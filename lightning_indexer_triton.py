@@ -33,18 +33,9 @@ INT64_MAX = 9223372036854775807
 
 @triton.jit
 def _lightning_indexer_score_kernel(
-    q_ptr,
-    k_ptr,
-    w_ptr,
-    score_ptr,
-    B,
-    S1,
-    S2,
-    N1,
-    N2,
-    D,
-    act_q_ptr,
-    act_k_ptr,
+    q_ptr, k_ptr, w_ptr, score_ptr, # Input/output tensors
+    B, S1, S2, N1, N2, D,           # B: batch size, S1: query sequence length, S2: key sequence length, N1: query group size, N2: key group size, D: head dimension
+    act_q_ptr, act_k_ptr,           # valid query and key sequence length
     sparse_mode: tl.constexpr,
     BLOCK_S2: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -56,11 +47,13 @@ def _lightning_indexer_score_kernel(
 
     Grid: (B * S1,)
     """
-    pid = tl.program_id(0)
+    pid = tl.program_id(0) # 每个 program 处理一个 sample 中的一个 query token
     b = pid // S1
     s1 = pid % S1
 
-    act_q = tl.load(act_q_ptr + b)
+    act_q = tl.load(act_q_ptr + b) # 当前 sample 的有效 query 序列长度
+
+    # Mask out invalid query positions
     if s1 >= act_q:
         for s2_start in range(0, S2, BLOCK_S2):
             offs = s2_start + tl.arange(0, BLOCK_S2)
@@ -72,45 +65,47 @@ def _lightning_indexer_score_kernel(
             )
         return
 
-    act_k = tl.load(act_k_ptr + b)
+    act_k = tl.load(act_k_ptr + b) # 当前 sample 的有效 key 序列长度
 
     q_base = (b * S1 + s1) * N1 * D
     w_base = (b * S1 + s1) * N1
     k_base = b * S2 * N2 * D
 
+    # 对长度为 S2 的 key 序列分块处理
     for s2_start in range(0, S2, BLOCK_S2):
         s2_offs = s2_start + tl.arange(0, BLOCK_S2)
         s2_valid = s2_offs < S2
 
         tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
 
-        for d_start in range(0, D, BLOCK_D):
-            d_offs_t = d_start + tl.arange(0, BLOCK_D)
-            d_valid = d_offs_t < D
-            d_size = tl.minimum(BLOCK_D, D - d_start)
+        # 外层遍历 head g，内层累加完整点积后再 ReLU
+        for g in range(N1):
+            w_g = tl.load(w_ptr + w_base + g) # 当前 query head 的标量权重
 
-            k_offs = (
-                k_base
-                + s2_offs[:, None] * N2 * D
-                + d_offs_t[None, :]
-            )
-            k_tile = tl.load(
-                k_ptr + k_offs,
-                mask=s2_valid[:, None] & d_valid[None, :],
-                other=0.0,
-            )
+            # 累加所有 D 分块，得到完整点积
+            full_dot = tl.zeros([BLOCK_S2], dtype=tl.float32)
+            for d_start in range(0, D, BLOCK_D):
+                d_offs_t = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs_t < D
+                d_size = tl.minimum(BLOCK_D, D - d_start)
 
-            for g in range(N1):
+                k_offs = k_base + s2_offs[:, None] * N2 * D + d_offs_t[None, :]
+                k_tile = tl.load(
+                    k_ptr + k_offs,
+                    mask=s2_valid[:, None] & d_valid[None, :],
+                    other=0.0,
+                )
+
                 q_offs = q_base + g * D + d_offs_t
                 q_g = tl.load(q_ptr + q_offs, mask=d_valid, other=0.0)
-                w_g = tl.load(w_ptr + w_base + g)
 
                 q_bc = tl.reshape(q_g, [1, d_size])
                 kt_bc = tl.reshape(k_tile, [BLOCK_S2, d_size])
-                dot = tl.sum(q_bc * kt_bc, axis=1)
+                full_dot += tl.sum(q_bc * kt_bc, axis=1)
 
-                dot = tl.maximum(dot, 0.0)
-                tile_scores += dot * w_g
+            # ReLU 在完整点积上，再乘权重累加
+            full_dot = tl.maximum(full_dot, 0.0)
+            tile_scores += full_dot * w_g
 
         if sparse_mode == 3:
             causal_limit = act_k - act_q + s1 + 1
@@ -128,21 +123,13 @@ def _lightning_indexer_score_kernel(
 
 
 def _default_actual_seq_lens(actual_seq_lens, batch_size, seq_len):
-    """Build default actual_seq_lengths when None is provided."""
-    if actual_seq_lens is not None:
-        if isinstance(actual_seq_lens, (list, tuple)):
-            return ms.Tensor(list(actual_seq_lens), dtype=ms.int32)
-        return actual_seq_lens
-    return ms.ops.fill(ms.int32, (batch_size,), seq_len)
+    return ms.ops.fill(ms.int32, (batch_size,), seq_len) if actual_seq_lens is None else \
+           ms.Tensor(list(actual_seq_lens), dtype=ms.int32) if isinstance(actual_seq_lens, (list, tuple)) else \
+           actual_seq_lens
 
 
 def _tnd_cumsum_to_per_batch(cumsum):
-    """Convert TND cumulative lengths [B] to per-batch lengths [B]."""
-    per_batch = ms.ops.zeros_like(cumsum)
-    per_batch[0] = cumsum[0]
-    if cumsum.shape[0] > 1:
-        per_batch[1:] = cumsum[1:] - cumsum[:-1]
-    return per_batch
+    return cumsum - ops.pad(cumsum[:-1], (1, 0))
 
 
 def _tnd_to_bsnd(tensor, act_seq_per_batch):
@@ -151,60 +138,41 @@ def _tnd_to_bsnd(tensor, act_seq_per_batch):
     Uses Python-loop based conversion; works in PyNative mode.
     For GRAPH_MODE, caller should pass BSND tensors directly.
     """
+    assert ms.get_context('mode') == ms.PYNATIVE_MODE, "Only PyNative mode is supported."
     B = act_seq_per_batch.shape[0]
     lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
     max_seq = max(lengths) if lengths else 0
 
-    if tensor.ndim == 2:
-        T, N = tensor.shape
-        out = ms.ops.zeros((B, max_seq, N), dtype=tensor.dtype)
-        start = 0
-        for b_idx in range(B):
-            length = lengths[b_idx]
-            if length > 0:
-                out[b_idx, :length, :] = tensor[start:start + length, :]
-                start += length
-    elif tensor.ndim == 3:
-        T, N, D = tensor.shape
-        out = ms.ops.zeros((B, max_seq, N, D), dtype=tensor.dtype)
-        start = 0
-        for b_idx in range(B):
-            length = lengths[b_idx]
-            if length > 0:
-                out[b_idx, :length, :, :] = tensor[start:start + length, :, :]
-                start += length
-    else:
-        raise ValueError(f"Unexpected ndim: {tensor.ndim}")
+    assert tensor.ndim in (2, 3), f"Unexpected ndim: {tensor.ndim}"
+
+    out = ms.ops.zeros((B, max_seq, *tensor.shape[1:]), dtype=tensor.dtype)
+    start = 0
+    for b_idx in range(B):
+        length = lengths[b_idx]
+        if length > 0:
+            out[b_idx, :length] = tensor[start:start + length]
+            start += length
+
     return out
 
 
 def _bsnd_to_tnd(tensor, act_seq_per_batch):
     """Convert [B, S, N, ...] to [T, N, ...]."""
+    assert ms.get_context('mode') == ms.PYNATIVE_MODE, "Only PyNative mode is supported."
     B = act_seq_per_batch.shape[0]
     lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
     total_t = sum(lengths)
 
-    if tensor.ndim == 3:
-        N = tensor.shape[2]
-        out = ms.ops.zeros((total_t, N), dtype=tensor.dtype)
-        start = 0
-        for b_idx in range(B):
-            length = lengths[b_idx]
-            if length > 0:
-                out[start:start + length, :] = tensor[b_idx, :length, :]
-                start += length
-    elif tensor.ndim == 4:
-        N = tensor.shape[2]
-        K = tensor.shape[3]
-        out = ms.ops.zeros((total_t, N, K), dtype=tensor.dtype)
-        start = 0
-        for b_idx in range(B):
-            length = lengths[b_idx]
-            if length > 0:
-                out[start:start + length, :, :] = tensor[b_idx, :length, :, :]
-                start += length
-    else:
-        raise ValueError(f"Unexpected ndim: {tensor.ndim}")
+    assert tensor.ndim in (2, 3), f"Unexpected ndim: {tensor.ndim}"
+
+    out = ms.ops.zeros((total_t, *tensor.shape[2:]), dtype=tensor.dtype)
+    start = 0
+    for b_idx in range(B):
+        length = lengths[b_idx]
+        if length > 0:
+            out[start:start + length] = tensor[b_idx, :length]
+            start += length
+
     return out
 
 
@@ -239,25 +207,7 @@ def infer_func(
     return_value,
 ):
     """Infer output shape and dtype for _ms_pyfunc."""
-    q_shape = query.shape
-    if len(q_shape) == 4:
-        B, S1, N1, D = q_shape
-    else:
-        T1, N1, D = q_shape
-        B = 1
-        S1 = T1
-
-    k_shape = key.shape
-    if len(k_shape) == 4:
-        N2 = k_shape[2]
-    else:
-        N2 = k_shape[1]
-
-    if len(q_shape) == 4:
-        out_shape = (B, S1, N2, sparse_count)
-    else:
-        out_shape = (T1, N2, sparse_count)
-
+    out_shape = (*query.shape[:-2], key.shape[-2], sparse_count)
     indices = ms.mint.empty(out_shape, dtype=ms.int32)
     values = ms.mint.empty(out_shape, dtype=query.dtype)
     return indices, values
@@ -346,18 +296,9 @@ def lightning_indexer_triton(
     grid = (B * S1,)
 
     _lightning_indexer_score_kernel[grid](
-        q_flat,
-        k_flat,
-        w_flat,
-        scores_flat,
-        B,
-        S1,
-        S2,
-        N1,
-        N2,
-        D,
-        act_q,
-        act_k,
+        q_flat, k_flat, w_flat, scores_flat,
+        B, S1, S2, N1, N2, D,
+        act_q, act_k,
         sparse_mode=sparse_mode,
         BLOCK_S2=BLOCK_S2,
         BLOCK_D=BLOCK_D,
