@@ -99,9 +99,9 @@ def _lightning_indexer_score_kernel(
                 q_offs = q_base + g * D + d_offs_t
                 q_g = tl.load(q_ptr + q_offs, mask=d_valid, other=0.0)
 
-                q_bc = tl.reshape(q_g, [1, BLOCK_D])
+                q_bc = tl.reshape(q_g, [BLOCK_D, 1])
                 kt_bc = tl.reshape(k_tile, [BLOCK_S2, BLOCK_D])
-                full_dot += tl.sum(q_bc * kt_bc, axis=1)
+                full_dot += tl.reshape(tl.dot(kt_bc, q_bc), [BLOCK_S2])
 
             # ReLU 在完整点积上，再乘权重累加
             full_dot = tl.maximum(full_dot, 0.0)

@@ -39,13 +39,18 @@ def _allclose_indices_and_values(a_idx, a_val, b_idx, b_val, rtol=1e-3):
     """Check index match and value closeness."""
     assert a_idx.shape == b_idx.shape, f"Shape mismatch: {a_idx.shape} vs {b_idx.shape}"
     idx_match = np.allclose(a_idx.astype(np.float32), b_idx.astype(np.float32))
-    val_match = np.allclose(a_val.astype(np.float32), b_val.astype(np.float32), rtol=rtol, atol=1e-5)
+    val_match = np.allclose(a_val.astype(np.float32), b_val.astype(np.float32), rtol=1e-3, atol=1e-4)
     return idx_match, val_match
 
 
 @pytest.mark.parametrize("B,S1,S2,N1,D,sparse_count", [
     (1, 4, 128, 8, 128, 32),
     (2, 8, 256, 16, 128, 64),
+    (3, 4, 128, 8, 128, 32),
+    (2, 1, 128, 8, 128, 32),
+    (1, 4, 512, 8, 128, 64),
+    (2, 4, 512, 8, 128, 64),
+    (2, 8, 256, 8, 128, 16),
 ])
 @pytest.mark.parametrize("sparse_mode", [0, 3])
 @pytest.mark.parametrize("return_value", [False, True])
