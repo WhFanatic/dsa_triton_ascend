@@ -26,7 +26,9 @@ import triton
 import triton.language as tl
 
 import mindspore as ms
-from mindspore import ops
+from mindspore import ops, mint
+from typing import Tuple
+
 
 INT64_MAX = 9223372036854775807
 
@@ -87,7 +89,6 @@ def _lightning_indexer_score_kernel(
             for d_start in range(0, D, BLOCK_D):
                 d_offs_t = d_start + tl.arange(0, BLOCK_D)
                 d_valid = d_offs_t < D
-                d_size = tl.minimum(BLOCK_D, D - d_start)
 
                 k_offs = k_base + s2_offs[:, None] * N2 * D + d_offs_t[None, :]
                 k_tile = tl.load(
@@ -95,12 +96,11 @@ def _lightning_indexer_score_kernel(
                     mask=s2_valid[:, None] & d_valid[None, :],
                     other=0.0,
                 )
-
                 q_offs = q_base + g * D + d_offs_t
                 q_g = tl.load(q_ptr + q_offs, mask=d_valid, other=0.0)
 
-                q_bc = tl.reshape(q_g, [1, d_size])
-                kt_bc = tl.reshape(k_tile, [BLOCK_S2, d_size])
+                q_bc = tl.reshape(q_g, [1, BLOCK_D])
+                kt_bc = tl.reshape(k_tile, [BLOCK_S2, BLOCK_D])
                 full_dot += tl.sum(q_bc * kt_bc, axis=1)
 
             # ReLU 在完整点积上，再乘权重累加
@@ -185,39 +185,76 @@ def _stable_topk(scores_2d, k):
     _, s2_len = scores_2d.shape
     k = min(k, s2_len)
 
-    _, sorted_indices = ops.sort(-scores_2d, axis=1, stable=True)
-    topk_indices = sorted_indices[:, :k]
+    _, sorted_indices = mint.sort(-scores_2d, dim=1,stable=True )
+    topk_indices = sorted_indices[:, :k].to(ms.int32)
     topk_values = ops.gather_d(scores_2d, 1, topk_indices)
     return topk_indices, topk_values
 
 
-def infer_func(
+def _infer_core(
+    q_bsnd: ms.Tensor,
+    k_bsnd: ms.Tensor,
+    w_bsnd: ms.Tensor,
+    act_q: ms.Tensor,
+    act_k: ms.Tensor,
+    sparse_count: int,
+    sparse_mode: int,
+    return_value: bool,
+) -> Tuple[ms.Tensor, ms.Tensor]:
+    B, S1, N1, D = q_bsnd.shape
+    N2 = k_bsnd.shape[2]
+    out_shape = (B, S1, N2, sparse_count)
+    return ms.mint.empty(out_shape, dtype=ms.int32), ms.mint.empty(out_shape, dtype=q_bsnd.dtype)
+
+
+@ms.ops._ms_pyfunc(infer_func=_infer_core)
+def _lightning_indexer_core(
+    q_bsnd: ms.Tensor,
+    k_bsnd: ms.Tensor,
+    w_bsnd: ms.Tensor,
+    act_q: ms.Tensor,
+    act_k: ms.Tensor,
+    sparse_count: int,
+    sparse_mode: int,
+    return_value: bool,
+) -> Tuple[ms.Tensor, ms.Tensor]:
+
+    B, S1, N1, D = q_bsnd.shape
+    S2 = k_bsnd.shape[1]
+    N2 = k_bsnd.shape[2]
+
+    if N2 != 1:
+        raise ValueError(f"lightning_indexer_triton requires N2=1, got N2={N2}")
+
+    q_flat = q_bsnd.reshape(B * S1, N1, D).contiguous()
+    k_flat = k_bsnd.reshape(B * S2, D).contiguous()
+    w_flat = w_bsnd.reshape(B * S1, N1).contiguous()
+    scores_flat = ms.mint.empty((B * S1, S2), dtype=ms.float32)
+
+    _lightning_indexer_score_kernel[(B * S1,)](
+        q_flat, k_flat, w_flat, scores_flat,
+        B, S1, S2, N1, N2, D,
+        act_q, act_k,
+        sparse_mode=sparse_mode,
+        BLOCK_S2=256,
+        BLOCK_D=64,
+    )
+
+    topk_indices_flat, topk_values_flat = _stable_topk(scores_flat, sparse_count)
+
+    topk_indices = topk_indices_flat.reshape(B, S1, N2, sparse_count)
+    if return_value:
+        topk_values = topk_values_flat.to(dtype=q_bsnd.dtype).reshape(B, S1, N2, sparse_count)
+    else:
+        topk_values = ms.ops.zeros((B, S1, N2, sparse_count), dtype=q_bsnd.dtype)
+
+    return topk_indices, topk_values
+
+    
+def lightning_indexer_triton(
     query,
     key,
     weights,
-    actual_seq_lengths_query,
-    actual_seq_lengths_key,
-    block_table,
-    layout_query,
-    layout_key,
-    sparse_count,
-    sparse_mode,
-    pre_tokens,
-    next_tokens,
-    return_value,
-):
-    """Infer output shape and dtype for _ms_pyfunc."""
-    out_shape = (*query.shape[:-2], key.shape[-2], sparse_count)
-    indices = ms.mint.empty(out_shape, dtype=ms.int32)
-    values = ms.mint.empty(out_shape, dtype=query.dtype)
-    return indices, values
-
-
-@ms.ops._ms_pyfunc(infer_func=infer_func)
-def lightning_indexer_triton(
-    query: ms.Tensor,
-    key: ms.Tensor,
-    weights: ms.Tensor,
     actual_seq_lengths_query=None,
     actual_seq_lengths_key=None,
     block_table=None,
@@ -261,10 +298,7 @@ def lightning_indexer_triton(
         act_k_pb = _tnd_cumsum_to_per_batch(act_k_cumsum)
         q_bsnd = _tnd_to_bsnd(query, act_q_pb)
         w_bsnd = _tnd_to_bsnd(weights, act_q_pb)
-        if layout_key == "TND":
-            k_bsnd = _tnd_to_bsnd(key, act_k_pb)
-        else:
-            k_bsnd = key
+        k_bsnd = _tnd_to_bsnd(key, act_k_pb) if layout_key == "TND" else key
         act_q = act_q_pb
         act_k = act_k_pb
     else:
@@ -275,42 +309,10 @@ def lightning_indexer_triton(
         act_q = _default_actual_seq_lens(actual_seq_lengths_query, B, q_bsnd.shape[1])
         act_k = _default_actual_seq_lens(actual_seq_lengths_key, B, k_bsnd.shape[1])
 
-    B = q_bsnd.shape[0]
-    S1 = q_bsnd.shape[1]
-    N1 = q_bsnd.shape[2]
-    D = q_bsnd.shape[3]
-    S2 = k_bsnd.shape[1]
-    N2 = k_bsnd.shape[2]
-
-    if N2 != 1:
-        raise ValueError(f"lightning_indexer_triton requires N2=1 (k_head_num=1), got N2={N2}")
-
-    q_flat = q_bsnd.reshape(B * S1, N1, D).contiguous()
-    k_flat = k_bsnd.reshape(B * S2, N2, D).contiguous()
-    w_flat = w_bsnd.reshape(B * S1, N1).contiguous()
-
-    scores_flat = ms.mint.empty((B * S1, S2), dtype=ms.float32)
-
-    BLOCK_S2 = 256
-    BLOCK_D = 64
-    grid = (B * S1,)
-
-    _lightning_indexer_score_kernel[grid](
-        q_flat, k_flat, w_flat, scores_flat,
-        B, S1, S2, N1, N2, D,
-        act_q, act_k,
-        sparse_mode=sparse_mode,
-        BLOCK_S2=BLOCK_S2,
-        BLOCK_D=BLOCK_D,
+    topk_indices, topk_values = _lightning_indexer_core(
+        q_bsnd, k_bsnd, w_bsnd, act_q, act_k,
+        sparse_count, sparse_mode, return_value,
     )
-
-    topk_indices_flat, topk_values_flat = _stable_topk(scores_flat, sparse_count)
-
-    topk_indices = topk_indices_flat.reshape(B, S1, N2, sparse_count)
-    if return_value:
-        topk_values = topk_values_flat.to(dtype=query.dtype).reshape(B, S1, N2, sparse_count)
-    else:
-        topk_values = ms.ops.zeros((B, S1, N2, sparse_count), dtype=query.dtype)
 
     if is_tnd:
         topk_indices = _bsnd_to_tnd(topk_indices, act_q_pb)

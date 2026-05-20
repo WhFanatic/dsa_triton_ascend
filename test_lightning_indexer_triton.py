@@ -22,7 +22,7 @@ import numpy as np
 import mindspore as ms
 from mindspore import ops
 
-ms.set_context(mode=ms.PYNATIVE_MODE)
+ms.set_context(mode=ms.GRAPH_MODE)
 
 
 def _make_inputs(B, S1, S2, N1, D, dtype=ms.float16):
@@ -69,9 +69,13 @@ def test_vs_builtin_op(B, S1, S2, N1, D, sparse_count, sparse_mode, return_value
     )
 
     idx_ok, val_ok = _allclose_indices_and_values(
-        ref_idx.asnumpy(), ref_val.asnumpy(),
-        tri_idx.asnumpy(), tri_val.asnumpy(),
+        ref_idx.numpy(), ref_val.numpy(),
+        tri_idx.numpy(), tri_val.numpy(),
     )
     assert idx_ok, "Index mismatch between triton and builtin op"
     if return_value:
         assert val_ok, "Value mismatch between triton and builtin op"
+
+
+if __name__== "__main__":
+    test_vs_builtin_op(1, 4, 128, 8, 128, 32,0,True)
