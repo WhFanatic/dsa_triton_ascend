@@ -201,10 +201,7 @@ def _infer_core(
     sparse_mode: int,
     return_value: bool,
 ) -> Tuple[ms.Tensor, ms.Tensor]:
-    B, S1, N1, D = q_bsnd.shape
-    N2 = k_bsnd.shape[2]
-    out_shape = (B, S1, N2, sparse_count)
-    return ms.mint.empty(out_shape, dtype=ms.int32), ms.mint.empty(out_shape, dtype=q_bsnd.dtype)
+    """Infer output shape and dtype for _ms_pyfunc."""
 
 
 @ms.ops._ms_pyfunc(infer_func=_infer_core)
@@ -250,11 +247,11 @@ def _lightning_indexer_core(
 
     return topk_indices, topk_values
 
-    
+
 def lightning_indexer_triton(
-    query,
-    key,
-    weights,
+    query: ms.Tensor,
+    key: ms.Tensor,
+    weights: ms.Tensor,
     actual_seq_lengths_query=None,
     actual_seq_lengths_key=None,
     block_table=None,
