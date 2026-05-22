@@ -1,6 +1,7 @@
 import time
 import numpy as np
 import mindspore as ms
+from mindspore.profiler import ProfilerLevel, ProfilerActivity, AicoreMetrics, ExportType
 from mindspore import Profiler, runtime
 
 
@@ -26,9 +27,7 @@ def _do_bench(fn, warmup=10, rep=100):
 
 def run_timing():
     configs = [
-        (1, 1024, 1024, 8, 128, 2048),
-        (1, 2048, 2048, 8, 128, 2048),
-        (4, 1024, 1024, 8, 128, 2048),
+        (1, 4, 128, 8, 128, 32),
     ]
 
     for B, S1, S2, N1, D, k in configs:
@@ -53,23 +52,35 @@ def run_timing():
 
 
 def run_profiling():
-    B, S1, S2, N1, D, k = 1, 1024, 1024, 8, 128, 2048
+    total_steps = 10
+    out_dir = './profiler_data'
+    B, S1, S2, N1, D, k = 1, 4, 128, 8, 128, 32
     q = ms.Tensor(np.random.randn(B, S1, N1, D).astype(np.float16))
     k_t = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float16))
     w = ms.Tensor(np.random.randn(B, S1, N1).astype(np.float32))
 
-    total_steps = 20
-    profiler = Profiler(
-        schedule=ms.profiler.ProfilerSchedule(skip_first=4, skip_last=4),
-        output_path="./profiler_data",
-    )
-    profiler.start()
-    for _ in range(total_steps):
-        lightning_indexer_triton(q, k_t, w, sparse_count=k)
-        profiler.step()
-    profiler.stop()
-    profiler.analyse()
-    print("Profiler data saved to ./profiler_data")
+    experimental_config = ms.profiler._ExperimentalConfig(
+        profiler_level=ProfilerLevel.Level0,
+        aic_metrics=AicoreMetrics.AiCoreNone,
+        l2_cache=False,
+        mstx=False,
+        data_simplification=False,
+        )
+
+    with ms.profiler.profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
+        with_stack=True,
+        schedule=ms.profiler.schedule(wait=2, warmup=2, active=2, repeat=1, skip_first=2),
+        on_trace_ready=ms.profiler.tensorboard_trace_handler(out_dir),
+        profile_memory=False,
+        experimental_config=experimental_config
+        ) as prof:
+
+        for _ in range(total_steps):
+            lightning_indexer_triton(q, k_t, w, sparse_count=k)
+            prof.step()
+
+    print(f"Profiler data saved to {out_dir}")
 
 
 if __name__ == "__main__":
