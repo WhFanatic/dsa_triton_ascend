@@ -1,17 +1,3 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ============================================================================
 """Triton-ascend implementation of lightning_indexer operator.
 
 Interface aligned with ops.lightning_indexer.
@@ -24,19 +10,24 @@ PA_BSND layout is not supported.
 """
 import triton
 import triton.language as tl
+import triton.backends.ascend.runtime
 
 import mindspore as ms
 from mindspore import ops, mint
 from typing import Tuple
 
-
 INT64_MAX = 9223372036854775807
 
 
+# # TODO: autotune 暂不支持 mindspore
+# @triton.autotune(
+#     configs=[], # Ascend backend 自动生成候选配置
+#     key=["S2", "D", "G"],
+# )
 @triton.jit
 def _lightning_indexer_score_kernel(
     q_ptr, k_ptr, w_ptr, score_ptr, # Input/output tensors
-    B, S1, S2, N1, N2, D,           # B: batch size, S1: query sequence length, S2: key sequence length, N1: query group size, N2: key group size, D: head dimension
+    B, S1, S2, N1, N2, D, G,        # B: batch size, S1: query sequence length, S2: key sequence length, N1: query group size, N2: key group size, D: head dimension
     act_q_ptr, act_k_ptr,           # valid query and key sequence length
     sparse_mode: tl.constexpr,
     BLOCK_S2: tl.constexpr,
@@ -44,14 +35,17 @@ def _lightning_indexer_score_kernel(
 ):
     """Compute reduced scores for lightning_indexer (BSND layout).
 
-    Each program handles one (batch, s1) position:
-        score[s2] = sum_g(ReLU(Q[g,:] @ K[s2,:]^T) * W[g])
-
-    Grid: (B * S1,)
+    Grid: (B * S1 * N2,)
+    Each program handles one (batch, s1, n2) position:
+        score[b, s1, n2, s2] = sum_{g in group}(ReLU(Q[b,s1,g,:] @ K[b,s2,n2,:]^T) * W[b,s1,g])
+    where group = [n2 * G, (n2+1) * G), G = N1 // N2.
     """
-    pid = tl.program_id(0) # 每个 program 处理一个 sample 中的一个 query token
-    b = pid // S1
-    s1 = pid % S1
+    pid = tl.program_id(0)
+    n2 = pid % N2
+    tmp = pid // N2
+    s1 = tmp % S1
+    b = tmp // S1
+    score_row_base = (b * S1 * N2 + s1 * N2 + n2) * S2
 
     act_q = tl.load(act_q_ptr + b) # 当前 sample 的有效 query 序列长度
 
@@ -59,19 +53,19 @@ def _lightning_indexer_score_kernel(
     if s1 >= act_q:
         for s2_start in range(0, S2, BLOCK_S2):
             offs = s2_start + tl.arange(0, BLOCK_S2)
-            mask = offs < S2
             tl.store(
-                score_ptr + b * S1 * S2 + s1 * S2 + offs,
+                score_ptr + score_row_base + offs,
                 tl.full([BLOCK_S2], float('-inf'), dtype=tl.float32),
-                mask=mask,
+                mask=offs < S2,
             )
         return
 
     act_k = tl.load(act_k_ptr + b) # 当前 sample 的有效 key 序列长度
 
-    q_base = (b * S1 + s1) * N1 * D
-    w_base = (b * S1 + s1) * N1
-    k_base = b * S2 * N2 * D
+    # Base offsets: q[B, S1, N1, D], k[B, S2, N2, D], w[B, S1, N1]
+    q_base = ((b * S1 + s1) * N1 + n2 * G) * D   # start of this n2's query group
+    w_base = (b * S1 + s1) * N1 + n2 * G
+    k_base = (b * S2 * N2 + n2) * D               # key head n2, stride N2*D between s2 positions
 
     # 对长度为 S2 的 key 序列分块处理
     for s2_start in range(0, S2, BLOCK_S2):
@@ -80,46 +74,40 @@ def _lightning_indexer_score_kernel(
 
         tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
 
-        # 外层遍历 head g，内层累加完整点积后再 ReLU
-        for g in range(N1):
+        for g in range(G):
             w_g = tl.load(w_ptr + w_base + g) # 当前 query head 的标量权重
 
-            # 累加所有 D 分块，得到完整点积
             full_dot = tl.zeros([BLOCK_S2], dtype=tl.float32)
             for d_start in range(0, D, BLOCK_D):
-                d_offs_t = d_start + tl.arange(0, BLOCK_D)
-                d_valid = d_offs_t < D
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < D
 
-                k_offs = k_base + s2_offs[:, None] * N2 * D + d_offs_t[None, :]
+                # k layout: [B, S2, N2, D] → offset = b*S2*N2*D + s2*N2*D + n2*D + d
+                k_offs = k_base + s2_offs[:, None] * (N2 * D) + d_offs[None, :]
                 k_tile = tl.load(
                     k_ptr + k_offs,
                     mask=s2_valid[:, None] & d_valid[None, :],
                     other=0.0,
                 )
-                q_offs = q_base + g * D + d_offs_t
+
+                q_offs = q_base + g * D + d_offs
                 q_g = tl.load(q_ptr + q_offs, mask=d_valid, other=0.0)
 
                 q_bc = tl.reshape(q_g, [BLOCK_D, 1])
                 kt_bc = tl.reshape(k_tile, [BLOCK_S2, BLOCK_D])
                 full_dot += tl.reshape(tl.dot(kt_bc, q_bc), [BLOCK_S2])
 
-            # ReLU 在完整点积上，再乘权重累加
             full_dot = tl.maximum(full_dot, 0.0)
             tile_scores += full_dot * w_g
 
+        # Causal mask (sparse_mode == 3: rightDownCausal)
         if sparse_mode == 3:
-            causal_limit = act_k - act_q + s1 + 1
-            causal_limit = tl.maximum(causal_limit, 0)
-            causal_limit = tl.minimum(causal_limit, S2)
-            tile_scores = tl.where(
-                s2_offs < causal_limit, tile_scores, float('-inf')
-            )
+            causal_limit = tl.minimum(tl.maximum(act_k - act_q + s1 + 1, 0), S2)
+            tile_scores = tl.where(s2_offs < causal_limit, tile_scores, float('-inf'))
 
-        k_mask = s2_offs < act_k
-        tile_scores = tl.where(k_mask, tile_scores, float('-inf'))
+        tile_scores = tl.where(s2_offs < act_k, tile_scores, float('-inf'))
 
-        out_offs = b * S1 * S2 + s1 * S2 + s2_offs
-        tl.store(score_ptr + out_offs, tile_scores, mask=s2_valid)
+        tl.store(score_ptr + score_row_base + s2_offs, tile_scores, mask=s2_valid)
 
 
 def _default_actual_seq_lens(actual_seq_lens, batch_size, seq_len):
@@ -163,7 +151,7 @@ def _bsnd_to_tnd(tensor, act_seq_per_batch):
     lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
     total_t = sum(lengths)
 
-    assert tensor.ndim in (2, 3), f"Unexpected ndim: {tensor.ndim}"
+    assert tensor.ndim in (3, 4), f"Unexpected ndim: {tensor.ndim}"
 
     out = ms.ops.zeros((total_t, *tensor.shape[2:]), dtype=tensor.dtype)
     start = 0
@@ -185,7 +173,7 @@ def _stable_topk(scores_2d, k):
     _, s2_len = scores_2d.shape
     k = min(k, s2_len)
 
-    _, sorted_indices = mint.sort(-scores_2d, dim=1,stable=True )
+    _, sorted_indices = mint.sort(-scores_2d, dim=1, stable=True)
     topk_indices = sorted_indices[:, :k].to(ms.int32)
     topk_values = ops.gather_d(scores_2d, 1, topk_indices)
     return topk_indices, topk_values
@@ -221,24 +209,27 @@ def _lightning_indexer_core(
 ) -> Tuple[ms.Tensor, ms.Tensor]:
 
     B, S1, N1, D = q_bsnd.shape
-    S2 = k_bsnd.shape[1]
-    N2 = k_bsnd.shape[2]
+    _, S2, N2, _ = k_bsnd.shape
 
-    if N2 != 1:
-        raise ValueError(f"lightning_indexer_triton requires N2=1, got N2={N2}")
+    if N1 % N2 != 0:
+        raise ValueError(f"N1({N1}) must be divisible by N2({N2})")
 
-    q_flat = q_bsnd.reshape(B * S1, N1, D).contiguous()
-    k_flat = k_bsnd.reshape(B * S2, D).contiguous()
-    w_flat = w_bsnd.reshape(B * S1, N1).contiguous()
-    scores_flat = ms.mint.empty((B * S1, S2), dtype=ms.float32)
+    G = N1 // N2  # GQA group size: number of query heads per key head
 
-    _lightning_indexer_score_kernel[(B * S1,)](
+    q_flat = q_bsnd.contiguous()
+    k_flat = k_bsnd.contiguous()
+    w_flat = w_bsnd.contiguous()
+
+    # scores: [B * S1 * N2, S2] — each (b, s1, n2) produces one row
+    scores_flat = ms.mint.empty((B * S1 * N2, S2), dtype=ms.float32)
+
+    _lightning_indexer_score_kernel[(B * S1 * N2,)](
         q_flat, k_flat, w_flat, scores_flat,
-        B, S1, S2, N1, N2, D,
+        B, S1, S2, N1, N2, D, G,
         act_q, act_k,
         sparse_mode=sparse_mode,
-        BLOCK_S2=256,
-        BLOCK_D=64,
+        BLOCK_S2=128, # TODO: autotune 情况下无需传入
+        BLOCK_D=64,   # TODO: autotune 情况下无需传入
     )
 
     topk_indices_flat, topk_values_flat = _stable_topk(scores_flat, sparse_count)
@@ -293,10 +284,8 @@ def lightning_indexer_triton(
     is_tnd = (layout_query == "TND")
 
     if is_tnd:
-        act_q_cumsum = actual_seq_lengths_query
-        act_k_cumsum = actual_seq_lengths_key
-        act_q_pb = _tnd_cumsum_to_per_batch(act_q_cumsum)
-        act_k_pb = _tnd_cumsum_to_per_batch(act_k_cumsum)
+        act_q_pb = _tnd_cumsum_to_per_batch(actual_seq_lengths_query)
+        act_k_pb = _tnd_cumsum_to_per_batch(actual_seq_lengths_key)
         q_bsnd = _tnd_to_bsnd(query, act_q_pb)
         w_bsnd = _tnd_to_bsnd(weights, act_q_pb)
         k_bsnd = _tnd_to_bsnd(key, act_k_pb) if layout_key == "TND" else key
