@@ -202,6 +202,10 @@ def _infer_core(
     return_value: bool,
 ) -> Tuple[ms.Tensor, ms.Tensor]:
     """Infer output shape and dtype for _ms_pyfunc."""
+    out_shape = (*q_bsnd.shape[:-2], k_bsnd.shape[-2], sparse_count)
+    indices = ms.mint.empty(out_shape, dtype=ms.int32)
+    values = ms.mint.empty(out_shape, dtype=q_bsnd.dtype)
+    return indices, values
 
 
 @ms.ops._ms_pyfunc(infer_func=_infer_core)
