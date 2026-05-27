@@ -28,11 +28,10 @@ import triton.language as tl
 import mindspore as ms
 from mindspore import ops, mint
 from typing import Tuple
+import numpy as np
 
 
 INT64_MAX = 9223372036854775807
-
-
 @triton.jit
 def _lightning_indexer_score_kernel(
     q_ptr, k_ptr, w_ptr, score_ptr, # Input/output tensors
@@ -41,6 +40,7 @@ def _lightning_indexer_score_kernel(
     sparse_mode: tl.constexpr,
     BLOCK_S2: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_G: tl.constexpr,
 ):
     """Compute reduced scores for lightning_indexer (BSND layout).
 
@@ -73,55 +73,74 @@ def _lightning_indexer_score_kernel(
     w_base = (b * S1 + s1) * N1
     k_base = b * S2 * N2 * D
 
+    if sparse_mode == 3:
+        causal_limit = act_k - act_q + s1 + 1
+        causal_limit = tl.maximum(causal_limit, 0)
+        causal_limit = tl.minimum(causal_limit, S2)
+
     # 对长度为 S2 的 key 序列分块处理
     for s2_start in range(0, S2, BLOCK_S2):
         s2_offs = s2_start + tl.arange(0, BLOCK_S2)
         s2_valid = s2_offs < S2
 
-        tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
-
-        # 外层遍历 head g，内层累加完整点积后再 ReLU
-        for g in range(N1):
-            w_g = tl.load(w_ptr + w_base + g) # 当前 query head 的标量权重
-
-            # 累加所有 D 分块，得到完整点积
-            full_dot = tl.zeros([BLOCK_S2], dtype=tl.float32)
-            for d_start in range(0, D, BLOCK_D):
-                d_offs_t = d_start + tl.arange(0, BLOCK_D)
-                d_valid = d_offs_t < D
-
-                k_offs = k_base + s2_offs[:, None] * N2 * D + d_offs_t[None, :]
-                k_tile = tl.load(
-                    k_ptr + k_offs,
-                    mask=s2_valid[:, None] & d_valid[None, :],
-                    other=0.0,
-                )
-                q_offs = q_base + g * D + d_offs_t
-                q_g = tl.load(q_ptr + q_offs, mask=d_valid, other=0.0)
-
-                q_bc = tl.reshape(q_g, [BLOCK_D, 1])
-                kt_bc = tl.reshape(k_tile, [BLOCK_S2, BLOCK_D])
-                full_dot += tl.reshape(tl.dot(kt_bc, q_bc), [BLOCK_S2])
-
-            # ReLU 在完整点积上，再乘权重累加
-            full_dot = tl.maximum(full_dot, 0.0)
-            tile_scores += full_dot * w_g
-
         if sparse_mode == 3:
-            causal_limit = act_k - act_q + s1 + 1
-            causal_limit = tl.maximum(causal_limit, 0)
-            causal_limit = tl.minimum(causal_limit, S2)
-            tile_scores = tl.where(
-                s2_offs < causal_limit, tile_scores, float('-inf')
+            visible_limit = tl.minimum(act_k, causal_limit)
+        else:
+            visible_limit = act_k
+
+        if s2_start >= visible_limit:
+            out_offs = b * S1 * S2 + s1 * S2 + s2_offs
+            tl.store(
+                score_ptr + out_offs,
+                tl.full([BLOCK_S2], float('-inf'), dtype=tl.float32),
+                mask=s2_valid,
             )
+        else:
+            tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
 
-        k_mask = s2_offs < act_k
-        tile_scores = tl.where(k_mask, tile_scores, float('-inf'))
+            # Batch several query heads per dot so each K tile is reused across G.
+            for g_start in range(0, N1, BLOCK_G):
+                g_offs = g_start + tl.arange(0, BLOCK_G)
+                g_valid = g_offs < N1
+                w_g = tl.load(w_ptr + w_base + g_offs, mask=g_valid, other=0.0)
 
-        out_offs = b * S1 * S2 + s1 * S2 + s2_offs
-        tl.store(score_ptr + out_offs, tile_scores, mask=s2_valid)
+                # 累加所有 D 分块，得到完整点积
+                full_dot = tl.zeros([BLOCK_G, BLOCK_S2], dtype=tl.float32)
+                for d_start in range(0, D, BLOCK_D):
+                    d_offs_t = d_start + tl.arange(0, BLOCK_D)
+                    d_valid = d_offs_t < D
 
+                    k_offs = k_base + s2_offs[:, None] * N2 * D + d_offs_t[None, :]
+                    k_tile = tl.load(
+                        k_ptr + k_offs,
+                        mask=s2_valid[:, None] & d_valid[None, :],
+                        other=0.0,
+                    )
+                    q_offs = q_base + g_offs[:, None] * D + d_offs_t[None, :]
+                    q_g = tl.load(
+                        q_ptr + q_offs,
+                        mask=g_valid[:, None] & d_valid[None, :],
+                        other=0.0,
+                    )
 
+                    full_dot += tl.dot(q_g, tl.trans(k_tile))
+
+                # ReLU 在完整点积上，再乘权重累加
+                full_dot = tl.maximum(full_dot, 0.0)
+                tile_scores += tl.sum(full_dot * w_g[:, None], 0)
+
+            if sparse_mode == 3:
+                tile_scores = tl.where(
+                    s2_offs < causal_limit, tile_scores, float('-inf')
+                )
+
+            k_mask = s2_offs < act_k
+            tile_scores = tl.where(k_mask, tile_scores, float('-inf'))
+
+            out_offs = b * S1 * S2 + s1 * S2 + s2_offs
+            tl.store(score_ptr + out_offs, tile_scores, mask=s2_valid)
+
+#如果用户没传真实seq_length，那就默认每个batch都是满长
 def _default_actual_seq_lens(actual_seq_lens, batch_size, seq_len):
     return ms.ops.fill(ms.int32, (batch_size,), seq_len) if actual_seq_lens is None else \
            ms.Tensor(list(actual_seq_lens), dtype=ms.int32) if isinstance(actual_seq_lens, (list, tuple)) else \
@@ -176,18 +195,50 @@ def _bsnd_to_tnd(tensor, act_seq_per_batch):
     return out
 
 
-def _stable_topk(scores_2d, k):
-    """Stable TopK: descending score, ascending index for ties.
+def _official_tie_break_order(s2_len):
+    """MindSpore lightning_indexer tie order: 512-token tiles in reverse order."""
+    tile = 512
+    full_tiles = s2_len // tile
+    tail = s2_len % tile
 
-    Uses stable sort on the full S2 dimension. For large S2, this can be
-    optimized to use topk + partial sort.
-    """
+    parts = []
+    if tail:
+        parts.append(np.arange(full_tiles * tile, s2_len, dtype=np.int32))
+
+    for tile_idx in range(full_tiles - 1, -1, -1):
+        start = tile_idx * tile
+        parts.append(np.arange(start, start + tile, dtype=np.int32))
+
+    return np.concatenate(parts) if parts else np.empty((0,), dtype=np.int32)
+
+
+def _stable_topk(scores_2d, k, sparse_mode):
+    """TopK aligned with MindSpore lightning_indexer tie and invalid-index behavior."""
     _, s2_len = scores_2d.shape
     k = min(k, s2_len)
 
-    _, sorted_indices = mint.sort(-scores_2d, dim=1,stable=True )
-    topk_indices = sorted_indices[:, :k].to(ms.int32)
-    topk_values = ops.gather_d(scores_2d, 1, topk_indices)
+    if sparse_mode == 0:
+        tie_order_np = _official_tie_break_order(s2_len)
+        tie_order = ms.Tensor(tie_order_np, dtype=ms.int32)
+
+        reordered_scores = ops.gather(scores_2d, tie_order, 1)
+        _, sorted_pos = mint.sort(-reordered_scores, dim=1, stable=True)
+
+        topk_pos = sorted_pos[:, :k].to(ms.int32)
+        topk_indices = ops.gather(tie_order, topk_pos, 0)
+        topk_values = ops.gather_d(scores_2d, 1, topk_indices)
+    else:
+        _, sorted_indices = mint.sort(-scores_2d, dim=1, stable=True)
+        topk_indices = sorted_indices[:, :k].to(ms.int32)
+        topk_values = ops.gather_d(scores_2d, 1, topk_indices)
+
+    invalid = topk_values == float("-inf")
+    topk_indices = ops.select(
+        invalid,
+        ops.ones_like(topk_indices) * -1,
+        topk_indices,
+    )
+
     return topk_indices, topk_values
 
 
@@ -202,7 +253,14 @@ def _infer_core(
     return_value: bool,
 ) -> Tuple[ms.Tensor, ms.Tensor]:
     """Infer output shape and dtype for _ms_pyfunc."""
+    B, S1 = q_bsnd.shape[0], q_bsnd.shape[1]
+    N2 = k_bsnd.shape[2]
+    out_shape = (B, S1, N2, sparse_count)
 
+    return (
+        ms.Tensor(shape=out_shape, dtype=ms.int32),
+        ms.Tensor(shape=out_shape, dtype=q_bsnd.dtype),
+    )
 
 @ms.ops._ms_pyfunc(infer_func=_infer_core)
 def _lightning_indexer_core(
@@ -228,16 +286,22 @@ def _lightning_indexer_core(
     w_flat = w_bsnd.reshape(B * S1, N1).contiguous()
     scores_flat = ms.mint.empty((B * S1, S2), dtype=ms.float32)
 
+    block_g = 16
+    block_s2 = 256
+
     _lightning_indexer_score_kernel[(B * S1,)](
         q_flat, k_flat, w_flat, scores_flat,
         B, S1, S2, N1, N2, D,
         act_q, act_k,
         sparse_mode=sparse_mode,
-        BLOCK_S2=256,
-        BLOCK_D=64,
+        BLOCK_S2=block_s2,
+        BLOCK_D=128,
+        BLOCK_G=block_g,
     )
 
-    topk_indices_flat, topk_values_flat = _stable_topk(scores_flat, sparse_count)
+    topk_indices_flat, topk_values_flat = _stable_topk(
+        scores_flat, sparse_count, sparse_mode
+    )
 
     topk_indices = topk_indices_flat.reshape(B, S1, N2, sparse_count)
     if return_value:
