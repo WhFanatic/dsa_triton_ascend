@@ -243,6 +243,62 @@ def _lightning_indexer_core(
     return topk_indices, topk_values
 
 
+class LightningIndexerTriton(ms.nn.Cell):
+    """nn.Cell wrapper for lightning_indexer_triton.
+
+    Args:
+        sparse_count: top-k count
+        sparse_mode: 0=default, 3=rightDownCausal
+        layout_query: "BSND" or "TND"
+        layout_key: "BSND" or "TND"
+        return_value: if True, return (indices, values); else values is dummy
+        pre_tokens: ignored in triton path
+        next_tokens: ignored in triton path
+    """
+
+    def __init__(
+        self,
+        sparse_count=2048,
+        sparse_mode=0,
+        layout_query="BSND",
+        layout_key="BSND",
+        return_value=False,
+        pre_tokens=INT64_MAX,
+        next_tokens=INT64_MAX,
+    ):
+        super().__init__()
+        self.sparse_count = sparse_count
+        self.sparse_mode = sparse_mode
+        self.layout_query = layout_query
+        self.layout_key = layout_key
+        self.return_value = return_value
+        self.pre_tokens = pre_tokens
+        self.next_tokens = next_tokens
+
+    def construct(
+        self,
+        query,
+        key,
+        weights,
+        actual_seq_lengths_query=None,
+        actual_seq_lengths_key=None,
+        block_table=None,
+    ):
+        return lightning_indexer_triton(
+            query, key, weights,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=block_table,
+            layout_query=self.layout_query,
+            layout_key=self.layout_key,
+            sparse_count=self.sparse_count,
+            sparse_mode=self.sparse_mode,
+            pre_tokens=self.pre_tokens,
+            next_tokens=self.next_tokens,
+            return_value=self.return_value,
+        )
+
+
 def lightning_indexer_triton(
     query: ms.Tensor,
     key: ms.Tensor,
@@ -284,13 +340,11 @@ def lightning_indexer_triton(
     is_tnd = (layout_query == "TND")
 
     if is_tnd:
-        act_q_pb = _tnd_cumsum_to_per_batch(actual_seq_lengths_query)
-        act_k_pb = _tnd_cumsum_to_per_batch(actual_seq_lengths_key)
-        q_bsnd = _tnd_to_bsnd(query, act_q_pb)
-        w_bsnd = _tnd_to_bsnd(weights, act_q_pb)
-        k_bsnd = _tnd_to_bsnd(key, act_k_pb) if layout_key == "TND" else key
-        act_q = act_q_pb
-        act_k = act_k_pb
+        act_q = _tnd_cumsum_to_per_batch(actual_seq_lengths_query)
+        act_k = _tnd_cumsum_to_per_batch(actual_seq_lengths_key)
+        q_bsnd = _tnd_to_bsnd(query, act_q)
+        w_bsnd = _tnd_to_bsnd(weights, act_q)
+        k_bsnd = _tnd_to_bsnd(key, act_k) if layout_key == "TND" else key
     else:
         q_bsnd = query
         k_bsnd = key
@@ -300,12 +354,12 @@ def lightning_indexer_triton(
         act_k = _default_actual_seq_lens(actual_seq_lengths_key, B, k_bsnd.shape[1])
 
     topk_indices, topk_values = _lightning_indexer_core(
-        q_bsnd, k_bsnd, w_bsnd, act_q, act_k,
+        q_bsnd, k_bsnd, w_bsnd, act_q.to('Ascend'), act_k.to('Ascend'),
         sparse_count, sparse_mode, return_value,
     )
 
     if is_tnd:
-        topk_indices = _bsnd_to_tnd(topk_indices, act_q_pb)
-        topk_values = _bsnd_to_tnd(topk_values, act_q_pb)
+        topk_indices = _bsnd_to_tnd(topk_indices, act_q)
+        topk_values = _bsnd_to_tnd(topk_values, act_q)
 
     return topk_indices, topk_values

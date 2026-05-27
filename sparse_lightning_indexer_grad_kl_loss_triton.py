@@ -420,6 +420,58 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     return d_query_index, d_key_index, d_weights, loss
 
 
+class SparseLightningIndexerGradKLLossTriton(ms.nn.Cell):
+    """nn.Cell wrapper for sparse_lightning_indexer_grad_kl_loss_triton.
+
+    Args:
+        scale_value: scaling factor for attention scores
+        layout: only "BSND" is supported
+        sparse_mode: only 3 (rightDownCausal) is supported
+        pre_tokens: ignored in triton path
+        next_tokens: ignored in triton path
+        deterministic: ignored in triton path
+    """
+
+    def __init__(
+        self,
+        scale_value=1.0,
+        layout="BSND",
+        sparse_mode=3,
+        pre_tokens=9223372036854775807,
+        next_tokens=9223372036854775807,
+        deterministic=False,
+    ):
+        super().__init__()
+        self.scale_value = scale_value
+        self.layout = layout
+        self.sparse_mode = sparse_mode
+        self.pre_tokens = pre_tokens
+        self.next_tokens = next_tokens
+        self.deterministic = deterministic
+
+    def construct(
+        self,
+        query, key,
+        query_index, key_index,
+        weights, sparse_indices,
+        softmax_max, softmax_sum,
+        query_rope=None, key_rope=None,
+        actual_seq_qlen=None, actual_seq_klen=None,
+    ):
+        return sparse_lightning_indexer_grad_kl_loss_triton(
+            query, key,
+            query_index, key_index,
+            weights, sparse_indices,
+            softmax_max, softmax_sum,
+            query_rope=query_rope, key_rope=key_rope,
+            actual_seq_qlen=actual_seq_qlen, actual_seq_klen=actual_seq_klen,
+            scale_value=self.scale_value,
+            layout=self.layout, sparse_mode=self.sparse_mode,
+            pre_tokens=self.pre_tokens, next_tokens=self.next_tokens,
+            deterministic=self.deterministic,
+        )
+
+
 # public API
 def sparse_lightning_indexer_grad_kl_loss_triton(
     query: ms.Tensor, key: ms.Tensor,

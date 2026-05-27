@@ -25,10 +25,9 @@ from mindspore import ops
 ms.set_context(mode=ms.GRAPH_MODE)
 
 
-def _make_inputs(B, S1, S2, N1, D, dtype=ms.float16):
+def _make_inputs(B, S1, S2, N1, D, N2=1, dtype=ms.float16):
     """Create random BSND tensors for lightning_indexer."""
     rng = np.random.RandomState(42)
-    N2 = 1
     q = ms.Tensor(rng.randn(B, S1, N1, D).astype(np.float32).astype(np.float16), dtype=dtype)
     k = ms.Tensor(rng.randn(B, S2, N2, D).astype(np.float32).astype(np.float16), dtype=dtype)
     w = ms.Tensor(rng.randn(B, S1, N1).astype(np.float32).astype(np.float16), dtype=dtype)
@@ -56,7 +55,7 @@ def _allclose_indices_and_values(a_idx, a_val, b_idx, b_val, rtol=1e-3):
 @pytest.mark.parametrize("return_value", [False, True])
 def test_vs_builtin_op(B, S1, S2, N1, D, sparse_count, sparse_mode, return_value):
     """Compare lightning_indexer_triton with ops.lightning_indexer on BSND layout."""
-    from lightning_indexer_triton import lightning_indexer_triton
+    from lightning_indexer_triton import LightningIndexerTriton
 
     q, k, w = _make_inputs(B, S1, S2, N1, D)
 
@@ -66,12 +65,11 @@ def test_vs_builtin_op(B, S1, S2, N1, D, sparse_count, sparse_mode, return_value
         sparse_count=sparse_count, sparse_mode=sparse_mode,
         return_value=return_value,
     )
-    tri_idx, tri_val = lightning_indexer_triton(
-        q, k, w,
-        layout_query="BSND", layout_key="BSND",
+    cell = LightningIndexerTriton(
         sparse_count=sparse_count, sparse_mode=sparse_mode,
         return_value=return_value,
     )
+    tri_idx, tri_val = cell(q, k, w)
 
     idx_ok, val_ok = _allclose_indices_and_values(
         ref_idx.numpy(), ref_val.numpy(),
@@ -80,6 +78,39 @@ def test_vs_builtin_op(B, S1, S2, N1, D, sparse_count, sparse_mode, return_value
     assert idx_ok, "Index mismatch between triton and builtin op"
     if return_value:
         assert val_ok, "Value mismatch between triton and builtin op"
+
+
+@pytest.mark.parametrize("B,S1,S2,N1,N2,D,sparse_count,dtype", [
+    (1, 4, 128, 8, 2, 128, 32, ms.float16),
+    (2, 8, 256, 16, 4, 128, 64, ms.float16),
+    (1, 4, 128, 12, 1, 128, 32, ms.float16),
+    (1, 4, 256, 7, 1, 128, 32, ms.float16),
+    (1, 4, 128, 8, 1, 64, 32, ms.float16),
+    (2, 8, 128, 16, 1, 256, 64, ms.float16),
+    (1, 4, 128, 8, 1, 128, 32, ms.float32),
+    (2, 8, 128, 16, 2, 96, 64, ms.float32),
+])
+@pytest.mark.parametrize("sparse_mode", [0, 3])
+def test_relaxed_params(B, S1, S2, N1, N2, D, sparse_count, dtype, sparse_mode):
+    """Test parameter combinations beyond CANN constraints (no reference comparison)."""
+    from lightning_indexer_triton import LightningIndexerTriton
+
+    q, k, w = _make_inputs(B, S1, S2, N1, D, N2=N2, dtype=dtype)
+
+    cell = LightningIndexerTriton(
+        sparse_count=sparse_count, sparse_mode=sparse_mode,
+        return_value=True,
+    )
+    tri_idx, tri_val = cell(q, k, w)
+
+    expected_shape = (B, S1, N2, sparse_count)
+    assert tri_idx.shape == expected_shape, f"Shape mismatch: {tri_idx.shape} vs {expected_shape}"
+    assert tri_val.shape == expected_shape, f"Shape mismatch: {tri_val.shape} vs {expected_shape}"
+    assert tri_idx.dtype == ms.int32, f"Index dtype mismatch: {tri_idx.dtype}"
+    idx_np = tri_idx.numpy()
+    assert np.all((idx_np >= 0) & (idx_np < S2)), "Indices out of range"
+    val_np = tri_val.numpy()
+    assert np.all(np.isfinite(val_np)), "Values contain NaN or inf"
 
 
 if __name__== "__main__":

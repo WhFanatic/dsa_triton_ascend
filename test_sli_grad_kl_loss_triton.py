@@ -60,7 +60,7 @@ def _compute_softmax_stats(q, k, qr, kr, si, scale_value):
 ])
 def test_sparse_grad_kl_loss_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK):
     from sparse_lightning_indexer_grad_kl_loss_triton import (
-        sparse_lightning_indexer_grad_kl_loss_triton,
+        SparseLightningIndexerGradKLLossTriton,
     )
     from sli_grad_kl_loss_cann import (
         SparseLightningIndexerGradKLLoss,
@@ -79,10 +79,12 @@ def test_sparse_grad_kl_loss_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK):
     )
 
     # Triton
-    d_qi_tri, d_ki_tri, d_w_tri, loss_tri = sparse_lightning_indexer_grad_kl_loss_triton(
+    cell = SparseLightningIndexerGradKLLossTriton(
+        scale_value=scale_value, layout="BSND", sparse_mode=3,
+    )
+    d_qi_tri, d_ki_tri, d_w_tri, loss_tri = cell(
         q, k, qi, ki, w, si, softmax_max, softmax_sum,
         query_rope=qr, key_rope=kr,
-        scale_value=scale_value, layout="BSND", sparse_mode=3,
     )
 
     np.testing.assert_allclose(d_qi_base.asnumpy(), d_qi_tri.asnumpy(), atol=1e-2, rtol=1e-2)
