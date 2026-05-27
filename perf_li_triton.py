@@ -37,8 +37,9 @@ def run_timing():
         k_t = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float16))
         w = ms.Tensor(np.random.randn(B, S1, N1).astype(np.float32))
 
+        cell = LightningIndexerTriton(sparse_count=k)
         t_med, t_p20, t_p80 = _do_bench(
-            lambda q=q, k_t=k_t, w=w, k=k: lightning_indexer_triton(q, k_t, w, sparse_count=k)
+            lambda cell=cell: cell(q, k_t, w)
         )
         print(f"triton:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
 
@@ -59,6 +60,8 @@ def run_profiling():
     k_t = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float16))
     w = ms.Tensor(np.random.randn(B, S1, N1).astype(np.float32))
 
+    cell = LightningIndexerTriton(sparse_count=k)
+
     experimental_config = ms.profiler._ExperimentalConfig(
         profiler_level=ProfilerLevel.Level0,
         aic_metrics=AicoreMetrics.AiCoreNone,
@@ -77,14 +80,14 @@ def run_profiling():
         ) as prof:
 
         for _ in range(total_steps):
-            lightning_indexer_triton(q, k_t, w, sparse_count=k)
+            cell(q, k_t, w)
             prof.step()
 
     print(f"Profiler data saved to {out_dir}")
 
 
 if __name__ == "__main__":
-    from lightning_indexer_triton import lightning_indexer_triton
+    from lightning_indexer_triton import LightningIndexerTriton
 
     ms.set_context(mode=ms.GRAPH_MODE)
     np.random.seed(42)
