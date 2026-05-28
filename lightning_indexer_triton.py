@@ -32,6 +32,7 @@ def _lightning_indexer_score_kernel(
     sparse_mode: tl.constexpr,
     BLOCK_S2: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_G: tl.constexpr,
 ):
     """Compute reduced scores for lightning_indexer (BSND layout).
 
@@ -67,47 +68,63 @@ def _lightning_indexer_score_kernel(
     w_base = (b * S1 + s1) * N1 + n2 * G
     k_base = (b * S2 * N2 + n2) * D               # key head n2, stride N2*D between s2 positions
 
+    if sparse_mode == 3:
+        causal_limit = tl.minimum(tl.maximum(act_k - act_q + s1 + 1, 0), S2)
+        visible_limit = tl.minimum(act_k, causal_limit)
+    else:
+        visible_limit = act_k
+
     # 对长度为 S2 的 key 序列分块处理
     for s2_start in range(0, S2, BLOCK_S2):
         s2_offs = s2_start + tl.arange(0, BLOCK_S2)
         s2_valid = s2_offs < S2
 
-        tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
+        if s2_start >= visible_limit:
+            tl.store(
+                score_ptr + score_row_base + s2_offs,
+                tl.full([BLOCK_S2], float('-inf'), dtype=tl.float32),
+                mask=s2_valid,
+            )
+        else:
+            tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
 
-        for g in range(G):
-            w_g = tl.load(w_ptr + w_base + g) # 当前 query head 的标量权重
+            for g_start in range(0, G, BLOCK_G):
+                g_rel = g_start + tl.arange(0, BLOCK_G)
+                g_valid = g_rel < G
+                w_g = tl.load(w_ptr + w_base + g_rel, mask=g_valid, other=0.0)
 
-            full_dot = tl.zeros([BLOCK_S2], dtype=tl.float32)
-            for d_start in range(0, D, BLOCK_D):
-                d_offs = d_start + tl.arange(0, BLOCK_D)
-                d_valid = d_offs < D
+                full_dot = tl.zeros([BLOCK_G, BLOCK_S2], dtype=tl.float32)
+                for d_start in range(0, D, BLOCK_D):
+                    d_offs = d_start + tl.arange(0, BLOCK_D)
+                    d_valid = d_offs < D
 
-                # k layout: [B, S2, N2, D] → offset = b*S2*N2*D + s2*N2*D + n2*D + d
-                k_offs = k_base + s2_offs[:, None] * (N2 * D) + d_offs[None, :]
-                k_tile = tl.load(
-                    k_ptr + k_offs,
-                    mask=s2_valid[:, None] & d_valid[None, :],
-                    other=0.0,
-                )
+                    # k layout: [B, S2, N2, D] -> offset = b*S2*N2*D + s2*N2*D + n2*D + d
+                    k_offs = k_base + s2_offs[:, None] * (N2 * D) + d_offs[None, :]
+                    k_tile = tl.load(
+                        k_ptr + k_offs,
+                        mask=s2_valid[:, None] & d_valid[None, :],
+                        other=0.0,
+                    )
 
-                q_offs = q_base + g * D + d_offs
-                q_g = tl.load(q_ptr + q_offs, mask=d_valid, other=0.0)
+                    q_offs = q_base + g_rel[:, None] * D + d_offs[None, :]
+                    q_tile = tl.load(
+                        q_ptr + q_offs,
+                        mask=g_valid[:, None] & d_valid[None, :],
+                        other=0.0,
+                    )
 
-                q_bc = tl.reshape(q_g, [BLOCK_D, 1])
-                kt_bc = tl.reshape(k_tile, [BLOCK_S2, BLOCK_D])
-                full_dot += tl.reshape(tl.dot(kt_bc, q_bc), [BLOCK_S2])
+                    full_dot += tl.dot(q_tile, tl.trans(k_tile))
 
-            full_dot = tl.maximum(full_dot, 0.0)
-            tile_scores += full_dot * w_g
+                full_dot = tl.maximum(full_dot, 0.0)
+                tile_scores += tl.sum(full_dot * w_g[:, None], 0)
 
-        # Causal mask (sparse_mode == 3: rightDownCausal)
-        if sparse_mode == 3:
-            causal_limit = tl.minimum(tl.maximum(act_k - act_q + s1 + 1, 0), S2)
-            tile_scores = tl.where(s2_offs < causal_limit, tile_scores, float('-inf'))
+            # Causal mask (sparse_mode == 3: rightDownCausal)
+            if sparse_mode == 3:
+                tile_scores = tl.where(s2_offs < causal_limit, tile_scores, float('-inf'))
 
-        tile_scores = tl.where(s2_offs < act_k, tile_scores, float('-inf'))
+            tile_scores = tl.where(s2_offs < act_k, tile_scores, float('-inf'))
 
-        tl.store(score_ptr + score_row_base + s2_offs, tile_scores, mask=s2_valid)
+            tl.store(score_ptr + score_row_base + s2_offs, tile_scores, mask=s2_valid)
 
 
 def _default_actual_seq_lens(actual_seq_lens, batch_size, seq_len):
@@ -228,8 +245,9 @@ def _lightning_indexer_core(
         B, S1, S2, N1, N2, D, G,
         act_q, act_k,
         sparse_mode=sparse_mode,
-        BLOCK_S2=128, # TODO: autotune 情况下无需传入
-        BLOCK_D=64,   # TODO: autotune 情况下无需传入
+        BLOCK_S2=256, # TODO: autotune 情况下无需传入
+        BLOCK_D=128,  # TODO: autotune 情况下无需传入
+        BLOCK_G=16,   # TODO: autotune 情况下无需传入
     )
 
     topk_indices_flat, topk_values_flat = _stable_topk(scores_flat, sparse_count)
