@@ -181,18 +181,23 @@ def _bsnd_to_tnd(tensor, act_seq_per_batch):
     return out
 
 
-def _stable_topk(scores_2d, k):
-    """Stable TopK: descending score, ascending index for ties.
-
-    Uses stable sort on the full S2 dimension. For large S2, this can be
-    optimized to use topk + partial sort.
-    """
+def _stable_topk(scores_2d, k, stable=False):
     _, s2_len = scores_2d.shape
     k = min(k, s2_len)
 
-    _, sorted_indices = mint.sort(-scores_2d, dim=1, stable=True)
-    topk_indices = sorted_indices[:, :k].to(ms.int32)
-    topk_values = ops.gather_d(scores_2d, 1, topk_indices)
+    if stable:
+        _, sorted_indices = mint.sort(-scores_2d, dim=1, stable=True)
+        topk_indices = sorted_indices[:, :k].to(ms.int32)
+        topk_values = ops.gather_d(scores_2d, 1, topk_indices)
+    else:
+        # 直接使用 mint.topk, 性能更好, 但同分情况排序结果与 CANN 参考实现有差异
+        topk_values, topk_indices = mint.topk(scores_2d, k, dim=1, largest=True, sorted=True)
+        topk_indices = topk_indices.to(ms.int32)
+
+    # -inf positions are invalid -> index -1, aligned with builtin op
+    invalid = topk_values == float('-inf')
+    topk_indices = mint.where(invalid, mint.full_like(topk_indices, -1), topk_indices)
+
     return topk_indices, topk_values
 
 
