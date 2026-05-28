@@ -19,11 +19,76 @@ from typing import Tuple
 INT64_MAX = 9223372036854775807
 
 
-# # TODO: autotune 暂不支持 mindspore
-# @triton.autotune(
-#     configs=[], # Ascend backend 自动生成候选配置
-#     key=["S2", "D", "G"],
-# )
+def _patch_triton_ascend_mindspore_dtype_bytes():
+    try:
+        from triton.backends.ascend.runtime import utils as ascend_utils
+        from triton.backends.ascend.runtime import autotuner as ascend_autotuner
+    except ImportError:
+        return
+
+    origin_func = getattr(ascend_utils, "get_byte_per_numel", None)
+    if origin_func is None:
+        return
+    if getattr(origin_func, "_mindspore_dtype_patched", False):
+        if hasattr(ascend_autotuner, "get_byte_per_numel"):
+            ascend_autotuner.get_byte_per_numel = origin_func
+        return
+
+    dtype_bytes = {}
+
+    def add_dtype(dtype_name, byte_size):
+        dtype = getattr(ms, dtype_name, None)
+        if dtype is not None:
+            dtype_bytes[dtype] = byte_size
+
+    for dtype_name in ("int8", "uint8", "bool_"):
+        add_dtype(dtype_name, 1)
+    for dtype_name in ("float16", "bfloat16", "int16", "uint16"):
+        add_dtype(dtype_name, 2)
+    for dtype_name in ("float32", "int32", "uint32"):
+        add_dtype(dtype_name, 4)
+    for dtype_name in ("float64", "int64", "uint64"):
+        add_dtype(dtype_name, 8)
+
+    def patched_get_byte_per_numel(dtype):
+        try:
+            if dtype in dtype_bytes:
+                return dtype_bytes[dtype]
+        except TypeError:
+            pass
+        return origin_func(dtype)
+
+    patched_get_byte_per_numel._mindspore_dtype_patched = True
+    ascend_utils.get_byte_per_numel = patched_get_byte_per_numel
+    if hasattr(ascend_autotuner, "get_byte_per_numel"):
+        ascend_autotuner.get_byte_per_numel = patched_get_byte_per_numel
+
+
+_patch_triton_ascend_mindspore_dtype_bytes()
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 32,  "BLOCK_G": 8}),
+        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 8}),
+        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 8}),
+        triton.Config({"BLOCK_S2": 256, "BLOCK_D": 32,  "BLOCK_G": 8}),
+        triton.Config({"BLOCK_S2": 256, "BLOCK_D": 64,  "BLOCK_G": 8}),
+        triton.Config({"BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 8}),
+        triton.Config({"BLOCK_S2": 512, "BLOCK_D": 32,  "BLOCK_G": 8}),
+        triton.Config({"BLOCK_S2": 512, "BLOCK_D": 64,  "BLOCK_G": 8}),
+
+        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 32,  "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S2": 256, "BLOCK_D": 32,  "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S2": 256, "BLOCK_D": 64,  "BLOCK_G": 16}),
+
+        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 32,  "BLOCK_G": 32}),
+        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 32}),
+    ],
+    key=["S2", "D", "G", "sparse_mode"],
+)
 @triton.jit
 def _lightning_indexer_score_kernel(
     q_ptr, k_ptr, w_ptr, score_ptr, # Input/output tensors
@@ -250,9 +315,6 @@ def _lightning_indexer_core(
         B, S1, S2, N1, N2, D, G,
         act_q, act_k,
         sparse_mode=sparse_mode,
-        BLOCK_S2=256, # TODO: autotune 情况下无需传入
-        BLOCK_D=128,  # TODO: autotune 情况下无需传入
-        BLOCK_G=16,   # TODO: autotune 情况下无需传入
     )
 
     topk_indices_flat, topk_values_flat = _stable_topk(scores_flat, sparse_count)
