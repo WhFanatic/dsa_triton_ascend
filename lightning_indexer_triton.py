@@ -14,7 +14,6 @@ import triton.backends.ascend.runtime
 
 import mindspore as ms
 from mindspore import ops, mint
-from typing import Tuple
 
 INT64_MAX = 9223372036854775807
 
@@ -266,50 +265,42 @@ def _stable_topk(scores_2d, k, stable=False):
     return topk_indices, topk_values
 
 
-def _infer_core(
-    q_bsnd: ms.Tensor,
-    k_bsnd: ms.Tensor,
-    w_bsnd: ms.Tensor,
+def _infer_score_launch(
+    q_flat: ms.Tensor,
+    k_flat: ms.Tensor,
+    w_flat: ms.Tensor,
+    scores_flat: ms.Tensor,
     act_q: ms.Tensor,
     act_k: ms.Tensor,
-    sparse_count: int,
+    B: int,
+    S1: int,
+    S2: int,
+    N1: int,
+    N2: int,
+    D: int,
+    G: int,
     sparse_mode: int,
-    return_value: bool,
-) -> Tuple[ms.Tensor, ms.Tensor]:
-    """Infer output shape and dtype for _ms_pyfunc."""
-    out_shape = (*q_bsnd.shape[:-2], k_bsnd.shape[-2], sparse_count)
-    indices = ms.mint.empty(out_shape, dtype=ms.int32)
-    values = ms.mint.empty(out_shape, dtype=q_bsnd.dtype)
-    return indices, values
+) -> ms.Tensor:
+    return ms.mint.empty_like(scores_flat)
 
 
-@ms.ops._ms_pyfunc(infer_func=_infer_core)
-def _lightning_indexer_core(
-    q_bsnd: ms.Tensor,
-    k_bsnd: ms.Tensor,
-    w_bsnd: ms.Tensor,
+@ms.ops._ms_pyfunc(infer_func=_infer_score_launch)
+def _lightning_indexer_score_core(
+    q_flat: ms.Tensor,
+    k_flat: ms.Tensor,
+    w_flat: ms.Tensor,
+    scores_flat: ms.Tensor,
     act_q: ms.Tensor,
     act_k: ms.Tensor,
-    sparse_count: int,
+    B: int,
+    S1: int,
+    S2: int,
+    N1: int,
+    N2: int,
+    D: int,
+    G: int,
     sparse_mode: int,
-    return_value: bool,
-) -> Tuple[ms.Tensor, ms.Tensor]:
-
-    B, S1, N1, D = q_bsnd.shape
-    _, S2, N2, _ = k_bsnd.shape
-
-    if N1 % N2 != 0:
-        raise ValueError(f"N1({N1}) must be divisible by N2({N2})")
-
-    G = N1 // N2  # GQA group size: number of query heads per key head
-
-    q_flat = q_bsnd.contiguous()
-    k_flat = k_bsnd.contiguous()
-    w_flat = w_bsnd.contiguous()
-
-    # scores: [B * S1 * N2, S2] — each (b, s1, n2) produces one row
-    scores_flat = ms.mint.empty((B * S1 * N2, S2), dtype=ms.float32)
-
+) -> ms.Tensor:
     _lightning_indexer_score_kernel[(B * S1 * N2,)](
         q_flat, k_flat, w_flat, scores_flat,
         B, S1, S2, N1, N2, D, G,
@@ -317,15 +308,7 @@ def _lightning_indexer_core(
         sparse_mode=sparse_mode,
     )
 
-    topk_indices_flat, topk_values_flat = _stable_topk(scores_flat, sparse_count)
-
-    topk_indices = topk_indices_flat.reshape(B, S1, N2, sparse_count)
-    if return_value:
-        topk_values = topk_values_flat.to(dtype=q_bsnd.dtype).reshape(B, S1, N2, sparse_count)
-    else:
-        topk_values = ms.ops.zeros((B, S1, N2, sparse_count), dtype=q_bsnd.dtype)
-
-    return topk_indices, topk_values
+    return scores_flat
 
 
 class LightningIndexerTriton(ms.nn.Cell):
@@ -333,7 +316,7 @@ class LightningIndexerTriton(ms.nn.Cell):
 
     Args:
         sparse_count: top-k count
-        sparse_mode: 0=default, 3=rightDownCausal
+        sparse_mode: 3=default, rightDownCausal
         layout_query: "BSND" or "TND"
         layout_key: "BSND" or "TND"
         return_value: if True, return (indices, values); else values is dummy
@@ -344,7 +327,7 @@ class LightningIndexerTriton(ms.nn.Cell):
     def __init__(
         self,
         sparse_count=2048,
-        sparse_mode=0,
+        sparse_mode=3,
         layout_query="BSND",
         layout_key="BSND",
         return_value=False,
@@ -394,7 +377,7 @@ def lightning_indexer_triton(
     layout_query="BSND",
     layout_key="BSND",
     sparse_count=2048,
-    sparse_mode=0,
+    sparse_mode=3,
     pre_tokens=INT64_MAX,
     next_tokens=INT64_MAX,
     return_value=False,
@@ -411,7 +394,7 @@ def lightning_indexer_triton(
         layout_query: "BSND" or "TND"
         layout_key: "BSND" or "TND"
         sparse_count: top-k count
-        sparse_mode: 0=default, 3=rightDownCausal
+        sparse_mode: 3=default, rightDownCausal
         pre_tokens: ignored in triton path
         next_tokens: ignored in triton path
         return_value: if True, return (indices, values); else values is dummy
@@ -438,10 +421,33 @@ def lightning_indexer_triton(
         act_q = _default_actual_seq_lens(actual_seq_lengths_query, B, q_bsnd.shape[1])
         act_k = _default_actual_seq_lens(actual_seq_lengths_key, B, k_bsnd.shape[1])
 
-    topk_indices, topk_values = _lightning_indexer_core(
-        q_bsnd, k_bsnd, w_bsnd, act_q.to('Ascend'), act_k.to('Ascend'),
-        sparse_count, sparse_mode, return_value,
+    B, S1, N1, D = q_bsnd.shape
+    _, S2, N2, _ = k_bsnd.shape
+
+    if N1 % N2 != 0:
+        raise ValueError(f"N1({N1}) must be divisible by N2({N2})")
+
+    G = N1 // N2
+
+    q_flat = q_bsnd.contiguous()
+    k_flat = k_bsnd.contiguous()
+    w_flat = w_bsnd.contiguous()
+
+    scores_flat = ms.mint.empty((B * S1 * N2, S2), dtype=ms.float32)
+
+    scores_flat = _lightning_indexer_score_core(
+        q_flat, k_flat, w_flat, scores_flat,
+        act_q.to('Ascend'), act_k.to('Ascend'),
+        B, S1, S2, N1, N2, D, G,
+        sparse_mode,
     )
+
+    topk_indices_flat, topk_values_flat = _stable_topk(scores_flat, sparse_count)
+    topk_indices = topk_indices_flat.reshape(B, S1, N2, sparse_count)
+    if return_value:
+        topk_values = topk_values_flat.to(dtype=q_bsnd.dtype).reshape(B, S1, N2, sparse_count)
+    else:
+        topk_values = ms.ops.zeros((B, S1, N2, sparse_count), dtype=q_bsnd.dtype)
 
     if is_tnd:
         topk_indices = _bsnd_to_tnd(topk_indices, act_q)
