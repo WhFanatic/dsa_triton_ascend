@@ -122,16 +122,6 @@ def _lightning_indexer_score_kernel(
     score_row_base = (b * S1 * N2 + s1 * N2 + n2) * S2
 
     act_q = tl.load(act_q_ptr + b) # 当前 sample 的有效 query 序列长度
-
-    # Mask out invalid query positions
-    if s1 >= act_q:
-        tl.store(
-            score_ptr + score_row_base + s2_offs,
-            tl.full([BLOCK_S2], float('-inf'), dtype=tl.float32),
-            mask=s2_valid,
-        )
-        return
-
     act_k = tl.load(act_k_ptr + b) # 当前 sample 的有效 key 序列长度
 
     # Causal limit
@@ -142,8 +132,9 @@ def _lightning_indexer_score_kernel(
         causal_limit = S2
         visible_limit = act_k
 
-    # 早退: 本 S2 tile 完全在可见范围之外
-    if pid_s2 * BLOCK_S2 >= visible_limit:
+    # 早退: invalid query positions or 本 S2 tile 完全在可见范围之外
+    # 注: triton-ascend kernel 中只能有一个早退出口, 否则会有 bug
+    if s1 >= act_q or pid_s2 * BLOCK_S2 >= visible_limit:
         tl.store(
             score_ptr + score_row_base + s2_offs,
             tl.full([BLOCK_S2], float('-inf'), dtype=tl.float32),
@@ -277,7 +268,7 @@ def _stable_topk(scores_2d, k, stable=False):
 
     # -inf positions are invalid -> index -1, aligned with builtin op
     invalid = topk_values == float('-inf')
-    topk_indices = mint.where(invalid, mint.full_like(topk_indices, -1), topk_indices)
+    topk_indices = mint.where(invalid, -1, topk_indices)
 
     return topk_indices, topk_values
 

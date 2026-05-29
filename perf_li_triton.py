@@ -28,14 +28,20 @@ def _do_bench(fn, warmup=10, rep=100):
 def run_timing():
     configs = [
         (1, 4, 128, 8, 128, 32),
+        (2, 8, 256, 16, 128, 64),
+        (3, 4, 128, 8, 128, 32),
+        (2, 1, 128, 8, 128, 32),
+        (1, 1024, 1024, 64, 128, 512),
+        (1, 2048, 2048, 64, 128, 1024),
+        (1, 4096, 4096, 64, 128, 2048),
     ]
 
     for B, S1, S2, N1, D, k in configs:
         print(f"\nB={B}, S1={S1}, S2={S2}, N1={N1}, D={D}, topk={k}")
 
-        q = ms.Tensor(np.random.randn(B, S1, N1, D).astype(np.float16))
-        k_t = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float16))
-        w = ms.Tensor(np.random.randn(B, S1, N1).astype(np.float32))
+        q = ms.Tensor(np.random.randn(B, S1, N1, D).astype(np.float16)).to('Ascend')
+        k_t = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float16)).to('Ascend')
+        w = ms.Tensor(np.random.randn(B, S1, N1).astype(np.float32)).to('Ascend')
 
         cell = LightningIndexerTriton(sparse_count=k)
         t_med, t_p20, t_p80 = _do_bench(
@@ -55,16 +61,20 @@ def run_timing():
 def run_profiling():
     total_steps = 10
     out_dir = './profiler_data'
-    B, S1, S2, N1, D, k = 1, 4, 128, 8, 128, 32
-    q = ms.Tensor(np.random.randn(B, S1, N1, D).astype(np.float16))
-    k_t = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float16))
-    w = ms.Tensor(np.random.randn(B, S1, N1).astype(np.float32))
+    B, S1, S2, N1, D, k = 1, 4096, 4096, 64, 128, 2048
+    q = ms.Tensor(np.random.randn(B, S1, N1, D).astype(np.float16)).to('Ascend')
+    k_t = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float16)).to('Ascend')
+    w = ms.Tensor(np.random.randn(B, S1, N1).astype(np.float32)).to('Ascend')
 
     cell = LightningIndexerTriton(sparse_count=k)
 
     experimental_config = ms.profiler._ExperimentalConfig(
         profiler_level=ProfilerLevel.Level0,
         aic_metrics=AicoreMetrics.AiCoreNone,
+        # aic_metrics=AicoreMetrics.ArithmeticUtilization,
+        # aic_metrics=AicoreMetrics.PipeUtilization,
+        # aic_metrics=AicoreMetrics.Memory,
+        # aic_metrics=AicoreMetrics.MemoryUB,
         l2_cache=False,
         mstx=False,
         data_simplification=False,
@@ -73,7 +83,7 @@ def run_profiling():
     with ms.profiler.profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
         with_stack=True,
-        schedule=ms.profiler.schedule(wait=2, warmup=2, active=2, repeat=1, skip_first=2),
+        schedule=ms.profiler.schedule(wait=2, warmup=2, active=4, repeat=1, skip_first=2),
         on_trace_ready=ms.profiler.tensorboard_trace_handler(out_dir),
         profile_memory=False,
         experimental_config=experimental_config

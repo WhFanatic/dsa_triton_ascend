@@ -47,9 +47,9 @@ def _allclose_indices_and_values(a_idx, a_val, b_idx, b_val, rtol=1e-3):
     (2, 8, 256, 16, 128, 64),
     (3, 4, 128, 8, 128, 32),
     (2, 1, 128, 8, 128, 32),
-    (1, 4, 512, 8, 128, 64),
-    (2, 4, 512, 8, 128, 64),
-    (2, 8, 256, 8, 128, 16),
+    (1, 1024, 1024, 64, 128, 512),
+    (1, 2048, 2048, 64, 128, 1024),
+    (1, 4096, 4096, 64, 128, 2048),
 ])
 @pytest.mark.parametrize("sparse_mode", [0, 3])
 @pytest.mark.parametrize("return_value", [False, True])
@@ -75,7 +75,7 @@ def test_vs_builtin_op(B, S1, S2, N1, D, sparse_count, sparse_mode, return_value
         ref_idx.numpy(), ref_val.numpy(),
         tri_idx.numpy(), tri_val.numpy(),
     )
-    assert idx_ok, "Index mismatch between triton and builtin op"
+    assert idx_ok, ("Index mismatch between triton and builtin op", tri_idx - ref_idx, tri_idx, ref_idx, tri_val, ref_val)
     if return_value:
         assert val_ok, "Value mismatch between triton and builtin op"
 
@@ -114,4 +114,4 @@ def test_relaxed_params(B, S1, S2, N1, N2, D, sparse_count, dtype, sparse_mode):
 
 
 if __name__== "__main__":
-    test_vs_builtin_op(1, 4, 128, 8, 128, 32,0,True)
+    test_vs_builtin_op(1, 4096, 4096, 64, 128, 2048, 3, True)

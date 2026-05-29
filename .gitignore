@@ -3,3 +3,4 @@ temp/
 trash/
 *__pycache__*
 prompts.md
+profiler*
