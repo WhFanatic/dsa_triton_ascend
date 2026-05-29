@@ -68,23 +68,26 @@ _patch_triton_ascend_mindspore_dtype_bytes()
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 32,  "BLOCK_G": 8}),
-        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 8}),
-        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 8}),
-        triton.Config({"BLOCK_S2": 256, "BLOCK_D": 32,  "BLOCK_G": 8}),
-        triton.Config({"BLOCK_S2": 256, "BLOCK_D": 64,  "BLOCK_G": 8}),
-        triton.Config({"BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 8}),
-        triton.Config({"BLOCK_S2": 512, "BLOCK_D": 32,  "BLOCK_G": 8}),
-        triton.Config({"BLOCK_S2": 512, "BLOCK_D": 64,  "BLOCK_G": 8}),
+        # BLOCK_G = 16:Cube M 维最小可用值,适合 G 较大或寄存器压力高
+        triton.Config({"BLOCK_S2": 128,  "BLOCK_D": 64,  "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S2": 128,  "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S2": 256,  "BLOCK_D": 64,  "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S2": 256,  "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S2": 512,  "BLOCK_D": 64,  "BLOCK_G": 16}),
 
-        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 32,  "BLOCK_G": 16}),
-        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 16}),
-        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
-        triton.Config({"BLOCK_S2": 256, "BLOCK_D": 32,  "BLOCK_G": 16}),
-        triton.Config({"BLOCK_S2": 256, "BLOCK_D": 64,  "BLOCK_G": 16}),
+        # BLOCK_G = 32:中等 G,平衡 K 复用与 tile 大小
+        triton.Config({"BLOCK_S2": 128,  "BLOCK_D": 64,  "BLOCK_G": 32}),
+        triton.Config({"BLOCK_S2": 128,  "BLOCK_D": 128, "BLOCK_G": 32}),
+        triton.Config({"BLOCK_S2": 256,  "BLOCK_D": 64,  "BLOCK_G": 32}),
+        triton.Config({"BLOCK_S2": 256,  "BLOCK_D": 128, "BLOCK_G": 32}),
+        triton.Config({"BLOCK_S2": 512,  "BLOCK_D": 64,  "BLOCK_G": 32}),
 
-        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 32,  "BLOCK_G": 32}),
-        triton.Config({"BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 32}),
+        # BLOCK_G = 64:G 较小时直接整块吃完;G 较大时单次 dot 形状最饱满
+        triton.Config({"BLOCK_S2": 128,  "BLOCK_D": 64,  "BLOCK_G": 64}),
+        triton.Config({"BLOCK_S2": 128,  "BLOCK_D": 128, "BLOCK_G": 64}),
+        triton.Config({"BLOCK_S2": 256,  "BLOCK_D": 64,  "BLOCK_G": 64}),
+        triton.Config({"BLOCK_S2": 256,  "BLOCK_D": 128, "BLOCK_G": 64}),
+        triton.Config({"BLOCK_S2": 512,  "BLOCK_D": 64,  "BLOCK_G": 64}),
     ],
     key=["S2", "D", "G", "sparse_mode"],
 )
@@ -100,95 +103,109 @@ def _lightning_indexer_score_kernel(
 ):
     """Compute reduced scores for lightning_indexer (BSND layout).
 
-    Grid: (B * S1 * N2,)
-    Each program handles one (batch, s1, n2) position:
+    Grid: (B * S1 * N2, cdiv(S2, BLOCK_S2))
+    每个 program 处理一个 (b, s1, n2) 位置的一个 S2 tile。
         score[b, s1, n2, s2] = sum_{g in group}(ReLU(Q[b,s1,g,:] @ K[b,s2,n2,:]^T) * W[b,s1,g])
     where group = [n2 * G, (n2+1) * G), G = N1 // N2.
     """
-    pid = tl.program_id(0)
-    n2 = pid % N2
-    tmp = pid // N2
-    s1 = tmp % S1
-    b = tmp // S1
+    pid_bsn = tl.program_id(0)
+    pid_s2  = tl.program_id(1)
+
+    n2  = pid_bsn % N2
+    tmp = pid_bsn // N2
+    s1  = tmp % S1
+    b   = tmp // S1
+
+    s2_offs  = pid_s2 * BLOCK_S2 + tl.arange(0, BLOCK_S2)
+    s2_valid = s2_offs < S2
+
     score_row_base = (b * S1 * N2 + s1 * N2 + n2) * S2
 
     act_q = tl.load(act_q_ptr + b) # 当前 sample 的有效 query 序列长度
 
     # Mask out invalid query positions
     if s1 >= act_q:
-        for s2_start in range(0, S2, BLOCK_S2):
-            offs = s2_start + tl.arange(0, BLOCK_S2)
-            tl.store(
-                score_ptr + score_row_base + offs,
-                tl.full([BLOCK_S2], float('-inf'), dtype=tl.float32),
-                mask=offs < S2,
-            )
+        tl.store(
+            score_ptr + score_row_base + s2_offs,
+            tl.full([BLOCK_S2], float('-inf'), dtype=tl.float32),
+            mask=s2_valid,
+        )
         return
 
     act_k = tl.load(act_k_ptr + b) # 当前 sample 的有效 key 序列长度
 
-    # Base offsets: q[B, S1, N1, D], k[B, S2, N2, D], w[B, S1, N1]
-    q_base = ((b * S1 + s1) * N1 + n2 * G) * D   # start of this n2's query group
-    w_base = (b * S1 + s1) * N1 + n2 * G
-    k_base = (b * S2 * N2 + n2) * D               # key head n2, stride N2*D between s2 positions
-
+    # Causal limit
     if sparse_mode == 3:
         causal_limit = tl.minimum(tl.maximum(act_k - act_q + s1 + 1, 0), S2)
         visible_limit = tl.minimum(act_k, causal_limit)
     else:
+        causal_limit = S2
         visible_limit = act_k
 
-    # 对长度为 S2 的 key 序列分块处理
-    for s2_start in range(0, S2, BLOCK_S2):
-        s2_offs = s2_start + tl.arange(0, BLOCK_S2)
-        s2_valid = s2_offs < S2
+    # 早退: 本 S2 tile 完全在可见范围之外
+    if pid_s2 * BLOCK_S2 >= visible_limit:
+        tl.store(
+            score_ptr + score_row_base + s2_offs,
+            tl.full([BLOCK_S2], float('-inf'), dtype=tl.float32),
+            mask=s2_valid,
+        )
+        return
 
-        if s2_start >= visible_limit:
-            tl.store(
-                score_ptr + score_row_base + s2_offs,
-                tl.full([BLOCK_S2], float('-inf'), dtype=tl.float32),
-                mask=s2_valid,
+    # Base offsets: q[B, S1, N1, D], k[B, S2, N2, D], w[B, S1, N1]
+    k_row_stride = N2 * D
+    k_base = b * S2 * k_row_stride + n2 * D
+    q_base = ((b * S1 + s1) * N1 + n2 * G) * D
+    w_base = (b * S1 + s1) * N1 + n2 * G
+
+    tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
+
+    # G 维分块, 外层循环; K tile 在 D 内循环 load, 被 G 内循环复用
+    for g_start in range(0, G, BLOCK_G):
+        g_rel   = g_start + tl.arange(0, BLOCK_G)
+        g_valid = g_rel < G
+        w_g = tl.load(w_ptr + w_base + g_rel, mask=g_valid, other=0.0).to(tl.float32) # W: [BLOCK_G]
+
+        # 累加 [BLOCK_G, BLOCK_S2] 的 QK^T(沿 D 维)
+        acc = tl.zeros([BLOCK_G, BLOCK_S2], dtype=tl.float32)
+
+        for d_start in range(0, D, BLOCK_D):
+            d_offs  = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D
+
+            # Q tile: [BLOCK_G, BLOCK_D]
+            q_offs = q_base + g_rel[:, None] * D + d_offs[None, :]
+            q_tile = tl.load(
+                q_ptr + q_offs,
+                mask=g_valid[:, None] & d_valid[None, :],
+                other=0.0,
             )
-        else:
-            tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
 
-            for g_start in range(0, G, BLOCK_G):
-                g_rel = g_start + tl.arange(0, BLOCK_G)
-                g_valid = g_rel < G
-                w_g = tl.load(w_ptr + w_base + g_rel, mask=g_valid, other=0.0)
+            # K tile: [BLOCK_S2, BLOCK_D]
+            # 注:此处每个 (g_start, d_start) 都会 load 一次 K,
+            # 当 BLOCK_G == G 时只走 1 次 g 循环,K 不会重复 load;
+            # 当 BLOCK_G < G 时,K 沿 g 维度重复 load 是必要代价,
+            # 由 autotune 在重 load 和 tile shape 之间权衡。
+            k_offs = k_base + s2_offs[:, None] * k_row_stride + d_offs[None, :]
+            k_tile = tl.load(
+                k_ptr + k_offs,
+                mask=s2_valid[:, None] & d_valid[None, :],
+                other=0.0,
+            )
 
-                full_dot = tl.zeros([BLOCK_G, BLOCK_S2], dtype=tl.float32)
-                for d_start in range(0, D, BLOCK_D):
-                    d_offs = d_start + tl.arange(0, BLOCK_D)
-                    d_valid = d_offs < D
+            # Cube MMA: [BLOCK_G, BLOCK_D] x [BLOCK_D, BLOCK_S2]
+            acc += tl.dot(q_tile, tl.trans(k_tile))
 
-                    # k layout: [B, S2, N2, D] -> offset = b*S2*N2*D + s2*N2*D + n2*D + d
-                    k_offs = k_base + s2_offs[:, None] * (N2 * D) + d_offs[None, :]
-                    k_tile = tl.load(
-                        k_ptr + k_offs,
-                        mask=s2_valid[:, None] & d_valid[None, :],
-                        other=0.0,
-                    )
+        # ReLU + W 加权
+        acc = tl.maximum(acc, 0.0)
+        acc = tl.where(g_valid[:, None], acc, 0.0)
+        tile_scores += tl.sum(acc * w_g[:, None], axis=0)
 
-                    q_offs = q_base + g_rel[:, None] * D + d_offs[None, :]
-                    q_tile = tl.load(
-                        q_ptr + q_offs,
-                        mask=g_valid[:, None] & d_valid[None, :],
-                        other=0.0,
-                    )
+    # Causal mask (sparse_mode == 3: rightDownCausal)
+    if sparse_mode == 3:
+        tile_scores = tl.where(s2_offs < causal_limit, tile_scores, float('-inf'))
+    tile_scores = tl.where(s2_offs < act_k, tile_scores, float('-inf'))
 
-                    full_dot += tl.dot(q_tile, tl.trans(k_tile))
-
-                full_dot = tl.maximum(full_dot, 0.0)
-                tile_scores += tl.sum(full_dot * w_g[:, None], 0)
-
-            # Causal mask (sparse_mode == 3: rightDownCausal)
-            if sparse_mode == 3:
-                tile_scores = tl.where(s2_offs < causal_limit, tile_scores, float('-inf'))
-
-            tile_scores = tl.where(s2_offs < act_k, tile_scores, float('-inf'))
-
-            tl.store(score_ptr + score_row_base + s2_offs, tile_scores, mask=s2_valid)
+    tl.store(score_ptr + score_row_base + s2_offs, tile_scores, mask=s2_valid)
 
 
 def _default_actual_seq_lens(actual_seq_lens, batch_size, seq_len):
@@ -301,7 +318,11 @@ def _lightning_indexer_score_core(
     G: int,
     sparse_mode: int,
 ) -> ms.Tensor:
-    _lightning_indexer_score_kernel[(B * S1 * N2,)](
+    # autotune 选 BLOCK_S2 后由 triton 自己根据 meta 算 cdiv
+    def grid_fn(meta):
+        return (B * S1 * N2, triton.cdiv(S2, meta["BLOCK_S2"]))
+
+    _lightning_indexer_score_kernel[grid_fn](
         q_flat, k_flat, w_flat, scores_flat,
         B, S1, S2, N1, N2, D, G,
         act_q, act_k,
@@ -419,7 +440,7 @@ def lightning_indexer_triton(
         w_bsnd = weights
         B = q_bsnd.shape[0]
         act_q = _default_actual_seq_lens(actual_seq_lengths_query, B, q_bsnd.shape[1])
-        act_k = _default_actual_seq_lens(actual_seq_lengths_key, B, k_bsnd.shape[1])
+        act_k = _default_actual_seq_lens(actual_seq_lengths_key,   B, k_bsnd.shape[1])
 
     B, S1, N1, D = q_bsnd.shape
     _, S2, N2, _ = k_bsnd.shape
