@@ -130,6 +130,7 @@ def _prune_configs(configs, named_args, **kwargs):
 
     if not kept:
         # 兜底: 取 UB 占用最小的一个, 避免 autotune 无 config 可用
+        print('Warning: all autotune params pruned')
         kept = [min(
             configs,
             key=lambda c: _estimate_ub_bytes(
@@ -143,22 +144,26 @@ def _prune_configs(configs, named_args, **kwargs):
 
 @triton.autotune(
     configs=[
-        # (BLOCK_S1, BLOCK_S2, BLOCK_D, BLOCK_G)
-        # BLOCK_S1: bsn 维每个 program 串行处理的位置数, 用于压低 grid 第0维
-        triton.Config({"BLOCK_S1": 8,  "BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 16}),
-        triton.Config({"BLOCK_S1": 8,  "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
-        triton.Config({"BLOCK_S1": 8,  "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),
-        triton.Config({"BLOCK_S1": 8,  "BLOCK_S2": 256, "BLOCK_D": 64,  "BLOCK_G": 32}),
-        triton.Config({"BLOCK_S1": 8,  "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 32}),
-        triton.Config({"BLOCK_S1": 8,  "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),
+        # BLOCK_S1=8/4: 小~中 shape, 并行度高; 每档给 G=16 与 G=64 两种 reduce 宽度。
+        triton.Config({"BLOCK_S1": 8, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=128 选中
+        triton.Config({"BLOCK_S1": 8, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),  # S1=1024/2048 选中
+        triton.Config({"BLOCK_S1": 4, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 4, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),
 
-        triton.Config({"BLOCK_S1": 4,  "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),
-        triton.Config({"BLOCK_S1": 4,  "BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 32}),
+        # BLOCK_S1=1/2: 并行度最高, 但只在 B*S1 很小时存活 (大 shape 下 grid0 超 coreDim 被剪)。
+        triton.Config({"BLOCK_S1": 1, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=4096 选中
+        triton.Config({"BLOCK_S1": 1, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),
+        triton.Config({"BLOCK_S1": 2, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
 
-        triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 16}),
-        triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),
+        # 大 BLOCK_S1: 大 shape 用它把 grid0 压回限内, 同时调大 BLOCK_S2 摊薄 grid1、调小 BLOCK_D 守 UB。
+        triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=16384 选中
+        triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 32, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 128, "BLOCK_S2": 256,  "BLOCK_D": 64, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 256, "BLOCK_S2": 512,  "BLOCK_D": 32, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 512, "BLOCK_S2": 1024, "BLOCK_D": 16, "BLOCK_G": 16}),
     ],
-    key=["S2", "D", "G", "sparse_mode"],
+    key=["B", "S1", "S2", "N1", "N2", "D"],
     prune_configs_by={"early_config_prune": _prune_configs},
 )
 @triton.jit
