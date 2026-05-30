@@ -13,7 +13,7 @@ export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 # 全量测试
 # pytest test_li_triton.py -v "$@"
 # 性能测试
-# python perf_li_triton.py
+# TRITON_PRINT_AUTOTUNING=1 python perf_li_triton.py
 # 内核性能测试
 # python test_li_triton.py
 # msprof --output=./profilers/prof_arith --aicpu=on --ai-core=on --ascendcl=on --aic-metrics=ArithmeticUtilization python test_li_triton.py

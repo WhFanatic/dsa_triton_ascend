@@ -51,7 +51,7 @@ def _allclose(a, b):
     (4096, 8192, 64, 1, 128, 2048),     # S2>S1 非方阵 (grid 超限回归点)
     (16*1024, 16*1024, 64, 1, 128, 2048),  # 超大, grid 上限压测
 ])
-@pytest.mark.parametrize("B", [1, 3])
+@pytest.mark.parametrize("B", [1, 2])
 @pytest.mark.parametrize("sparse_mode", [0, 3])
 @pytest.mark.parametrize("dtype", [ms.float16, ms.float32])
 @pytest.mark.parametrize("return_value", [False, True])
