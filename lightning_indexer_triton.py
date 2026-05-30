@@ -157,8 +157,12 @@ def _prune_configs(configs, named_args, **kwargs):
 
         triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 16}),
         triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),
+
+        triton.Config({"BLOCK_S1": 128, "BLOCK_S2": 128, "BLOCK_D": 64,  "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 256, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 512, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),
     ],
-    key=["S2", "D", "G", "sparse_mode"],
+    key=["B", "S1", "S2", "N1", "N2", "D"],
     prune_configs_by={"early_config_prune": _prune_configs},
 )
 @triton.jit
