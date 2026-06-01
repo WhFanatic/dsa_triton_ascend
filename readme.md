@@ -7,6 +7,7 @@
 - CANN 9.0.0
 - mindspore 2.9.0
 - triton-ascend 3.2.1
+- pytest-forked (全量测试需要 pytest --forked ...)
 
 ## 文件
 

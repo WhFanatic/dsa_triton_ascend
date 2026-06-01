@@ -18,8 +18,18 @@ from mindspore import ops, mint
 INT64_MAX = 9223372036854775807
 
 
+def _next_pow2(x):
+    # Ascend 要求 kernel grid 每维都是 2 的幂, 否则分核映射出错 -> aicore trap。
+    # padding 多出的 program 在 kernel 里靠 bsn_in_range 掩码空转。
+    return 1 << (x - 1).bit_length() if x > 1 else 1
+
+
 def _patch_triton_ascend_mindspore_dtype_bytes():
-    ''' MindSpore 数据类型兼容补丁, 用于 autotune '''
+    """修补 triton-ascend autotuner 的 dtype 字节数查询。
+
+    autotuner 估 UB 占用时会调 get_byte_per_numel(dtype), 但它只认 torch dtype,
+    传 MindSpore dtype 会抛错把整个 autotune 带挂; 这里补一张 ms dtype -> 字节的映射兜住。
+    """
     try:
         from triton.backends.ascend.runtime import utils as ascend_utils
         from triton.backends.ascend.runtime import autotuner as ascend_autotuner
@@ -29,32 +39,30 @@ def _patch_triton_ascend_mindspore_dtype_bytes():
     origin_func = getattr(ascend_utils, "get_byte_per_numel", None)
     if origin_func is None:
         return
+    # 已打过补丁: 让 autotuner 模块也指向同一函数 (re-import 时它可能仍握着旧引用)。
     if getattr(origin_func, "_mindspore_dtype_patched", False):
         if hasattr(ascend_autotuner, "get_byte_per_numel"):
             ascend_autotuner.get_byte_per_numel = origin_func
         return
 
     dtype_bytes = {}
-
-    def add_dtype(dtype_name, byte_size):
-        dtype = getattr(ms, dtype_name, None)
-        if dtype is not None:
-            dtype_bytes[dtype] = byte_size
-
-    for dtype_name in ("int8", "uint8", "bool_"):
-        add_dtype(dtype_name, 1)
-    for dtype_name in ("float16", "bfloat16", "int16", "uint16"):
-        add_dtype(dtype_name, 2)
-    for dtype_name in ("float32", "int32", "uint32"):
-        add_dtype(dtype_name, 4)
-    for dtype_name in ("float64", "int64", "uint64"):
-        add_dtype(dtype_name, 8)
+    for byte_size, names in (
+        (1, ("int8", "uint8", "bool_")),
+        (2, ("float16", "bfloat16", "int16", "uint16")),
+        (4, ("float32", "int32", "uint32")),
+        (8, ("float64", "int64", "uint64")),
+    ):
+        for name in names:
+            dt = getattr(ms, name, None)
+            if dt is not None:
+                dtype_bytes[dt] = byte_size
 
     def patched_get_byte_per_numel(dtype):
         try:
             if dtype in dtype_bytes:
                 return dtype_bytes[dtype]
         except TypeError:
+            # 个别 dtype 对象不可哈希, in 会抛 TypeError; 落回原实现。
             pass
         return origin_func(dtype)
 
@@ -66,23 +74,22 @@ def _patch_triton_ascend_mindspore_dtype_bytes():
 
 _patch_triton_ascend_mindspore_dtype_bytes()
 
+
 def _prune_configs(configs, named_args, **kwargs):
     """autotune config 过滤
 
     - UB 容量上限(910B 单核 ~192KB)
     - grid program 总数上限(实测 131072 可跑, 262144 静默失败)
-    两条约束通过 BLOCK_S1(bsn 维分块) 与 BLOCK_S2(S2 维分块) 解耦:
-      grid = (cdiv(B*S1*N2, BLOCK_S1), cdiv(S2, BLOCK_S2))
-      单 tile UB 只取决于 BLOCK_S2/BLOCK_D/BLOCK_G, 与 grid 大小无关
+    - grid0/grid1 必须是 2 的幂, 否则 runtime 分核映射出错 -> aicore trap
     """
     _UB_LIMIT_BYTES = 192 * 1024
-    _GRID_LIMIT = 131072  # 已知可跑的上限; 留余量可调小
+    _GRID_LIMIT = 131072  # 已知可跑的上限; 调小则过于严格有损性能
 
     def _estimate_ub_bytes(block_s2, block_d, block_g):
-        """粗估单 tile 主要 buffer 的 UB 占用(bytes)。
+        """粗估单 tile 主要 buffer 的 UB 占用 (bytes)。
 
-        系数 1.25 近似 multi-buffer(double buffering) + 转置临时空间的额外开销,
-        由实测报错值校准: (BLOCK_S2=256,BLOCK_D=128,BLOCK_G=64) 实测需 ~262KB。
+        1.25 系数近似 double-buffering + tl.trans 临时空间, 由实测反推:
+        (BLOCK_S2=256,BLOCK_D=128,BLOCK_G=64) 实测要 ~262KB。
         """
         if block_s2 is None or block_d is None or block_g is None:
             return 0
@@ -109,20 +116,17 @@ def _prune_configs(configs, named_args, **kwargs):
         bd  = c.kwargs.get("BLOCK_D")
         bg  = c.kwargs.get("BLOCK_G")
 
-        # UB 约束(总能判断, 只依赖 block 大小)
         if _estimate_ub_bytes(bs2, bd, bg) > _UB_LIMIT_BYTES:
             continue
 
-        # BLOCK 不超实际维度(严格大于才过滤, 保留 ==)
         if None not in (S2, D, G):
             if bs2 > S2 or bd > D or bg > G:
                 continue
 
-        # grid 总数约束
         if None not in (B, S1, N2, S2) and bs1 and bs2:
             bsn = B * S1 * N2
-            grid0 = (bsn + bs1 - 1) // bs1
-            grid1 = (S2 + bs2 - 1) // bs2
+            grid0 = _next_pow2((bsn + bs1 - 1) // bs1)
+            grid1 = _next_pow2((S2 + bs2 - 1) // bs2)
             if grid0 * grid1 > _GRID_LIMIT:
                 continue
 
@@ -179,15 +183,14 @@ def _lightning_indexer_score_kernel(
 ):
     """Compute reduced scores for lightning_indexer (BSND layout).
 
-    Grid: (cdiv(B * S1 * N2, BLOCK_S1), cdiv(S2, BLOCK_S2))
-    每个 program 处理 BLOCK_S1 个 (b, s1, n2) 位置 (bsn 扁平维度上连续的一段)
-    的同一个 S2 tile。bsn 维分块用于压低 grid 第0维, 使总 program 数不随
-    S1/S2 规模线性膨胀而超过 launch 上限。
-        score[b, s1, n2, s2] = sum_{g in group}(ReLU(Q[b,s1,g,:] @ K[b,s2,n2,:]^T) * W[b,s1,g])
-    where group = [n2 * G, (n2+1) * G), G = N1 // N2.
+    Grid: (cdiv(B*S1*N2, BLOCK_S1), cdiv(S2, BLOCK_S2)), 两维都 pow2-padded。
+    把 (b,s1,n2) 摊平成 bsn 维再按 BLOCK_S1 分块, 是为了让 grid0 不随 S1 线性膨胀撑破
+    coreDim 上限。每个 program 算 BLOCK_S1 个 bsn 位置的同一个 S2 tile:
+        score[b,s1,n2,s2] = sum_{g in group}(ReLU(Q[b,s1,g,:] @ K[b,s2,n2,:]^T) * W[b,s1,g])
+    其中 group = [n2*G, (n2+1)*G), G = N1 // N2。
     """
-    pid_bsn_blk = tl.program_id(0)  # ∈ [0, cdiv(B*S1*N2, BLOCK_S1))
-    pid_s2      = tl.program_id(1)  # ∈ [0, cdiv(S2, BLOCK_S2))
+    pid_bsn_blk = tl.program_id(0)
+    pid_s2      = tl.program_id(1)
 
     s2_offs  = pid_s2 * BLOCK_S2 + tl.arange(0, BLOCK_S2)
     s2_valid = s2_offs < S2
@@ -196,13 +199,13 @@ def _lightning_indexer_score_kernel(
     bsn_limit = B * S1 * N2
     bsn_base = pid_bsn_blk * BLOCK_S1
 
-    # 串行处理本 block 负责的 BLOCK_S1 个 bsn 位置
-    # 注: 用循环内 if/else + 末尾统一单 store, 不用 early-return
-    #     (triton-ascend 对多 early-return + store 有丢 store 的 bug)
+    # 串行扫本 block 的 BLOCK_S1 个 bsn 位置。踩坑: triton-ascend 一个 kernel 里多个
+    # early-return + store 会丢 store, 所以全程不 return, 无效位置也走完、只置空 store mask。
     for i in range(BLOCK_S1):
         bsn = bsn_base + i
         bsn_in_range = bsn < bsn_limit
-        bsn = tl.where(bsn_in_range, bsn, 0) # 避免地址计算越界被硬件 trap;
+        # pow2-padding 会多出越界 program; 钳到 0 只为地址不 trap, 不写脏数据靠末尾 store_mask。
+        bsn = tl.where(bsn_in_range, bsn, 0)
 
         n2  = bsn % N2
         tmp = bsn // N2
@@ -214,7 +217,7 @@ def _lightning_indexer_score_kernel(
         act_q = tl.load(act_q_ptr + b) # 当前 sample 的有效 query 序列长度
         act_k = tl.load(act_k_ptr + b) # 当前 sample 的有效 key 序列长度
 
-        # Causal limit
+        # rightDownCausal: query s1 可见 key 上界 = act_k-act_q+s1+1 (右下对齐), 再和 act_k/S2 取交。
         if sparse_mode == 3:
             causal_limit  = tl.minimum(tl.maximum(act_k - act_q + s1 + 1, 0), S2)
             visible_limit = tl.minimum(act_k, causal_limit)
@@ -222,18 +225,19 @@ def _lightning_indexer_score_kernel(
             causal_limit  = S2
             visible_limit = act_k
 
-        # 是否需要实际计算: bsn 合法 且 query 有效 且 本 S2 tile 在可见范围内
+        # bsn 合法 + query 行有效 + 本 S2 tile 在可见范围内, 三者缺一就整段跳过、直接输出 -inf。
         need_compute = bsn_in_range & (s1 < act_q) & (pid_s2 * BLOCK_S2 < visible_limit)
 
         if need_compute:
-            # Base offsets: q[B, S1, N1, D], k[B, S2, N2, D], w[B, S1, N1]
+            # offset 基址 (内存布局 q[B,S1,N1,D] / k[B,S2,N2,D] / w[B,S1,N1])。
             k_base = b * S2 * k_row_stride + n2 * D
             q_base = ((b * S1 + s1) * N1 + n2 * G) * D
             w_base = (b * S1 + s1) * N1 + n2 * G
 
             tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
 
-            # G 维分块, 外层循环; K tile 在 D 内循环 load, 被 G 内循环复用
+            # G 外 / D 内分块。k_tile 与 g 无关却每个 g-block 重 load 一遍 (G=64/BLOCK_G=16 时 4 次),
+            # K 带宽吃紧时可提到 g 循环外复用。
             for g_start in range(0, G, BLOCK_G):
                 g_rel   = g_start + tl.arange(0, BLOCK_G)
                 g_valid = g_rel < G
@@ -245,7 +249,6 @@ def _lightning_indexer_score_kernel(
                     d_offs  = d_start + tl.arange(0, BLOCK_D)
                     d_valid = d_offs < D
 
-                    # Q tile: [BLOCK_G, BLOCK_D]
                     q_offs = q_base + g_rel[:, None] * D + d_offs[None, :]
                     q_tile = tl.load(
                         q_ptr + q_offs,
@@ -253,7 +256,6 @@ def _lightning_indexer_score_kernel(
                         other=0.0,
                     )
 
-                    # K tile: [BLOCK_S2, BLOCK_D]
                     k_offs = k_base + s2_offs[:, None] * k_row_stride + d_offs[None, :]
                     k_tile = tl.load(
                         k_ptr + k_offs,
@@ -261,41 +263,42 @@ def _lightning_indexer_score_kernel(
                         other=0.0,
                     )
 
-                    # Cube MMA: [BLOCK_G, BLOCK_D] x [BLOCK_D, BLOCK_S2]
                     acc += tl.dot(q_tile, tl.trans(k_tile))
 
-                # ReLU + W 加权
+                # indexer 打分 = 各 head ReLU(Q·K) 按 W 加权求和; padding 的 g 行先清零。
                 acc = tl.maximum(acc, 0.0)
                 acc = tl.where(g_valid[:, None], acc, 0.0)
                 tile_scores += tl.sum(acc * w_g[:, None], axis=0)
 
-            # Causal mask (sparse_mode == 3: rightDownCausal)
+            # 超出 causal / act_k 的不可见位置置 -inf, topk 时会被映射成 index -1。
             if sparse_mode == 3:
                 tile_scores = tl.where(s2_offs < causal_limit, tile_scores, float('-inf'))
             tile_scores = tl.where(s2_offs < act_k, tile_scores, float('-inf'))
         else:
             tile_scores = tl.full([BLOCK_S2], float('-inf'), dtype=tl.float32)
 
-        # 越界 bsn 不写(mask 全 False); 有效行按 s2_valid 写
+        # s2_valid 卡 S2 尾块, bsn_in_range 卡 padding 越界行; 任一为假都不写。
         store_mask = s2_valid & bsn_in_range
         tl.store(score_ptr + score_row_base + s2_offs, tile_scores, mask=store_mask)
 
 
 def _default_actual_seq_lens(actual_seq_lens, batch_size, seq_len):
+    # None -> 默认整段; list/tuple -> 转 int32 张量; 否则原样透传。
     return ms.ops.fill(ms.int32, (batch_size,), seq_len) if actual_seq_lens is None else \
            ms.Tensor(list(actual_seq_lens), dtype=ms.int32) if isinstance(actual_seq_lens, (list, tuple)) else \
            actual_seq_lens
 
 
 def _tnd_cumsum_to_per_batch(cumsum):
+    # TND 的 actual_seq_lengths 是累积前缀和; 错位相减还原成每 batch 实际长度。
     return cumsum - ops.pad(cumsum[:-1], (1, 0))
 
 
 def _tnd_to_bsnd(tensor, act_seq_per_batch):
-    """Convert [T, N, ...] to [B, max_S, N, ...].
+    """[T, N, ...] -> [B, max_S, N, ...], 按各 batch 实际长度填充、其余补零。
 
-    Uses Python-loop based conversion; works in PyNative mode.
-    For GRAPH_MODE, caller should pass BSND tensors directly.
+    python 循环做变长切片, 只能 PyNative (GRAPH_MODE 无法处理数据依赖的切片);
+    GRAPH_MODE 调用方请直接传 BSND。
     """
     assert ms.get_context('mode') == ms.PYNATIVE_MODE, "Only PyNative mode is supported."
     B = act_seq_per_batch.shape[0]
@@ -316,7 +319,7 @@ def _tnd_to_bsnd(tensor, act_seq_per_batch):
 
 
 def _bsnd_to_tnd(tensor, act_seq_per_batch):
-    """Convert [B, S, N, ...] to [T, N, ...]."""
+    """[B, S, N, ...] -> [T, N, ...], _tnd_to_bsnd 的逆操作 (同样 PyNative-only)。"""
     assert ms.get_context('mode') == ms.PYNATIVE_MODE, "Only PyNative mode is supported."
     B = act_seq_per_batch.shape[0]
     lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
@@ -340,21 +343,24 @@ def _stable_topk(scores_2d, k, stable=False):
     k = min(k, s2_len)
 
     if stable:
+        # stable=True: 用 sort 保证同分时稳定顺序, 与 CANN 参考对齐 (比 topk 慢)。
         _, sorted_indices = mint.sort(-scores_2d, dim=1, stable=True)
         topk_indices = sorted_indices[:, :k].to(ms.int32)
         topk_values = ops.gather_d(scores_2d, 1, topk_indices)
     else:
-        # 直接使用 mint.topk, 性能更好, 但同分情况排序结果与 CANN 参考实现有差异
+        # mint.topk 更快; 但同分时排序结果与 CANN 不保证一致, 对数值无影响。
         topk_values, topk_indices = mint.topk(scores_2d, k, dim=1, largest=True, sorted=True)
         topk_indices = topk_indices.to(ms.int32)
 
-    # -inf positions are invalid -> index -1, aligned with builtin op
+    # -inf 占位的不可见位置, index 统一置 -1, 与 ops 算子语义一致。
     invalid = topk_values == float('-inf')
     topk_indices = mint.where(invalid, -1, topk_indices)
 
     return topk_indices, topk_values
 
 
+# _ms_pyfunc 的 shape/dtype 推导: 输出与 scores_flat 同形同类型。
+# 参数类型注解是 _ms_pyfunc 推导依赖的, 勿删 (须与下面 core 对齐)。
 def _infer_score_launch(
     q_flat: ms.Tensor,
     k_flat: ms.Tensor,
@@ -374,6 +380,7 @@ def _infer_score_launch(
     return ms.mint.empty_like(scores_flat)
 
 
+# 参数类型注解同样被 _ms_pyfunc 依赖, 勿删。
 @ms.ops._ms_pyfunc(infer_func=_infer_score_launch)
 def _lightning_indexer_score_core(
     q_flat: ms.Tensor,
@@ -391,10 +398,11 @@ def _lightning_indexer_score_core(
     G: int,
     sparse_mode: int,
 ) -> ms.Tensor:
-    # grid 第0维按 BLOCK_S1 对 bsn(=B*S1*N2) 分块, 第1维按 BLOCK_S2 对 S2 分块
+    # grid 两维都 _next_pow2 向上取整 (Ascend 非 2 的幂 grid 会 trap); 越界 program 由
+    # kernel 内 bsn_in_range 空转。padding 须与 _prune_configs 判定一致。
     def grid_fn(meta): return (
-        triton.cdiv(B * S1 * N2, meta["BLOCK_S1"]),
-        triton.cdiv(S2, meta["BLOCK_S2"]),
+        _next_pow2(triton.cdiv(B * S1 * N2, meta["BLOCK_S1"])),
+        _next_pow2(triton.cdiv(S2, meta["BLOCK_S2"])),
     )
 
     _lightning_indexer_score_kernel[grid_fn](
@@ -408,17 +416,7 @@ def _lightning_indexer_score_core(
 
 
 class LightningIndexerTriton(ms.nn.Cell):
-    """nn.Cell wrapper for lightning_indexer_triton.
-
-    Args:
-        sparse_count: top-k count
-        sparse_mode: 3=default, rightDownCausal
-        layout_query: "BSND" or "TND"
-        layout_key: "BSND" or "TND"
-        return_value: if True, return (indices, values); else values is dummy
-        pre_tokens: ignored in triton path
-        next_tokens: ignored in triton path
-    """
+    """nn.Cell wrapper around lightning_indexer_triton; see that function for arg semantics."""
 
     def __init__(
         self,
@@ -503,6 +501,7 @@ def lightning_indexer_triton(
 
     is_tnd = (layout_query == "TND")
 
+    # TND 入口: 累积长度还原成 per-batch, 转 BSND 喂 kernel; 出口再转回 TND。
     if is_tnd:
         act_q = _tnd_cumsum_to_per_batch(actual_seq_lengths_query)
         act_k = _tnd_cumsum_to_per_batch(actual_seq_lengths_key)
@@ -523,12 +522,13 @@ def lightning_indexer_triton(
     if N1 % N2 != 0:
         raise ValueError(f"N1({N1}) must be divisible by N2({N2})")
 
-    G = N1 // N2
+    G = N1 // N2   # GQA: 每个 key head 对应的 query head 组宽
 
     q_flat = q_bsnd.contiguous()
     k_flat = k_bsnd.contiguous()
     w_flat = w_bsnd.contiguous()
 
+    # 预填 -inf: kernel 只写可见位置, 未触及的保持 -inf -> topk 视为无效 (index -1)。
     scores_flat = ms.mint.full((B * S1 * N2, S2), float('-inf'), dtype=ms.float32)
 
     scores_flat = _lightning_indexer_score_core(

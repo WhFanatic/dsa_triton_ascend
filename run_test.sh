@@ -11,7 +11,7 @@ export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 # 基础调试
 # python test_li_triton.py
 # 全量测试
-# pytest test_li_triton.py -v "$@"
+# pytest --forked test_li_triton.py -v "$@"
 # 性能测试
 # TRITON_PRINT_AUTOTUNING=1 python perf_li_triton.py
 # 内核性能测试
