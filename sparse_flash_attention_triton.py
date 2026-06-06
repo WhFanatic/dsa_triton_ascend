@@ -92,10 +92,13 @@ _patch_triton_ascend_mindspore_dtype_bytes()
 def _prune_configs(configs, named_args, **kwargs):
     """autotune config 过滤 (UB 上限 + grid pow2 + grid 总数上限)。
 
-    Two-pass kernel: no [BLOCK_G,D] resident acc; pass-2 keeps acc[BLOCK_G,BLOCK_DV]
-    + v[BLOCK_K,BLOCK_DV], so UB no longer scales with full D. The 2.0 factor below
-    is a coarse guard for Ascend's auto-multi-buffer doubling (the on-device
-    compiler is the final UB authority — observed it reject undersized estimates).
+    Single-pass fused kernel: acc[BLOCK_G, D] fp32 is resident (online-softmax
+    rescales it in place), and one V tile [BLOCK_K, D] fp16 is loaded per K-block,
+    so UB now scales with the FULL output dim D. Large BLOCK_K therefore only
+    survives at small D. The 3.0 factor guards Ascend's auto-multi-buffer
+    expansion: device-measured occupancy was ~2.73x the raw tile sum for the
+    single-pass acc[.,D]+v[.,D] layout (a 2.0 guard let a D=512 config through
+    that then overflowed UB at 237KB), so 3.0 leaves headroom under 192KB.
     """
     _UB_LIMIT_BYTES = 180 * 1024   # headroom under the 192KB hard limit
     _GRID_LIMIT = 131072
@@ -107,33 +110,46 @@ def _prune_configs(configs, named_args, **kwargs):
 
     N1 = _get("N1")
     BS1 = _get("B_S1")
+    D = _get("D")
+    D_ROPE = _get("D_ROPE")
+    topK = _get("topK")
 
-    def _estimate_ub_bytes(block_g, block_k, block_d, block_dv):
-        if None in (block_g, block_k, block_d, block_dv):
+    def _estimate_ub_bytes(block_g, block_k, block_d):
+        if None in (block_g, block_k, block_d, D):
             return 0
-        acc = block_g * block_dv * 4        # acc[BLOCK_G, BLOCK_DV] fp32 (pass 2)
-        v_tile = block_k * block_dv * 2     # v[BLOCK_K, BLOCK_DV] fp16
+        acc = block_g * D * 4               # acc[BLOCK_G, D] fp32 resident
+        v_tile = block_k * D * 2            # v[BLOCK_K, D] fp16 (full D per K-block)
         q_tile = block_g * block_d * 2      # q/k QK tiles fp16
         k_tile = block_k * block_d * 2
         s_tile = block_g * block_k * 4      # scores[BLOCK_G, BLOCK_K] fp32
         p_tile = block_g * block_k * 2      # p cast fp16 for PV
         trans = block_k * block_d * 2       # tl.trans tmp
         total = acc + v_tile + q_tile + k_tile + s_tile + p_tile + trans
-        return int(total * 2.0)             # multi-buffer doubling guard
+        return int(total * 3.0)             # multi-buffer doubling guard
 
     kept = []
     for c in configs:
         bg = c.kwargs.get("BLOCK_G")
         bk = c.kwargs.get("BLOCK_K")
         bd = c.kwargs.get("BLOCK_D")
-        bdv = c.kwargs.get("BLOCK_DV")
 
-        if _estimate_ub_bytes(bg, bk, bd, bdv) > _UB_LIMIT_BYTES:
+        if _estimate_ub_bytes(bg, bk, bd) > _UB_LIMIT_BYTES:
+            continue
+        # Drop square QK tiles (BLOCK_K == BLOCK_D, and by extension BLOCK_K >
+        # BLOCK_D). The Ascend backend miscompiles tl.trans(k_tile) for a square
+        # [BLOCK_K, BLOCK_D] tile, emitting a VEC instruction that reads past the
+        # UB allocation -> aicore exception (retcode 507015, "ub address out of
+        # bounds") at kernel launch. Confirmed by per-config isolation: configs
+        # 64x64 and 128x128 fault on every shape/D tested, while every BLOCK_K <
+        # BLOCK_D config (incl. 64x128, same byte size as 64x64) runs clean. Tile
+        # transpose stays correct only for the strictly-rectangular case here.
+        if bk is not None and bd is not None and bk >= bd:
             continue
         # NB: BLOCK_G may exceed N1; the kernel masks padded heads (g_valid),
         # so we do NOT prune on bg > N1 (would kill all configs for small N1).
         if None not in (BS1, N1) and bg:
-            grid0 = _next_pow2(BS1)
+            bs1_block = c.kwargs.get("BLOCK_S1") or 1
+            grid0 = _next_pow2((BS1 + bs1_block - 1) // bs1_block)
             grid1 = _next_pow2((N1 + bg - 1) // bg)
             if grid0 * grid1 > _GRID_LIMIT:
                 continue
@@ -143,7 +159,7 @@ def _prune_configs(configs, named_args, **kwargs):
         print('Warning: all autotune params pruned')
         kept = [min(configs, key=lambda c: _estimate_ub_bytes(
             c.kwargs.get("BLOCK_G"), c.kwargs.get("BLOCK_K"),
-            c.kwargs.get("BLOCK_D"), c.kwargs.get("BLOCK_DV")))]
+            c.kwargs.get("BLOCK_D")))]
     return kept
 
 
@@ -188,13 +204,26 @@ def _sfa_scores_block(
 
 @triton.autotune(
     configs=[
-        # Two-pass kernel: pass-2 keeps only acc[BLOCK_G, BLOCK_DV] (not [.,D]) +
-        # v[BLOCK_K, BLOCK_DV], so UB no longer scales with full D. BLOCK_DV<=128.
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 64, "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 32, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # Single-pass fused kernel: one K-loop streams KV, online-softmax rescales
+        # acc[BLOCK_G, D] (fp32, resident) in place -> scores/K-gather/V-gather done
+        # ONCE (was 5x in the two-pass tiling). acc scales with full D, so UB now
+        # depends on D; _prune_configs drops configs whose acc[BLOCK_G,D]+tiles
+        # exceed UB (large BLOCK_K survives only at small D).
+        # BLOCK_S1 folds multiple query positions into one program, shrinking grid0
+        # (= _next_pow2(cdiv(B*S1, BLOCK_S1))) and launch/sync overhead. It does NOT
+        # change UB (positions run serially, reusing the same tiles).
+        # Tile sizes span the UB budget: large BLOCK_K (measure-2 win) survives only
+        # at small D; small BLOCK_K/BLOCK_D fall-backs keep D=512 compilable (acc[.,D]
+        # + v[.,D] dominate UB at D=512 — see _prune_configs).
+        triton.Config({"BLOCK_S1": 8,  "BLOCK_G": 16, "BLOCK_K": 16,  "BLOCK_D": 64}),
+        triton.Config({"BLOCK_S1": 8,  "BLOCK_G": 16, "BLOCK_K": 32,  "BLOCK_D": 64}),
+        triton.Config({"BLOCK_S1": 8,  "BLOCK_G": 16, "BLOCK_K": 32,  "BLOCK_D": 128}),
+        triton.Config({"BLOCK_S1": 8,  "BLOCK_G": 16, "BLOCK_K": 64,  "BLOCK_D": 64}),
+        triton.Config({"BLOCK_S1": 8,  "BLOCK_G": 16, "BLOCK_K": 64,  "BLOCK_D": 128}),
+        triton.Config({"BLOCK_S1": 8,  "BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128}),
+        triton.Config({"BLOCK_S1": 16, "BLOCK_G": 16, "BLOCK_K": 16,  "BLOCK_D": 64}),
+        triton.Config({"BLOCK_S1": 16, "BLOCK_G": 16, "BLOCK_K": 64,  "BLOCK_D": 128}),
+        triton.Config({"BLOCK_S1": 4,  "BLOCK_G": 16, "BLOCK_K": 16,  "BLOCK_D": 64}),
     ],
     key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
     prune_configs_by={"early_config_prune": _prune_configs},
@@ -211,59 +240,100 @@ def _sfa_kernel(
     scale_value,
     sparse_mode: tl.constexpr,
     return_lse: tl.constexpr,
+    BLOCK_S1: tl.constexpr,
     BLOCK_G: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    BLOCK_DV: tl.constexpr,
 ):
-    """Flash attention over sparsely gathered KV (BSND, MQA / N2=1), two-pass.
+    """Flash attention over sparsely gathered KV (BSND, MQA / N2=1), single-pass.
 
-    Grid: (_next_pow2(B*S1), _next_pow2(cdiv(N1, BLOCK_G))), both pow2-padded.
-    Each program: one (b,s1) position, BLOCK_G query heads. Inline-gathers KV
-    rows by sparse token indices.
+    Grid: (_next_pow2(cdiv(B*S1, BLOCK_S1)), _next_pow2(cdiv(N1, BLOCK_G))), both
+    pow2-padded. Each program walks BLOCK_S1 query positions serially (folding
+    them into one program shrinks grid0 and the launch/sync overhead), each over
+    BLOCK_G query heads. Inline-gathers KV rows by sparse token indices.
 
-    Pass 1: stream KV -> online-softmax stats m_i / l_i (only [BLOCK_G] vectors).
-    Pass 2: tile output dim by BLOCK_DV; per tile re-stream KV, recompute scores,
-            accumulate p @ v into acc[BLOCK_G, BLOCK_DV]. Keeps UB independent of D.
+    Single-pass online-softmax: one K-loop streams KV once, maintaining stats
+    m_i / l_i AND rescaling acc[BLOCK_G, D] (fp32, resident) in place. Scores,
+    K-gather and V-gather each happen ONCE per K-block (the prior two-pass tiling
+    recomputed scores + re-streamed KV per output tile, ~5x). UB now scales with
+    the full output dim D (acc + the [BLOCK_K, D] V tile), so large BLOCK_K only
+    fits at small D — see _prune_configs.
 
     sparse_ptr holds token positions directly; block-wise (sparse_block_size>1)
     is pre-expanded on host into per-token indices, so this kernel is token-wise.
     """
-    pid_bs1 = tl.program_id(0)
+    pid_s1blk = tl.program_id(0)
     pid_g = tl.program_id(1)
-
-    bs1_in_range = pid_bs1 < B_S1
-    pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0)
-
-    b = pid_bs1 // S1
-    s1 = pid_bs1 % S1
 
     g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
     g_valid = g_offs < N1
 
-    act_q = tl.load(act_q_ptr + b)
-    act_k = tl.load(act_k_ptr + b)
+    # Walk BLOCK_S1 (b,s1) positions in this program. Each iteration reproduces
+    # the original single-position computation exactly (per-position threshold,
+    # row_active, base offsets), so batch boundaries inside the block are handled
+    # by recomputing b=pid//S1, s1=pid%S1 per position.
+    for s1_local in range(BLOCK_S1):
+        pid_bs1 = pid_s1blk * BLOCK_S1 + s1_local
 
-    # causal window upper bound (token threshold)
-    if sparse_mode == 0:
-        threshold = act_k
-    else:
-        threshold = act_k - act_q + s1 + 1
+        bs1_in_range = pid_bs1 < B_S1
+        pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0)
 
-    # rightDownCausal: leading rows (query longer than key) are fully hidden.
-    row_active = bs1_in_range & (s1 < act_q) & (threshold > 0)
+        b = pid_bs1 // S1
+        s1 = pid_bs1 % S1
 
-    # base offsets (memory layout: q[B,S1,N1,D], k/v[B,S2,1,D], rope analogous)
-    q_base = (b * S1 + s1) * N1 * D
-    qr_base = (b * S1 + s1) * N1 * D_ROPE
-    k_base = b * S2 * D
-    kr_base = b * S2 * D_ROPE
-    v_base = b * S2 * D
-    sp_base = (b * S1 + s1) * topK
+        act_q = tl.load(act_q_ptr + b)
+        act_k = tl.load(act_k_ptr + b)
 
-    # ---- Pass 1: online-softmax stats (m_i, l_i); no V, no [BLOCK_G,D] acc ----
+        # causal window upper bound (token threshold)
+        if sparse_mode == 0:
+            threshold = act_k
+        else:
+            threshold = act_k - act_q + s1 + 1
+
+        # rightDownCausal: leading rows (query longer than key) are fully hidden.
+        row_active = bs1_in_range & (s1 < act_q) & (threshold > 0)
+
+        # base offsets (memory layout: q[B,S1,N1,D], k/v[B,S2,1,D], rope analogous)
+        q_base = (b * S1 + s1) * N1 * D
+        qr_base = (b * S1 + s1) * N1 * D_ROPE
+        k_base = b * S2 * D
+        kr_base = b * S2 * D_ROPE
+        v_base = b * S2 * D
+        sp_base = (b * S1 + s1) * topK
+        sm_base = (b * S1 + s1) * N1   # softmax_max/sum layout (B,1,S1,N1) flat
+
+        _sfa_one_position(
+            q_ptr, qr_ptr, k_ptr, kr_ptr, v_ptr, sparse_ptr,
+            out_ptr, sm_max_ptr, sm_sum_ptr,
+            q_base, qr_base, k_base, kr_base, v_base, sp_base, sm_base,
+            threshold, act_k, row_active, g_offs, g_valid,
+            topK, scale_value,
+            D, D_ROPE, N1, return_lse,
+            BLOCK_G, BLOCK_K, BLOCK_D)
+
+
+@triton.jit
+def _sfa_one_position(
+    q_ptr, qr_ptr, k_ptr, kr_ptr, v_ptr, sparse_ptr,
+    out_ptr, sm_max_ptr, sm_sum_ptr,
+    q_base, qr_base, k_base, kr_base, v_base, sp_base, sm_base,
+    threshold, act_k, row_active, g_offs, g_valid,
+    topK, scale_value,
+    D: tl.constexpr, D_ROPE: tl.constexpr, N1, return_lse: tl.constexpr,
+    BLOCK_G: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    """One (b,s1) position, single-pass online-softmax.
+
+    One K-loop streams KV once: per K-block it computes scores, updates the
+    running max m_i / denom l_i, and rescales the resident acc[BLOCK_G, D] by
+    alpha = exp(m_old - m_new) before adding p @ v. Numerically identical to the
+    prior two-pass formulation (standard flash-attention rescale identity), but
+    scores / K-gather / V-gather happen once instead of 5x."""
+    d_offs = tl.arange(0, D)               # full output dim (D is constexpr)
+    acc = tl.zeros([BLOCK_G, D], dtype=tl.float32)
     m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
+
     for blk_start in range(0, topK, BLOCK_K):
         blk_offs = blk_start + tl.arange(0, BLOCK_K)
         blk_in_count = blk_offs < topK
@@ -277,7 +347,8 @@ def _sfa_kernel(
             tok_clamped, tok_valid, g_offs, g_valid,
             scale_value, D, D_ROPE, BLOCK_G, BLOCK_K, BLOCK_D)
 
-        # guard all-masked block: max stays -inf -> safe 0 so exp(-inf)=0, not nan.
+        # online-softmax: guard all-masked block (max stays -inf -> safe 0 so
+        # exp(-inf)=0, not nan). alpha rescales both l_i and the resident acc.
         m_blk = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_blk)
         m_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
@@ -285,48 +356,24 @@ def _sfa_kernel(
         p = tl.where(tok_valid[None, :], p, 0.0)
         alpha = tl.exp(m_i - m_safe)
         l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        v_tile = tl.load(
+            v_ptr + v_base + tok_clamped[:, None] * D + d_offs[None, :],
+            mask=tok_valid[:, None], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
         m_i = m_new
 
-    # final global max for pass 2 (empty rows: m_i==-inf -> use 0, p will be 0)
-    m_final = tl.where(m_i == float('-inf'), 0.0, m_i)
     l_safe = tl.where(l_i > 0.0, l_i, 1.0)
-
-    # ---- Pass 2: tile output dim, recompute scores, accumulate p @ v ----
-    out_base = (b * S1 + s1) * N1 * D
-    for dv_start in range(0, D, BLOCK_DV):
-        dv_offs = dv_start + tl.arange(0, BLOCK_DV)
-        dv_valid = dv_offs < D
-        acc = tl.zeros([BLOCK_G, BLOCK_DV], dtype=tl.float32)
-        for blk_start in range(0, topK, BLOCK_K):
-            blk_offs = blk_start + tl.arange(0, BLOCK_K)
-            blk_in_count = blk_offs < topK
-            tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
-            tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-            tok_clamped = tl.where(tok_valid, tok, 0)
-
-            scores = _sfa_scores_block(
-                q_ptr, q_base, qr_ptr, qr_base,
-                k_ptr, k_base, kr_ptr, kr_base,
-                tok_clamped, tok_valid, g_offs, g_valid,
-                scale_value, D, D_ROPE, BLOCK_G, BLOCK_K, BLOCK_D)
-
-            p = tl.exp(scores - m_final[:, None])
-            p = tl.where(tok_valid[None, :], p, 0.0)
-            v_tile = tl.load(
-                v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
-                mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
-            acc += tl.dot(p.to(v_tile.dtype), v_tile)
-
-        out_tile = acc / l_safe[:, None]
-        tl.store(
-            out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
-            out_tile.to(out_ptr.dtype.element_ty),
-            mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+    out_base = q_base   # out[B,S1,N1,D] shares q[B,S1,N1,D]'s (b,s1) row offset
+    out_row = acc / l_safe[:, None]
+    tl.store(
+        out_ptr + out_base + g_offs[:, None] * D + d_offs[None, :],
+        out_row.to(out_ptr.dtype.element_ty),
+        mask=g_valid[:, None] & row_active)
 
     if return_lse:
         # softmax_max/sum layout (B, N2=1, S1, N1) -> flat (b*S1+s1)*N1 + g.
         # Empty/hidden rows (l_i==0) keep the pre-filled 0 to match the golden.
-        sm_base = (b * S1 + s1) * N1
         store_mask = g_valid & row_active & (l_i > 0.0)
         tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
         tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
@@ -457,8 +504,10 @@ def _sfa_core(
 ) -> tuple[ms.Tensor, ms.Tensor, ms.Tensor]:
     # grid both dims pow2-padded (Ascend traps on non-pow2 grid); out-of-range
     # programs idle via in_range masks. Padding must match _prune_configs.
+    # grid0 folds B*S1 by BLOCK_S1 (one program walks BLOCK_S1 positions),
+    # shrinking the launch/sync overhead that dominated the profile.
     def grid_fn(meta): return (
-        _next_pow2(B_S1),
+        _next_pow2(triton.cdiv(B_S1, meta["BLOCK_S1"])),
         _next_pow2(triton.cdiv(N1, meta["BLOCK_G"])),
     )
 

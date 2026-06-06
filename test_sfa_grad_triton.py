@@ -245,6 +245,33 @@ def test_basic(B, S1, S2, N1, sparse_count, D, sparse_mode, dtype):
 
 
 # ---------------------------------------------------------------------------
+# smoke — fast per-edit regression. Each case is a FULL param tuple (no D/dtype
+# cross-product), so the count is exactly what's listed. Reuses test_golden /
+# test_accuracy bodies. Run after every edit:  pytest --forked -k smoke
+# Run the full matrix only after large structural / logic changes.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("B,S1,S2,N1,sc,bs,mode,D,dtype", [
+    (2, 16, 256, 16, 128, 1, 3, 512, ms.float16),  # multi-batch: pid crosses batch boundary
+    (1, 4, 128, 8, 64, 1, 3, 512, ms.bfloat16),    # B_S1<BLOCK_S1: tail-program masking + bf16
+    (1, 4, 128, 8, 64, 1, 0, 256, ms.float16),     # sparse_mode 0 (full), D=256
+    (1, 1, 128, 8, 16, 1, 3, 128, ms.float16),     # S1=1 single row, D=128
+    (1, 8, 128, 8, 32, 2, 3, 512, ms.float16),     # block-wise (bs=2)
+])
+def test_smoke_golden(B, S1, S2, N1, sc, bs, mode, D, dtype):
+    """Fast backward golden subset covering the BLOCK_S1 folding risk points."""
+    test_golden(B, S1, S2, N1, sc, bs, mode, D, dtype)
+
+
+@pytest.mark.parametrize("B,S1,S2,N1,sparse_count,sparse_mode,dtype", [
+    (2, 8, 256, 32, 128, 3, ms.bfloat16),  # multi-batch + bf16 vs CANN
+    (1, 8, 128, 16, 64, 0, ms.float16),    # full mode vs CANN
+])
+def test_smoke_accuracy(B, S1, S2, N1, sparse_count, sparse_mode, dtype):
+    """Fast CANN-baseline subset (backward)."""
+    test_accuracy(B, S1, S2, N1, sparse_count, sparse_mode, dtype)
+
+
+# ---------------------------------------------------------------------------
 # negative guards — unsupported interface params must raise, not silently run
 # ---------------------------------------------------------------------------
 def test_guards():

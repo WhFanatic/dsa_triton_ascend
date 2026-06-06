@@ -1,8 +1,9 @@
 #!/bin/bash
-export ASCEND_RT_VISIBLE_DEVICES=7
+export ASCEND_RT_VISIBLE_DEVICES=8
 export TRITON_END=mindspore
 export TRITON_BACKEND=mindspore
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+export TRITON_CACHE_DIR=./my_triton_cache
 
 # ####################
 # LightningIndexer 算子测试
@@ -53,7 +54,11 @@ export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 # 接口守卫（不支持参数须 raise ValueError，无需 NPU）
 # pytest --forked test_sfa_grad_triton.py -v -k test_guards "$@"
 
-# ---- 一键功能+精度回归（前向+反向 golden & accuracy，改完代码跑这条）----
+# ---- 日常快速回归（改完代码先跑这条：前向+反向 smoke，精选 7+7 个典型 case）----
+# 命中 BLOCK_S1 合核风险点（跨 batch / 尾部 padding / mode0/3 / S1=1 / block-wise）+ fp16/bf16/D 覆盖
+# pytest --forked test_sfa_triton.py test_sfa_grad_triton.py -v -k "smoke" "$@"
+
+# ---- 全量功能+精度回归（结构/逻辑大改后才跑：前向+反向 golden & accuracy，约 90+ case）----
 # pytest --forked test_sfa_triton.py test_sfa_grad_triton.py -v -k "test_golden or test_accuracy" "$@"
 
 # ---- 性能 / profiling ----
