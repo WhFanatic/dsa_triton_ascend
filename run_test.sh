@@ -15,18 +15,27 @@ export TRITON_CACHE_DIR=./my_triton_cache
 # pytest --forked test_li_triton.py -v "$@"
 # 性能测试
 # TRITON_PRINT_AUTOTUNING=1 python perf_li_triton.py
-# 内核性能测试
-# python test_li_triton.py
-# msprof --output=./profilers/prof_arith --aicpu=on --ai-core=on --ascendcl=on --aic-metrics=ArithmeticUtilization python test_li_triton.py
-# msprof --output=./profilers/prof_pipe  --aicpu=on --ai-core=on --ascendcl=on --aic-metrics=PipeUtilization       python test_li_triton.py
-# msprof --output=./profilers/prof_mem   --aicpu=on --ai-core=on --ascendcl=on --aic-metrics=Memory                python test_li_triton.py
-# msprof --output=./profilers/prof_ub    --aicpu=on --ai-core=on --ascendcl=on --aic-metrics=MemoryUB              python test_li_triton.py
+# 内核性能测试（msprof op 指定 kernel，避免全量采集与 triton driver 冲突导致 segfault）
+# msprof op --kernel-name="_lightning_indexer_score_kernel" --output=./profilers python perf_li_triton.py --kernel-only
 
 # ####################
-# SparseLightningIndexerGradKLLoss 算子测试
+# SparseLightningIndexerGradKLLoss 算子测试----脚本待调试
 # ####################
 
+# 基础调试
 # python test_sli_grad_kl_loss_triton.py
+# 全量测试
+# pytest --forked test_sli_grad_kl_loss_triton.py -v "$@"
+# 性能测试（triton vs CANN 计时 + speedup）
+# TRITON_PRINT_AUTOTUNING=1 python perf_sli_grad_kl_loss_triton.py
+# triton profiling
+# python perf_sli_grad_kl_loss_triton.py
+# CANN profiling
+# python perf_sli_grad_kl_loss_triton.py
+# 内核性能测试（msprof op 指定 kernel，3个 kernel 耗时汇总为 triton 总耗时）
+# msprof op --kernel-name="_gather_kv_kernel" --output=./profilers python perf_sli_grad_kl_loss_triton.py --kernel-only
+# msprof op --kernel-name="_indexer_grad_kl_loss_kernel" --output=./profilers python perf_sli_grad_kl_loss_triton.py --kernel-only
+# msprof op --kernel-name="_scatter_dkey_index_kernel" --output=./profilers python perf_sli_grad_kl_loss_triton.py --kernel-only
 
 # ####################
 # SparseFlashAttention 算子测试
@@ -63,7 +72,11 @@ export TRITON_CACHE_DIR=./my_triton_cache
 
 # ---- 性能 / profiling ----
 # 计时 + speedup（triton vs CANN）
-TRITON_PRINT_AUTOTUNING=1 python perf_sfa_triton.py
+# TRITON_PRINT_AUTOTUNING=1 python perf_sfa_triton.py
 # 内核性能测试（msprof op 指定 kernel，避免全量采集与 triton driver 冲突导致 segfault）
-msprof op --kernel-name="_sfa_kernel" --output=./profilers python perf_sfa_triton.py --kernel-only
+# msprof op --kernel-name="_sfa_kernel" --output=./profilers python perf_sfa_triton.py --kernel-only
 
+# 计时 + speedup（triton vs CANN）
+TRITON_PRINT_AUTOTUNING=1 python perf_sfa_grad_triton.py
+# 内核性能测试（msprof op 指定 kernel，避免全量采集与 triton driver 冲突导致 segfault）
+msprof op --kernel-name="_sfa_grad_kernel" --output=./profilers python perf_sfa_grad_triton.py --kernel-only
