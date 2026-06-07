@@ -4,9 +4,9 @@ BSND layout, sparse_mode=3 (rightDownCausal).
 Reuses softmaxMax/softmaxSum from forward pass for numerical consistency with CANN.
 
 Stages (per (b,s1) position):
-  1. I[k] = Σ_g W[g] · ReLU(qi[g] @ ki[idx[k]]^T)
-  2. p[k] = (1/N1) Σ_h softmax(score_h)[k]  (teacher)
-  3-4. softmax(I) → KL(p || softmax(I)) loss → dI
+  1. I[k] = sum_g W[g] * ReLU(qi[g] @ ki[idx[k]]^T)
+  2. p[k] = (1/N1) sum_h softmax(score_h)[k]  (teacher)
+  3-4. softmax(I) -> KL(p || softmax(I)) loss -> dI
   5. dW, dQueryIndex, dKeyIndex from chain rule
 """
 import triton
@@ -15,7 +15,7 @@ import mindspore as ms
 from mindspore import ops
 
 
-# vec[D] @ mat[K, D]^T → [K]
+# vec[D] @ mat[K, D]^T -> [K]
 @triton.jit
 def _block_dot_1xD_vs_KxD(
     vec_ptr, vec_base,
@@ -40,19 +40,25 @@ def _block_dot_1xD_vs_KxD(
 @triton.jit
 def _gather_kv_kernel(
     src_ptr, indices_ptr, dst_ptr,
+    act_q_ptr, act_k_ptr,
     S1, S2, topK, D,
-    BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
+    VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """Gather sparse KV at positions specified by indices.
 
     Grid: (B * S1,)   src: [B, S2, D]   dst: [B*S1, topK, D]
-    For each (b,s1), reads topK rows from src and writes them contiguously.
+    For each (b,s1), only gathers valid causal rows.
     """
     pid = tl.program_id(0)
-    batch_src_offset = (pid // S1) * S2 * D
-    for k_start in range(0, topK, BLOCK_K):
+    b = pid // S1
+    s1 = pid % S1
+    batch_src_offset = b * S2 * D
+    act_q = tl.load(act_q_ptr + b)
+    act_k = tl.load(act_k_ptr + b)
+    s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1 + 1, 0))
+    for k_start in range(0, VALID_K, BLOCK_K):
         k_offs = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offs < topK
+        k_mask = k_offs < s2_real
         idx = tl.load(indices_ptr + pid * topK + k_offs, mask=k_mask, other=0)
         idx = tl.maximum(tl.minimum(idx, S2 - 1), 0)
         for d_start in range(0, D, BLOCK_D):
@@ -65,7 +71,6 @@ def _gather_kv_kernel(
             tl.store(dst_ptr + dst_offs, vals, mask=mask_2d)
 
 
-# main fused kernel
 @triton.jit
 def _indexer_grad_kl_loss_kernel(
     query_ptr, key_gathered_ptr,
@@ -79,14 +84,14 @@ def _indexer_grad_kl_loss_kernel(
     B, S1, N1, Nidx1, D, D_rope, D_idx, topK,
     scale_value,
     act_q_ptr, act_k_ptr,
-    BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
+    VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """Fused gradient + KL loss. Grid: (B*S1,), one (b,s1) per program.
 
     dKeyIndex computed by separate scatter kernel.
     s_idx_buf: ReLU(dot) per (g,k), reused in stage 5 & scatter kernel.
-    buf_i:     I[k] — weighted index-level scores.
-    buf_p:     p[k] — averaged teacher distribution.
+    buf_i:     I[k] weighted index-level scores.
+    buf_p:     p[k] averaged teacher distribution.
     di:        softmax(I) - p, gradient signal back to I.
     """
     pid = tl.program_id(0)
@@ -99,7 +104,7 @@ def _indexer_grad_kl_loss_kernel(
 
     act_k = tl.load(act_k_ptr + b)
     # s2_real: number of valid key positions within causal window (s1 + right context)
-    s2_real = tl.minimum(topK, act_k - act_q + s1 + 1)
+    s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1 + 1, 0))
 
     qi_base = pid * Nidx1 * D_idx
     ki_g_base = pid * topK * D_idx
@@ -111,8 +116,8 @@ def _indexer_grad_kl_loss_kernel(
     sm_base = pid * N1
     local_k = tl.arange(0, BLOCK_K)
 
-    # Stage 1: I[k] = Σ_g W_g · ReLU(qi_g @ ki_gathered[k]^T)
-    for k_start in range(0, topK, BLOCK_K):
+    # Stage 1: I[k] = sum_g W_g * ReLU(qi_g @ ki_gathered[k]^T)
+    for k_start in range(0, VALID_K, BLOCK_K):
         k_offs = k_start + local_k
         k_mask = k_offs < s2_real
         i_tile = tl.zeros([BLOCK_K], dtype=tl.float32)
@@ -130,8 +135,8 @@ def _indexer_grad_kl_loss_kernel(
                      relu, mask=k_mask)
         tl.store(buf_i_ptr + pid * topK + k_offs, i_tile, mask=k_mask)
 
-    # Stage 2: p[k] = (1/N1) Σ_h softmax(score_h)[k], using forward's softmaxMax/Sum
-    for k_start in range(0, topK, BLOCK_K):
+    # Stage 2: p[k] = (1/N1) sum_h softmax(score_h)[k], using forward softmaxMax/Sum.
+    for k_start in range(0, VALID_K, BLOCK_K):
         k_offs = k_start + local_k
         k_mask = k_offs < s2_real
         tl.store(buf_p_ptr + pid * topK + k_offs,
@@ -141,7 +146,7 @@ def _indexer_grad_kl_loss_kernel(
         sm_max_h = tl.load(softmax_max_ptr + sm_base + h).to(tl.float32)
         sm_sum_h = tl.load(softmax_sum_ptr + sm_base + h).to(tl.float32)
 
-        for k_start in range(0, topK, BLOCK_K):
+        for k_start in range(0, VALID_K, BLOCK_K):
             k_offs = k_start + local_k
             k_mask = k_offs < s2_real
 
@@ -164,17 +169,16 @@ def _indexer_grad_kl_loss_kernel(
             tl.store(buf_p_ptr + pid * topK + k_offs,
                      old_p + probs, mask=k_mask)
 
-    # Average over heads: p = Σ_h prob_h / N1
-    for k_start in range(0, topK, BLOCK_K):
+    for k_start in range(0, VALID_K, BLOCK_K):
         k_offs = k_start + local_k
         k_mask = k_offs < s2_real
         p_tile = tl.load(buf_p_ptr + pid * topK + k_offs,
                          mask=k_mask, other=0.0) * (1.0 / N1)
         tl.store(buf_p_ptr + pid * topK + k_offs, p_tile, mask=k_mask)
 
-    # Stage 3+4: softmax(I) → KL(p || softmax(I)) loss, dI = softmax(I) - p
+    # Stage 3+4: softmax(I) -> KL(p || softmax(I)) loss, dI = softmax(I) - p
     i_max = tl.full([1], float('-inf'), dtype=tl.float32)
-    for k_start in range(0, topK, BLOCK_K):
+    for k_start in range(0, VALID_K, BLOCK_K):
         k_offs = k_start + local_k
         k_mask = k_offs < s2_real
         i_tile = tl.load(buf_i_ptr + pid * topK + k_offs,
@@ -182,7 +186,7 @@ def _indexer_grad_kl_loss_kernel(
         i_max = tl.maximum(i_max, tl.max(i_tile, axis=0))
 
     i_sum = tl.zeros([1], dtype=tl.float32)
-    for k_start in range(0, topK, BLOCK_K):
+    for k_start in range(0, VALID_K, BLOCK_K):
         k_offs = k_start + local_k
         k_mask = k_offs < s2_real
         i_tile = tl.load(buf_i_ptr + pid * topK + k_offs,
@@ -192,7 +196,7 @@ def _indexer_grad_kl_loss_kernel(
         i_sum += tl.sum(exp_i, axis=0)
 
     kl_total = tl.zeros([1], dtype=tl.float32)
-    for k_start in range(0, topK, BLOCK_K):
+    for k_start in range(0, VALID_K, BLOCK_K):
         k_offs = k_start + local_k
         k_mask = k_offs < s2_real
         i_tile = tl.load(buf_i_ptr + pid * topK + k_offs,
@@ -215,7 +219,7 @@ def _indexer_grad_kl_loss_kernel(
     for g in range(Nidx1):
         w_g = tl.load(weights_ptr + w_base + g).to(tl.float32)
         dw_g = tl.zeros([1], dtype=tl.float32)
-        for k_start in range(0, topK, BLOCK_K):
+        for k_start in range(0, VALID_K, BLOCK_K):
             k_offs = k_start + local_k
             k_mask = k_offs < s2_real
             relu_tile = tl.load(
@@ -255,33 +259,36 @@ def _scatter_dkey_index_kernel(
     d_key_index_ptr,
     act_q_ptr, act_k_ptr,
     B, S1, S2, Nidx1, D_idx, topK,
-    BLOCK_D: tl.constexpr,
+    valid_k,
+    BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    """Scatter-add dKeyIndex. Grid: (B*S1*topK,). Reuses s_idx_buf for ReLU values.
+    """Scatter-add dKeyIndex. Grid: (B*S1, cdiv(valid_k, BLOCK_K)).
 
     dki[b, target_k] += dI[k] * w[g] * 1_{relu>0} * qi[g]
     """
-    pid = tl.program_id(0)
-    bs1_idx = pid // topK
-    k_idx = pid % topK
+    bs1_idx = tl.program_id(0)
+    k_block = tl.program_id(1)
     b = bs1_idx // S1
     s1 = bs1_idx % S1
 
     act_q = tl.load(act_q_ptr + b)
     act_k = tl.load(act_k_ptr + b)
-    s2_real = tl.minimum(topK, act_k - act_q + s1 + 1)
-    if k_idx >= s2_real:
-        return
+    s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1 + 1, 0))
+    k_offsets = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_mask = k_offsets < tl.minimum(s2_real, valid_k)
 
     qi_base = bs1_idx * Nidx1 * D_idx
     w_base = bs1_idx * Nidx1
-    di_k = tl.load(di_ptr + bs1_idx * topK + k_idx).to(tl.float32)
-    target_k = tl.load(sparse_indices_ptr + bs1_idx * topK + k_idx)
+    di_k = tl.load(di_ptr + bs1_idx * topK + k_offsets,
+                   mask=k_mask, other=0.0).to(tl.float32)
+    target_k = tl.load(sparse_indices_ptr + bs1_idx * topK + k_offsets,
+                       mask=k_mask, other=0)
     target_k = tl.maximum(tl.minimum(target_k, S2 - 1), 0)
     for g in range(Nidx1):
         w_g = tl.load(weights_ptr + w_base + g).to(tl.float32)
         relu_gk = tl.load(s_idx_buf_ptr + bs1_idx * Nidx1 * topK
-                          + g * topK + k_idx).to(tl.float32)
+                          + g * topK + k_offsets,
+                          mask=k_mask, other=0.0).to(tl.float32)
         relu_mask = (relu_gk > 0.0).to(tl.float32)
         dki_contrib = di_k * w_g * relu_mask
         for d_start in range(0, D_idx, BLOCK_D):
@@ -289,11 +296,11 @@ def _scatter_dkey_index_kernel(
             d_valid = d_offs < D_idx
             qi_g = tl.load(query_index_ptr + qi_base + g * D_idx + d_offs,
                            mask=d_valid, other=0.0).to(tl.float32)
-            dki_vals = dki_contrib * qi_g
-            dki_offs = b * S2 * D_idx + target_k * D_idx + d_offs
+            dki_vals = dki_contrib[:, None] * qi_g[None, :]
+            dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs[None, :]
             tl.atomic_add(d_key_index_ptr + dki_offs,
                           dki_vals.to(d_key_index_ptr.dtype.element_ty),
-                          mask=d_valid)
+                          mask=k_mask[:, None] & d_valid[None, :])
 
 
 # helpers
@@ -342,9 +349,11 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     D_rope = query_rope.shape[3]
     Nidx1, D_idx = query_index.shape[2], query_index.shape[3]
     topK = sparse_indices.shape[3]
+    valid_k = min(topK, S2)
 
     BLOCK_K = 128
     BLOCK_D = 64
+    BLOCK_K_SCATTER = 16
 
     # Flatten N2=1, Nidx2=1 dimensions (MQA: single KV head)
     q_flat = query.reshape(B * S1, N1, D).contiguous()
@@ -356,7 +365,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     w_flat = weights.reshape(B * S1, Nidx1).contiguous()
     sparse_flat = sparse_indices.reshape(B * S1, topK).contiguous()
 
-    # softmaxMax/Sum: (B, N2=1, S1, N1) → (B*S1, N1)
+    # softmaxMax/Sum: (B, N2=1, S1, N1) -> (B*S1, N1)
     sm_max_flat = softmax_max.reshape(B * S1, N1).contiguous()
     sm_sum_flat = softmax_sum.reshape(B * S1, N1).contiguous()
 
@@ -381,13 +390,19 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     grid_bs1 = (B * S1,)
     _gather_kv_kernel[grid_bs1](
         k_flat, sparse_flat, key_gathered,
-        S1, S2, topK, D, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D)
+        actual_seq_qlen, actual_seq_klen,
+        S1, S2, topK, D,
+        VALID_K=valid_k, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D)
     _gather_kv_kernel[grid_bs1](
         ki_flat, sparse_flat, key_index_gathered,
-        S1, S2, topK, D_idx, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D)
+        actual_seq_qlen, actual_seq_klen,
+        S1, S2, topK, D_idx,
+        VALID_K=valid_k, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D)
     _gather_kv_kernel[grid_bs1](
         kr_flat, sparse_flat, key_rope_gathered,
-        S1, S2, topK, D_rope, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D)
+        actual_seq_qlen, actual_seq_klen,
+        S1, S2, topK, D_rope,
+        VALID_K=valid_k, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D)
 
     _indexer_grad_kl_loss_kernel[grid_bs1](
         q_flat, key_gathered,
@@ -401,17 +416,18 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         B, S1, N1, Nidx1, D, D_rope, D_idx, topK,
         scale_value,
         actual_seq_qlen, actual_seq_klen,
-        BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D,
+        VALID_K=valid_k, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D,
     )
 
-    _scatter_dkey_index_kernel[(B * S1 * topK,)](
+    _scatter_dkey_index_kernel[(B * S1, triton.cdiv(valid_k, BLOCK_K_SCATTER))](
         qi_flat,
         w_flat, di, sparse_flat,
         s_idx_buf,
         d_key_index,
         actual_seq_qlen, actual_seq_klen,
         B, S1, S2, Nidx1, D_idx, topK,
-        BLOCK_D=BLOCK_D,
+        valid_k,
+        BLOCK_K=BLOCK_K_SCATTER, BLOCK_D=BLOCK_D,
     )
 
     d_query_index = d_query_index.reshape(query_index.shape)
