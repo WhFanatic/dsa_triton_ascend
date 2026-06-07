@@ -36,9 +36,7 @@ def run_timing():
     configs = [
         (1, 128, 128, 16, 1, 128, 32),
         (1, 1024, 1024, 64, 1, 128, 512),
-        (1, 2048, 2048, 64, 1, 128, 1024),
         (1, 4096, 4096, 64, 1, 128, 2048),
-        (1, 16*1024, 16*1024, 64, 1, 128, 2048),
     ]
 
     for B, S1, S2, N1, N2, D, k in configs:
@@ -54,6 +52,10 @@ def run_timing():
         print(f"triton:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
         print(f"ms.ops:  median={o_med:.2f}ms, p20={o_p20:.2f}ms, p80={o_p80:.2f}ms")
         print(f"speedup: {speedup:.2f}x")
+
+        del q, k_t, w, cell
+        runtime.synchronize()
+        runtime.empty_cache()
 
 
 def run_profiling():
@@ -93,12 +95,63 @@ def run_profiling():
     print(f"Profiler data saved to {out_dir}")
 
 
+def run_profiling_cann():
+    total_steps = 10
+    out_dir = './profiler_data_cann'
+
+    B, S1, S2, N1, N2, D, k = 1, 4096, 4096, 64, 1, 128, 2048
+
+    q, k_t, w = _make_inputs(B, S1, S2, N1, N2, D)
+
+    experimental_config = ms.profiler._ExperimentalConfig(
+        profiler_level=ProfilerLevel.Level0,
+        aic_metrics=AicoreMetrics.AiCoreNone,
+        l2_cache=False,
+        mstx=False,
+        data_simplification=False,
+    )
+
+    with ms.profiler.profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
+        with_stack=True,
+        schedule=ms.profiler.schedule(wait=2, warmup=2, active=4, repeat=1, skip_first=2),
+        on_trace_ready=ms.profiler.tensorboard_trace_handler(out_dir),
+        profile_memory=False,
+        experimental_config=experimental_config,
+    ) as prof:
+
+        for _ in range(total_steps):
+            ms.ops.lightning_indexer(q, k_t, w, sparse_count=k)
+            prof.step()
+
+    print(f"Profiler data saved to {out_dir}")
+
+
+def run_kernel_only():
+    from lightning_indexer_triton import LightningIndexerTriton
+
+    B, S1, S2, N1, N2, D, k = 1, 4096, 4096, 64, 1, 128, 2048
+
+    q, k_t, w = _make_inputs(B, S1, S2, N1, N2, D)
+    cell = LightningIndexerTriton(sparse_count=k)
+
+    for _ in range(10):
+        cell(q, k_t, w)
+    print("kernel-only run finished")
+
+
 if __name__ == "__main__":
+    import sys
+
     from lightning_indexer_triton import LightningIndexerTriton
 
     ms.set_context(mode=ms.GRAPH_MODE)
     np.random.seed(42)
     ms.set_seed(42)
 
-    run_timing()
-    run_profiling()
+    if len(sys.argv) > 1 and sys.argv[1] == "--kernel-only":
+        run_kernel_only()
+    else:
+        run_timing()
+        run_profiling()
+        run_profiling_cann()

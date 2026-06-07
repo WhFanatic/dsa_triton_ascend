@@ -83,7 +83,7 @@ def _prune_configs(configs, named_args, **kwargs):
     - grid0/grid1 必须是 2 的幂, 否则 runtime 分核映射出错 -> aicore trap
     """
     _UB_LIMIT_BYTES = 192 * 1024
-    _GRID_LIMIT = 131072  # 已知可跑的上限; 调小则过于严格有损性能
+    _GRID_LIMIT = 65535  # Ascend coreDim 硬件上限
 
     def _estimate_ub_bytes(block_s2, block_d, block_g):
         """粗估单 tile 主要 buffer 的 UB 占用 (bytes)。
