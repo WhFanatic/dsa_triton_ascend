@@ -14,9 +14,9 @@ export TRITON_CACHE_DIR=./my_triton_cache
 # 全量测试
 # pytest --forked test_li_triton.py -v "$@"
 # 性能测试
-# TRITON_PRINT_AUTOTUNING=1 python perf_li_triton.py
+TRITON_PRINT_AUTOTUNING=1 python perf_li_triton.py
 # 内核性能测试（msprof op 指定 kernel，避免全量采集与 triton driver 冲突导致 segfault）
-# msprof op --kernel-name="_lightning_indexer_score_kernel" --output=./profilers python perf_li_triton.py --kernel-only
+msprof op --kernel-name="_lightning_indexer_score_kernel" --output=./profilers python perf_li_triton.py --kernel-only
 
 # ####################
 # SparseLightningIndexerGradKLLoss 算子测试----脚本待调试
@@ -72,9 +72,9 @@ export TRITON_CACHE_DIR=./my_triton_cache
 
 # ---- 性能 / profiling ----
 # 计时 + speedup（triton vs CANN）
-TRITON_PRINT_AUTOTUNING=1 python perf_sfa_triton.py
+# TRITON_PRINT_AUTOTUNING=1 python perf_sfa_triton.py
 # 内核性能测试（msprof op 指定 kernel，避免全量采集与 triton driver 冲突导致 segfault）
-msprof op --kernel-name="_sfa_kernel" --output=./profilers python perf_sfa_triton.py --kernel-only
+# msprof op --kernel-name="_sfa_kernel" --output=./profilers python perf_sfa_triton.py --kernel-only
 
 # 计时 + speedup（triton vs CANN）
 # TRITON_PRINT_AUTOTUNING=1 python perf_sfa_grad_triton.py

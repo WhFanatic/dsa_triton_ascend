@@ -5,20 +5,24 @@ from mindspore import runtime
 from mindspore.profiler import ProfilerLevel, ProfilerActivity, AicoreMetrics
 
 
-def _do_bench(fn, warmup=10, rep=100):
+def _do_bench(fn, warmup=10, rep=50):
     """Simple benchmarking with manual timing (Ascend-compatible)."""
     for _ in range(warmup):
-        fn()
-    runtime.synchronize()
+        out = fn()
+        runtime.synchronize()
+        del out
+        runtime.empty_cache()
 
     times = []
     for _ in range(rep):
         runtime.synchronize()
         t0 = time.perf_counter()
-        fn()
+        out = fn()
         runtime.synchronize()
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)
+        del out
+        runtime.empty_cache()
 
     times.sort()
     n = len(times)
