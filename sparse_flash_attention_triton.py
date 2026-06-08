@@ -197,6 +197,10 @@ def _sfa_scores_block(
         triton.Config({"BLOCK_G": 32, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # BLOCK_G>=N1 -> grid1=1: MQA gathers KV once per (b,s1), no per-head re-gather.
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # same tiling, deeper software pipeline: lets the fast-path PV (cube) overlap
+        # the next dv-tile's softmax/gather-addressing (vector), hiding the cube's
+        # wait_id0 idle that dominates this shape. Falls back to stages=2 if not faster.
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 64,  "BLOCK_DV": 64}, num_stages=3),
     ],
     key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
     prune_configs_by={"early_config_prune": _prune_configs},
