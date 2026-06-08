@@ -195,6 +195,8 @@ def _sfa_scores_block(
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 128}),
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 64, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 32, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # BLOCK_G>=N1 -> grid1=1: MQA gathers KV once per (b,s1), no per-head re-gather.
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 64,  "BLOCK_DV": 64}),
     ],
     key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
     prune_configs_by={"early_config_prune": _prune_configs},
@@ -215,16 +217,21 @@ def _sfa_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_DV: tl.constexpr,
+    SINGLE_BLOCK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
 ):
-    """Flash attention over sparsely gathered KV (BSND, MQA / N2=1), two-pass.
+    """Flash attention over sparsely gathered KV (BSND, MQA / N2=1).
 
     Grid: (_next_pow2(B*S1), _next_pow2(cdiv(N1, BLOCK_G))), both pow2-padded.
     Each program: one (b,s1) position, BLOCK_G query heads. Inline-gathers KV
     rows by sparse token indices.
 
-    Pass 1: stream KV -> online-softmax stats m_i / l_i (only [BLOCK_G] vectors).
-    Pass 2: tile output dim by BLOCK_DV; per tile re-stream KV, recompute scores,
-            accumulate p @ v into acc[BLOCK_G, BLOCK_DV]. Keeps UB independent of D.
+    SINGLE_BLOCK (topK fits one BLOCK_TOPK block): scores/P computed ONCE and kept
+        resident, then dv-tiled P@V. Score/gather recompute is O(1), not
+        O(dv_tiles*k_blocks). Used for topK<=128 (the profiled/mindformers shapes).
+    else (two-pass fallback, large topK): Pass 1 streams KV -> online-softmax stats
+        m_i / l_i; Pass 2 tiles output dim by BLOCK_DV, per tile re-streams KV,
+        recomputes scores, accumulates p @ v. Keeps UB independent of D.
 
     sparse_ptr holds token positions directly; block-wise (sparse_block_size>1)
     is pre-expanded on host into per-token indices, so this kernel is token-wise.
@@ -261,11 +268,11 @@ def _sfa_kernel(
     v_base = b * S2 * D
     sp_base = (b * S1 + s1) * topK
 
-    # ---- Pass 1: online-softmax stats (m_i, l_i); no V, no [BLOCK_G,D] acc ----
-    m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
-    for blk_start in range(0, topK, BLOCK_K):
-        blk_offs = blk_start + tl.arange(0, BLOCK_K)
+    if SINGLE_BLOCK:
+        # ---- fast path: one block covers the whole topK window; scores/P computed
+        # ONCE and kept resident, then dv-tiled P@V. Score/gather recompute is O(1),
+        # not O(dv_tiles*k_blocks) as in the two-pass fallback below. ----
+        blk_offs = tl.arange(0, BLOCK_TOPK)
         blk_in_count = blk_offs < topK
         tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
         tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
@@ -275,28 +282,37 @@ def _sfa_kernel(
             q_ptr, q_base, qr_ptr, qr_base,
             k_ptr, k_base, kr_ptr, kr_base,
             tok_clamped, tok_valid, g_offs, g_valid,
-            scale_value, D, D_ROPE, BLOCK_G, BLOCK_K, BLOCK_D)
+            scale_value, D, D_ROPE, BLOCK_G, BLOCK_TOPK, BLOCK_D)
 
-        # guard all-masked block: max stays -inf -> safe 0 so exp(-inf)=0, not nan.
-        m_blk = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_blk)
-        m_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+        m_i = tl.max(scores, axis=1)
+        m_safe = tl.where(m_i == float('-inf'), 0.0, m_i)
         p = tl.exp(scores - m_safe[:, None])
         p = tl.where(tok_valid[None, :], p, 0.0)
-        alpha = tl.exp(m_i - m_safe)
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        m_i = m_new
+        l_i = tl.sum(p, axis=1)
+        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
 
-    # final global max for pass 2 (empty rows: m_i==-inf -> use 0, p will be 0)
-    m_final = tl.where(m_i == float('-inf'), 0.0, m_i)
-    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+        out_base = (b * S1 + s1) * N1 * D
+        for dv_start in range(0, D, BLOCK_DV):
+            dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+            dv_valid = dv_offs < D
+            v_tile = tl.load(
+                v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
+                mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+            out_tile = tl.dot(p.to(v_tile.dtype), v_tile) / l_safe[:, None]
+            tl.store(
+                out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
+                out_tile.to(out_ptr.dtype.element_ty),
+                mask=g_valid[:, None] & dv_valid[None, :] & row_active)
 
-    # ---- Pass 2: tile output dim, recompute scores, accumulate p @ v ----
-    out_base = (b * S1 + s1) * N1 * D
-    for dv_start in range(0, D, BLOCK_DV):
-        dv_offs = dv_start + tl.arange(0, BLOCK_DV)
-        dv_valid = dv_offs < D
-        acc = tl.zeros([BLOCK_G, BLOCK_DV], dtype=tl.float32)
+        if return_lse:
+            sm_base = (b * S1 + s1) * N1
+            store_mask = g_valid & row_active & (l_i > 0.0)
+            tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
+            tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
+    else:
+        # ---- Pass 1: online-softmax stats (m_i, l_i); no V, no [BLOCK_G,D] acc ----
+        m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
         for blk_start in range(0, topK, BLOCK_K):
             blk_offs = blk_start + tl.arange(0, BLOCK_K)
             blk_in_count = blk_offs < topK
@@ -310,26 +326,59 @@ def _sfa_kernel(
                 tok_clamped, tok_valid, g_offs, g_valid,
                 scale_value, D, D_ROPE, BLOCK_G, BLOCK_K, BLOCK_D)
 
-            p = tl.exp(scores - m_final[:, None])
+            # guard all-masked block: max stays -inf -> safe 0 so exp(-inf)=0, not nan.
+            m_blk = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_blk)
+            m_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+            p = tl.exp(scores - m_safe[:, None])
             p = tl.where(tok_valid[None, :], p, 0.0)
-            v_tile = tl.load(
-                v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
-                mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
-            acc += tl.dot(p.to(v_tile.dtype), v_tile)
+            alpha = tl.exp(m_i - m_safe)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_new
 
-        out_tile = acc / l_safe[:, None]
-        tl.store(
-            out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
-            out_tile.to(out_ptr.dtype.element_ty),
-            mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+        # final global max for pass 2 (empty rows: m_i==-inf -> use 0, p will be 0)
+        m_final = tl.where(m_i == float('-inf'), 0.0, m_i)
+        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
 
-    if return_lse:
-        # softmax_max/sum layout (B, N2=1, S1, N1) -> flat (b*S1+s1)*N1 + g.
-        # Empty/hidden rows (l_i==0) keep the pre-filled 0 to match the golden.
-        sm_base = (b * S1 + s1) * N1
-        store_mask = g_valid & row_active & (l_i > 0.0)
-        tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
-        tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
+        # ---- Pass 2: tile output dim, recompute scores, accumulate p @ v ----
+        out_base = (b * S1 + s1) * N1 * D
+        for dv_start in range(0, D, BLOCK_DV):
+            dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+            dv_valid = dv_offs < D
+            acc = tl.zeros([BLOCK_G, BLOCK_DV], dtype=tl.float32)
+            for blk_start in range(0, topK, BLOCK_K):
+                blk_offs = blk_start + tl.arange(0, BLOCK_K)
+                blk_in_count = blk_offs < topK
+                tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
+                tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
+                tok_clamped = tl.where(tok_valid, tok, 0)
+
+                scores = _sfa_scores_block(
+                    q_ptr, q_base, qr_ptr, qr_base,
+                    k_ptr, k_base, kr_ptr, kr_base,
+                    tok_clamped, tok_valid, g_offs, g_valid,
+                    scale_value, D, D_ROPE, BLOCK_G, BLOCK_K, BLOCK_D)
+
+                p = tl.exp(scores - m_final[:, None])
+                p = tl.where(tok_valid[None, :], p, 0.0)
+                v_tile = tl.load(
+                    v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
+                    mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+                acc += tl.dot(p.to(v_tile.dtype), v_tile)
+
+            out_tile = acc / l_safe[:, None]
+            tl.store(
+                out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
+                out_tile.to(out_ptr.dtype.element_ty),
+                mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+        if return_lse:
+            # softmax_max/sum layout (B, N2=1, S1, N1) -> flat (b*S1+s1)*N1 + g.
+            # Empty/hidden rows (l_i==0) keep the pre-filled 0 to match the golden.
+            sm_base = (b * S1 + s1) * N1
+            store_mask = g_valid & row_active & (l_i > 0.0)
+            tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
+            tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +511,12 @@ def _sfa_core(
         _next_pow2(triton.cdiv(N1, meta["BLOCK_G"])),
     )
 
+    # fast path when one block (BLOCK_TOPK = pow2(topK), capped at 128) covers the
+    # whole sparse window: scores/P computed once, dv-tiled P@V. Larger topK falls
+    # back to the two-pass online-softmax kernel.
+    block_topk = _next_pow2(topK)
+    single_block = block_topk <= 128
+
     _sfa_kernel[grid_fn](
         q_flat, qr_flat,
         k_flat, kr_flat, v_flat,
@@ -473,6 +528,8 @@ def _sfa_core(
         scale_value,
         sparse_mode=sparse_mode,
         return_lse=return_lse,
+        SINGLE_BLOCK=single_block,
+        BLOCK_TOPK=block_topk,
     )
     return out_buf, sm_max_buf, sm_sum_buf
 
