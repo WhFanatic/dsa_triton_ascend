@@ -98,7 +98,7 @@ def _prune_configs(configs, named_args, **kwargs):
     compiler is the final UB authority — observed it reject undersized estimates).
     """
     _UB_LIMIT_BYTES = 180 * 1024   # headroom under the 192KB hard limit
-    _GRID_LIMIT = 131072
+    _GRID_LIMIT = 131072  # 这个值持保留意见
 
     def _get(name):
         if name in named_args:
