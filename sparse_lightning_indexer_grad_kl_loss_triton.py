@@ -219,6 +219,8 @@ def _indexer_grad_kl_loss_kernel(
     for g in range(Nidx1):
         w_g = tl.load(weights_ptr + w_base + g).to(tl.float32)
         dw_g = tl.zeros([1], dtype=tl.float32)
+
+        # dW is independent of D_idx, so accumulate it once over K.
         for k_start in range(0, VALID_K, BLOCK_K):
             k_offs = k_start + local_k
             k_mask = k_offs < s2_real
@@ -227,25 +229,36 @@ def _indexer_grad_kl_loss_kernel(
                 mask=k_mask, other=0.0)
             di_tile = tl.load(di_ptr + pid * topK + k_offs,
                               mask=k_mask, other=0.0)
-            relu_mask = (relu_tile > 0.0).to(tl.float32)
             dw_g += tl.sum(di_tile * relu_tile, axis=0)
-            ds_idx = di_tile * w_g * relu_mask
-            for d_start in range(0, D_idx, BLOCK_D):
-                d_offs = d_start + tl.arange(0, BLOCK_D)
-                d_valid = d_offs < D_idx
+
+        # Keep dQI in fp32 across all K tiles and cast only once on output.
+        for d_start in range(0, D_idx, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D_idx
+            dqi_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+            for k_start in range(0, VALID_K, BLOCK_K):
+                k_offs = k_start + local_k
+                k_mask = k_offs < s2_real
+                relu_tile = tl.load(
+                    s_idx_buf_ptr + pid * Nidx1 * topK + g * topK + k_offs,
+                    mask=k_mask, other=0.0)
+                di_tile = tl.load(di_ptr + pid * topK + k_offs,
+                                  mask=k_mask, other=0.0)
+                relu_mask = (relu_tile > 0.0).to(tl.float32)
+                ds_idx = di_tile * w_g * relu_mask
                 ki_tile = tl.load(
                     key_index_gathered_ptr + ki_g_base
                     + k_offs[:, None] * D_idx + d_offs[None, :],
                     mask=k_mask[:, None] & d_valid[None, :],
                     other=0.0).to(tl.float32)
-                dqi_contrib = tl.sum(ds_idx[:, None] * ki_tile, axis=0)
-                dqi_offs = pid * Nidx1 * D_idx + g * D_idx + d_offs
-                old_dqi = tl.load(d_query_index_ptr + dqi_offs,
-                                  mask=d_valid, other=0.0).to(tl.float32)
-                tl.store(d_query_index_ptr + dqi_offs,
-                         (old_dqi + dqi_contrib).to(
-                             d_query_index_ptr.dtype.element_ty),
-                         mask=d_valid)
+                dqi_acc += tl.sum(ds_idx[:, None] * ki_tile, axis=0)
+
+            dqi_offs = pid * Nidx1 * D_idx + g * D_idx + d_offs
+            tl.store(d_query_index_ptr + dqi_offs,
+                     dqi_acc.to(d_query_index_ptr.dtype.element_ty),
+                     mask=d_valid)
+
         tl.store(d_weights_ptr + pid * Nidx1 + g,
                  tl.sum(dw_g).to(d_weights_ptr.dtype.element_ty))
 
@@ -273,9 +286,10 @@ def _scatter_dkey_index_kernel(
 
     act_q = tl.load(act_q_ptr + b)
     act_k = tl.load(act_k_ptr + b)
+    valid_q = s1 < act_q
     s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1 + 1, 0))
     k_offsets = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
-    k_mask = k_offsets < tl.minimum(s2_real, valid_k)
+    k_mask = valid_q & (k_offsets < tl.minimum(s2_real, valid_k))
 
     qi_base = bs1_idx * Nidx1 * D_idx
     w_base = bs1_idx * Nidx1
@@ -299,8 +313,18 @@ def _scatter_dkey_index_kernel(
             dki_vals = dki_contrib[:, None] * qi_g[None, :]
             dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs[None, :]
             tl.atomic_add(d_key_index_ptr + dki_offs,
-                          dki_vals.to(d_key_index_ptr.dtype.element_ty),
+                          dki_vals,
                           mask=k_mask[:, None] & d_valid[None, :])
+
+
+@triton.jit
+def _cast_dkey_index_kernel(src_ptr, dst_ptr, total,
+                            BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < total
+    vals = tl.load(src_ptr + offsets, mask=mask, other=0.0)
+    tl.store(dst_ptr + offsets, vals.to(dst_ptr.dtype.element_ty), mask=mask)
 
 
 # helpers
@@ -377,7 +401,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
 
     # Outputs
     d_query_index = ms.mint.zeros((B * S1, Nidx1, D_idx), dtype=query_index.dtype)
-    d_key_index = ms.mint.zeros((B * S2, D_idx), dtype=key_index.dtype)
+    d_key_index_acc = ms.mint.zeros((B * S2, D_idx), dtype=ms.float32)
     d_weights = ms.mint.zeros((B * S1, Nidx1), dtype=weights.dtype)
     loss = ms.mint.zeros((1,), dtype=ms.float32)
 
@@ -423,12 +447,16 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         qi_flat,
         w_flat, di, sparse_flat,
         s_idx_buf,
-        d_key_index,
+        d_key_index_acc,
         actual_seq_qlen, actual_seq_klen,
         B, S1, S2, Nidx1, D_idx, topK,
         valid_k,
         BLOCK_K=BLOCK_K_SCATTER, BLOCK_D=BLOCK_D,
     )
+
+    d_key_index = ms.mint.empty((B * S2, D_idx), dtype=key_index.dtype)
+    _cast_dkey_index_kernel[(triton.cdiv(B * S2 * D_idx, 256),)](
+        d_key_index_acc, d_key_index, B * S2 * D_idx, BLOCK_SIZE=256)
 
     d_query_index = d_query_index.reshape(query_index.shape)
     d_key_index = d_key_index.reshape(key_index.shape)

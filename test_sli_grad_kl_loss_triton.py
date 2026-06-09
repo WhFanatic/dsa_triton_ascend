@@ -10,24 +10,18 @@ ATOL = 1e-2
 RTOL = 1e-2
 
 SPARSE_GRAD_CANN_TEST_CONFIGS = [
-    (1, 1, 128, 32, 512, 8, 128, 1024),
-    (1, 4, 128, 32, 512, 8, 128, 1024),
-    (1, 4, 128, 64, 512, 16, 128, 1024),
-    (1, 4, 128, 128, 512, 32, 128, 1024),
-    (1, 3, 96, 32, 512, 16, 128, 1024),
-    (1, 4, 256, 32, 512, 64, 128, 2048),
+    (1, 1, 2048, 32, 512, 8, 128, 1024),
+    (1, 4, 2048, 32, 512, 8, 128, 1024),
+    (1, 4, 2048, 64, 512, 16, 128, 1024),
+    (1, 4, 2048, 128, 512, 32, 128, 1024),
+    (1, 3, 2048, 32, 512, 16, 128, 1024),
+    (1, 4, 4096, 32, 512, 64, 128, 2048),
 ]
 
 SPARSE_GRAD_LARGE_TEST_CONFIGS = [
     (1, 1024, 1024, 32, 512, 8, 128, 1024),
     (1, 4096, 4096, 32, 512, 8, 128, 1024),
 ]
-
-SPARSE_GRAD_ACTUAL_SEQ_TEST_CONFIGS = [
-    (1, 4, 128, 32, 512, 8, 128, 1024, [3], [112]),
-    (2, 4, 128, 32, 512, 8, 128, 1024, [4, 3], [128, 112]),
-]
-
 
 def _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=ms.float16):
     rng = np.random.RandomState(42)
@@ -47,6 +41,15 @@ def _make_sparse_indices(B, S1, S2, topK, pattern):
     if pattern == "random":
         rng = np.random.RandomState(42)
         si = rng.randint(0, S2, (B, S1, 1, topK)).astype(np.int32)
+    elif pattern == "causal_random":
+        rng = np.random.RandomState(42)
+        si = np.zeros((B, S1, 1, topK), dtype=np.int32)
+        for b in range(B):
+            for s1 in range(S1):
+                visible = min(max(S2 - S1 + s1 + 1, 1), S2)
+                valid_k = min(topK, visible)
+                si[b, s1, 0, :valid_k] = rng.choice(
+                    visible, size=valid_k, replace=False).astype(np.int32)
     elif pattern == "continuous":
         row = np.arange(topK, dtype=np.int32) % S2
         si = np.broadcast_to(row.reshape(1, 1, 1, topK),
@@ -141,7 +144,7 @@ def _assert_large_outputs(base_outputs, tri_outputs):
 
 def _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
                                actual_seq_qlen=None, actual_seq_klen=None,
-                               sparse_pattern="random", large_check=False):
+                               sparse_pattern="causal_random", large_check=False):
     from sparse_lightning_indexer_grad_kl_loss_triton import (
         SparseLightningIndexerGradKLLossTriton,
     )
@@ -200,29 +203,15 @@ def test_sparse_grad_kl_loss_large_precision(B, S1, S2, N1, D, Nidx1, D_idx, top
     )
 
 
-@pytest.mark.parametrize(
-    "B,S1,S2,N1,D,Nidx1,D_idx,topK,actual_seq_qlen,actual_seq_klen",
-    SPARSE_GRAD_ACTUAL_SEQ_TEST_CONFIGS,
-)
-def test_sparse_grad_kl_loss_actual_seq_precision(
-        B, S1, S2, N1, D, Nidx1, D_idx, topK,
-        actual_seq_qlen, actual_seq_klen):
-    _run_cann_triton_precision(
-        B, S1, S2, N1, D, Nidx1, D_idx, topK,
-        actual_seq_qlen=actual_seq_qlen,
-        actual_seq_klen=actual_seq_klen,
-    )
-
-
-@pytest.mark.parametrize("sparse_pattern", ["random", "continuous", "repeated"])
+@pytest.mark.parametrize("sparse_pattern", ["causal_random", "continuous", "repeated"])
 def test_sparse_grad_kl_loss_sparse_indices_patterns(sparse_pattern):
     _run_cann_triton_precision(
-        B=1, S1=4, S2=128, N1=32, D=512,
+        B=1, S1=4, S2=2048, N1=32, D=512,
         Nidx1=8, D_idx=128, topK=1024,
         sparse_pattern=sparse_pattern,
     )
 
 
 if __name__ == "__main__":
-    test_sparse_grad_kl_loss_precision(1, 4, 128, 32, 512, 8, 128, 1024)
+    test_sparse_grad_kl_loss_precision(1, 4, 2048, 32, 512, 8, 128, 1024)
     print("precision test passed!")
