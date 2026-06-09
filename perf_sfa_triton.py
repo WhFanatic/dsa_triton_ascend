@@ -4,7 +4,7 @@ import mindspore as ms
 from mindspore import ops, runtime
 from mindspore.profiler import ProfilerLevel, ProfilerActivity, AicoreMetrics
 
-D_NOPE = 512
+D_NOPE = 512  #客户建议优先测试数值256，来源kv_lora_rank:256
 D_ROPE = 64
 
 
@@ -108,7 +108,7 @@ def run_profiling():
     total_steps = 10
     out_dir = './profiler_data_sfa'
 
-    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 64
+    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 2048
 
     q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
@@ -149,7 +149,7 @@ def run_profiling_cann():
     total_steps = 10
     out_dir = './profiler_data_sfa_cann'
 
-    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 64
+    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 2048
 
     q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
@@ -187,7 +187,7 @@ def run_profiling_cann():
 def run_kernel_only():
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
 
-    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 64
+    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 2048
 
     q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)

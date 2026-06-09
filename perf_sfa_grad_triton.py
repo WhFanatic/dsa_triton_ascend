@@ -15,7 +15,7 @@ import mindspore as ms
 from mindspore import ops, runtime
 from mindspore.profiler import ProfilerLevel, ProfilerActivity, AicoreMetrics
 
-D_NOPE = 512
+D_NOPE = 512  #客户建议优先测试数值256，来源kv_lora_rank:256
 D_ROPE = 64
 
 PROF_SHAPE = (1, 512, 4096, 64, 64)

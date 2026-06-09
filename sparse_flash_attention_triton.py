@@ -752,5 +752,5 @@ class SparseFlashAttentionTriton(ms.nn.Cell):
             next_tokens=self.next_tokens,
             attention_mode=self.attention_mode,
             return_softmax_lse=self.return_softmax_lse,
-            block_size=self.block_size,
+            # block_size=self.block_size,   目前mindformers不用，先注释掉 by guod
         )
