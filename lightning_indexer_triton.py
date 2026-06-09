@@ -79,11 +79,9 @@ def _prune_configs(configs, named_args, **kwargs):
     """autotune config 过滤
 
     - UB 容量上限(910B 单核 ~192KB)
-    - grid program 总数上限(实测 131072 可跑, 262144 静默失败)
-    - grid0/grid1 必须是 2 的幂, 否则 runtime 分核映射出错 -> aicore trap
     """
     _UB_LIMIT_BYTES = 192 * 1024
-    _GRID_LIMIT = 65535  # Ascend coreDim 硬件上限
+    _GRID_LIMIT = 65536  # Ascend coreDim 硬件上限（65536）
 
     def _estimate_ub_bytes(block_s2, block_d, block_g):
         """粗估单 tile 主要 buffer 的 UB 占用 (bytes)。
