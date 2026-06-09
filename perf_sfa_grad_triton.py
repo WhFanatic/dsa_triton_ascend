@@ -9,6 +9,8 @@ Usage (Ascend NPU required):
     # msprof op — single-kernel profiling (target: _sfa_grad_kernel)
     msprof op --kernel-name="_sfa_grad_kernel" --output=./profilers python perf_sfa_grad_triton.py --kernel-only
 """
+import os
+import sys
 import time
 import numpy as np
 import mindspore as ms
@@ -18,22 +20,26 @@ from mindspore.profiler import ProfilerLevel, ProfilerActivity, AicoreMetrics
 D_NOPE = 512  #客户建议优先测试数值256，来源kv_lora_rank:256
 D_ROPE = 64
 
-PROF_SHAPE = (1, 512, 4096, 64, 64)
+PROF_SHAPE = (1, 512, 4096, 64, 2048)
 
 
-def _do_bench(fn, warmup=10, rep=100):
+def _do_bench(fn, warmup=10, rep=50):
     for _ in range(warmup):
-        fn()
-    runtime.synchronize()
+        out = fn()
+        runtime.synchronize()
+        del out
+        runtime.empty_cache()
 
     times = []
     for _ in range(rep):
         runtime.synchronize()
         t0 = time.perf_counter()
-        fn()
+        out = fn()
         runtime.synchronize()
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)
+        del out
+        runtime.empty_cache()
 
     times.sort()
     n = len(times)
@@ -71,62 +77,79 @@ def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.float16, D=D_NOPE):
     return q, k, v, qr, kr, do, si
 
 
-def run_timing():
+def _run_one_config(B, S1, S2, N1, sparse_count):
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
     from sparse_flash_attention_grad_triton import SparseFlashAttentionGradTriton
     from sfa_grad_cann import SparseFlashAttentionGradCANN
 
+    print(f"\nB={B}, S1={S1}, S2={S2}, N1={N1}, topk={sparse_count}")
+
+    q, k, v, qr, kr, do, si = _make_inputs(B, S1, S2, N1, sparse_count)
+    scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
+    act_q = ms.Tensor([S1] * B, dtype=ms.int32)
+    act_k = ms.Tensor([S2] * B, dtype=ms.int32)
+
+    fwd_tri = SparseFlashAttentionTriton(
+        scale_value=scale, sparse_mode=3, return_softmax_lse=True)
+    out_tri, smax_tri, ssum_tri = fwd_tri(q, k, v, si, query_rope=qr, key_rope=kr)
+
+    tri_grad = SparseFlashAttentionGradTriton(scale_value=scale, sparse_mode=3)
+
+    try:
+        t_med, t_p20, t_p80 = _do_bench(
+            lambda: tri_grad(q, k, v, si, do, out_tri, smax_tri, ssum_tri,
+                             query_rope=qr, key_rope=kr))
+        print(f"triton:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
+    except Exception as e:
+        print(f"triton:  FAILED - {e}")
+        t_med = None
+
+    out_cann, smax_cann, ssum_cann = ops.sparse_flash_attention(
+        q, k, v, si, scale,
+        query_rope=qr, key_rope=kr,
+        layout_query="BSND", layout_kv="BSND",
+        sparse_block_size=1, sparse_mode=3,
+        attention_mode=2, return_softmax_lse=True)
+
+    cann_grad = SparseFlashAttentionGradCANN(scale_value=scale, sparse_mode=3)
+
+    try:
+        o_med, o_p20, o_p80 = _do_bench(
+            lambda: cann_grad(q, k, v, si, do, out_cann, smax_cann, ssum_cann,
+                              query_rope=qr, key_rope=kr,
+                              actual_seq_lengths_query=act_q,
+                              actual_seq_lengths_kv=act_k))
+        print(f"cann:    median={o_med:.2f}ms, p20={o_p20:.2f}ms, p80={o_p80:.2f}ms")
+    except Exception as e:
+        print(f"cann:    FAILED - {e}")
+        o_med = None
+
+    if t_med is not None and o_med is not None and t_med > 0:
+        print(f"speedup: {o_med / t_med:.2f}x")
+
+
+def run_timing():
     configs = [
         (1, 128, 1024, 64, 16),
         (1, 256, 2048, 64, 32),
         (1, 512, 4096, 64, 64),
     ]
 
-    for B, S1, S2, N1, sparse_count in configs:
-        print(f"\nB={B}, S1={S1}, S2={S2}, N1={N1}, topk={sparse_count}")
+    # 每个 case fork 到独立子进程: 拿到干净的分配器/VMM 状态, 隔离跨 case 内存
+    # 碎片污染 (同进程串跑 case3 大 shape 会触发 H2D 竞争越界)。父进程不碰设备。
+    for cfg in configs:
+        pid = os.fork()
+        if pid == 0:  # child
+            ms.set_context(mode=ms.GRAPH_MODE)
+            ms.set_seed(42)
+            _run_one_config(*cfg)
+            # os._exit 绕过 stdio flush; 输出重定向到管道/文件时 stdout 是块缓冲,
+            # 不手动 flush 会丢掉子进程的全部 print。
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+        os.waitpid(pid, 0)
 
-        q, k, v, qr, kr, do, si = _make_inputs(B, S1, S2, N1, sparse_count)
-        scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
-        act_q = ms.Tensor([S1] * B, dtype=ms.int32)
-        act_k = ms.Tensor([S2] * B, dtype=ms.int32)
-
-        fwd_tri = SparseFlashAttentionTriton(
-            scale_value=scale, sparse_mode=3, return_softmax_lse=True)
-        out_tri, smax_tri, ssum_tri = fwd_tri(q, k, v, si, query_rope=qr, key_rope=kr)
-
-        tri_grad = SparseFlashAttentionGradTriton(scale_value=scale, sparse_mode=3)
-
-        try:
-            t_med, t_p20, t_p80 = _do_bench(
-                lambda: tri_grad(q, k, v, si, do, out_tri, smax_tri, ssum_tri,
-                                 query_rope=qr, key_rope=kr))
-            print(f"triton:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
-        except Exception as e:
-            print(f"triton:  FAILED - {e}")
-            t_med = None
-
-        out_cann, smax_cann, ssum_cann = ops.sparse_flash_attention(
-            q, k, v, si, scale,
-            query_rope=qr, key_rope=kr,
-            layout_query="BSND", layout_kv="BSND",
-            sparse_block_size=1, sparse_mode=3,
-            attention_mode=2, return_softmax_lse=True)
-
-        cann_grad = SparseFlashAttentionGradCANN(scale_value=scale, sparse_mode=3)
-
-        try:
-            o_med, o_p20, o_p80 = _do_bench(
-                lambda: cann_grad(q, k, v, si, do, out_cann, smax_cann, ssum_cann,
-                                  query_rope=qr, key_rope=kr,
-                                  actual_seq_lengths_query=act_q,
-                                  actual_seq_lengths_kv=act_k))
-            print(f"cann:    median={o_med:.2f}ms, p20={o_p20:.2f}ms, p80={o_p80:.2f}ms")
-        except Exception as e:
-            print(f"cann:    FAILED - {e}")
-            o_med = None
-
-        if t_med is not None and o_med is not None and t_med > 0:
-            print(f"speedup: {o_med / t_med:.2f}x")
 
 
 def run_profiling():
@@ -244,15 +267,15 @@ def run_kernel_only():
 
 
 if __name__ == "__main__":
-    import sys
-
-    ms.set_context(mode=ms.GRAPH_MODE)
     np.random.seed(42)
     ms.set_seed(42)
 
     if len(sys.argv) > 1 and sys.argv[1] == "--kernel-only":
+        ms.set_context(mode=ms.GRAPH_MODE)
         run_kernel_only()
     else:
+        # run_timing 每 case fork 隔离 (父进程不碰设备); profiling 段在父进程跑。
         run_timing()
+        ms.set_context(mode=ms.GRAPH_MODE)
         run_profiling()
         run_profiling_cann()
