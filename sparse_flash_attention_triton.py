@@ -92,10 +92,9 @@ _patch_triton_ascend_mindspore_dtype_bytes()
 def _prune_configs(configs, named_args, **kwargs):
     """autotune config 过滤 (UB 上限 + grid pow2 + grid 总数上限)。
 
-    Two-pass kernel: no [BLOCK_G,D] resident acc; pass-2 keeps acc[BLOCK_G,BLOCK_DV]
-    + v[BLOCK_K,BLOCK_DV], so UB no longer scales with full D. The 2.0 factor below
-    is a coarse guard for Ascend's auto-multi-buffer doubling (the on-device
-    compiler is the final UB authority — observed it reject undersized estimates).
+    Chunked kernel: p_raw[BLOCK_G,BLOCK_K] kept resident during DV loop;
+    fp32 accumulator lives in global memory (fp32_acc_ptr), not in UB. The 2.0
+    factor below is a coarse guard for Ascend's auto-multi-buffer doubling.
     """
     _UB_LIMIT_BYTES = 180 * 1024   # headroom under the 192KB hard limit
     _GRID_LIMIT = 131072  # 这个值持保留意见
@@ -111,15 +110,18 @@ def _prune_configs(configs, named_args, **kwargs):
     def _estimate_ub_bytes(block_g, block_k, block_d, block_dv):
         if None in (block_g, block_k, block_d, block_dv):
             return 0
-        acc = block_g * block_dv * 4        # acc[BLOCK_G, BLOCK_DV] fp32 (pass 2)
-        v_tile = block_k * block_dv * 2     # v[BLOCK_K, BLOCK_DV] fp16
-        q_tile = block_g * block_d * 2      # q/k QK tiles fp16
+        # chunked path: p_raw kept resident during DV loop; fp32 acc in global mem.
+        # pv_tile (tl.dot result) coexists with loaded acc_dv during correction.
+        m_l = block_g * 2 * 4                # m_i + l_i [BLOCK_G] fp32
+        p_raw = block_g * block_k * 2        # p_raw[BLOCK_G, BLOCK_K] fp16 resident
+        v_tile = block_k * block_dv * 2      # v[BLOCK_K, BLOCK_DV] fp16
+        pv_tile = block_g * block_dv * 4     # tl.dot(p,v) result fp32 (coexists with acc_dv load)
+        q_tile = block_g * block_d * 2       # q/k QK tiles fp16
         k_tile = block_k * block_d * 2
-        s_tile = block_g * block_k * 4      # scores[BLOCK_G, BLOCK_K] fp32
-        p_tile = block_g * block_k * 2      # p cast fp16 for PV
-        trans = block_k * block_d * 2       # tl.trans tmp
-        total = acc + v_tile + q_tile + k_tile + s_tile + p_tile + trans
-        return int(total * 2.0)             # multi-buffer doubling guard
+        s_tile = block_g * block_k * 4       # scores[BLOCK_G, BLOCK_K] fp32
+        trans = block_k * block_d * 2        # tl.trans tmp
+        total = m_l + p_raw + v_tile + pv_tile + q_tile + k_tile + s_tile + trans
+        return int(total * 2.0)
 
     kept = []
     for c in configs:
@@ -187,13 +189,13 @@ def _sfa_scores_block(
 
 
 @triton.autotune(
-    configs=[
-        # Two-pass kernel: pass-2 keeps only acc[BLOCK_G, BLOCK_DV] (not [.,D]) +
-        # v[BLOCK_K, BLOCK_DV], so UB no longer scales with full D. BLOCK_DV<=128.
+configs=[
+        # Chunked kernel: p_raw[BLOCK_G,BLOCK_K] kept resident during DV loop;
+        # fp32 accumulator in global memory (fp32_acc_ptr), not in UB.
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 64, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 32, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # BLOCK_G>=N1 -> grid1=1: MQA gathers KV once per (b,s1), no per-head re-gather.
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 64,  "BLOCK_DV": 64}),
@@ -211,6 +213,7 @@ def _sfa_kernel(
     k_ptr, kr_ptr, v_ptr,                # key/key_rope/value, all [B,S2,1,*]
     sparse_ptr,                          # token indices [B,S1,1,topK] int32 (block-wise pre-expanded on host)
     out_ptr, sm_max_ptr, sm_sum_ptr,     # outputs
+    fp32_acc_ptr,                        # fp32 accumulator [B,S1,N1,D] for chunked path
     act_q_ptr, act_k_ptr,
     B_S1, S1, S2, N1, topK,
     D: tl.constexpr, D_ROPE: tl.constexpr,
@@ -232,10 +235,12 @@ def _sfa_kernel(
 
     SINGLE_BLOCK (topK fits one BLOCK_TOPK block): scores/P computed ONCE and kept
         resident, then dv-tiled P@V. Score/gather recompute is O(1), not
-        O(dv_tiles*k_blocks). Used for topK<=128 (the profiled/mindformers shapes).
-    else (two-pass fallback, large topK): Pass 1 streams KV -> online-softmax stats
-        m_i / l_i; Pass 2 tiles output dim by BLOCK_DV, per tile re-streams KV,
-        recomputes scores, accumulates p @ v. Keeps UB independent of D.
+        O(dv_tiles*k_blocks) as in the chunked fallback below. Used for topK<=128.
+    else (chunked online-softmax, large topK): single pass over KV chunks with
+        per-chunk correction of fp32 global accumulator (fp32_acc_ptr). Per chunk:
+        compute scores, p_raw = exp(scores - m_chunk), then dv-tiled P@V with
+        alpha_old/alpha_new correction applied via load-modify-store on fp32_acc.
+        Eliminates two-pass score recompute, reduces dots ~69%.
 
     sparse_ptr holds token positions directly; block-wise (sparse_block_size>1)
     is pre-expanded on host into per-token indices, so this kernel is token-wise.
@@ -314,9 +319,13 @@ def _sfa_kernel(
             tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
             tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
     else:
-        # ---- Pass 1: online-softmax stats (m_i, l_i); no V, no [BLOCK_G,D] acc ----
+        # ---- chunked online-softmax: one pass over KV chunks, per-chunk
+        # correction of fp32 global accumulator. Eliminates two-pass score
+        # recompute, reduces dots ~69% (928 -> 288 for the profiled shape). ----
         m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
         l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
+        fp32_base = (b * S1 + s1) * N1 * D
+
         for blk_start in range(0, topK, BLOCK_K):
             blk_offs = blk_start + tl.arange(0, BLOCK_K)
             blk_in_count = blk_offs < topK
@@ -330,55 +339,51 @@ def _sfa_kernel(
                 tok_clamped, tok_valid, g_offs, g_valid,
                 scale_value, D, D_ROPE, BLOCK_G, BLOCK_K, BLOCK_D)
 
-            # guard all-masked block: max stays -inf -> safe 0 so exp(-inf)=0, not nan.
             m_blk = tl.max(scores, axis=1)
             m_new = tl.maximum(m_i, m_blk)
-            m_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
-            p = tl.exp(scores - m_safe[:, None])
-            p = tl.where(tok_valid[None, :], p, 0.0)
-            alpha = tl.exp(m_i - m_safe)
-            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_new_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+            alpha_old = tl.exp(m_i - m_new_safe)
+            alpha_new = tl.exp(m_blk - m_new_safe)
+
+            m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
+            p_raw = tl.exp(scores - m_blk_safe[:, None])
+            p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
+            l_chunk = tl.sum(p_raw, axis=1)
+            l_i = l_i * alpha_old + l_chunk * alpha_new
+
+            for dv_start in range(0, D, BLOCK_DV):
+                dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+                dv_valid = dv_offs < D
+                v_tile = tl.load(
+                    v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
+                    mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+                pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
+                acc_dv = tl.load(
+                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                    mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
+                acc_dv = acc_dv * alpha_old[:, None] + pv_tile
+                tl.store(
+                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                    acc_dv,
+                    mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
             m_i = m_new
 
-        # final global max for pass 2 (empty rows: m_i==-inf -> use 0, p will be 0)
-        m_final = tl.where(m_i == float('-inf'), 0.0, m_i)
         l_safe = tl.where(l_i > 0.0, l_i, 1.0)
-
-        # ---- Pass 2: tile output dim, recompute scores, accumulate p @ v ----
         out_base = (b * S1 + s1) * N1 * D
         for dv_start in range(0, D, BLOCK_DV):
             dv_offs = dv_start + tl.arange(0, BLOCK_DV)
             dv_valid = dv_offs < D
-            acc = tl.zeros([BLOCK_G, BLOCK_DV], dtype=tl.float32)
-            for blk_start in range(0, topK, BLOCK_K):
-                blk_offs = blk_start + tl.arange(0, BLOCK_K)
-                blk_in_count = blk_offs < topK
-                tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
-                tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-                tok_clamped = tl.where(tok_valid, tok, 0)
-
-                scores = _sfa_scores_block(
-                    q_ptr, q_base, qr_ptr, qr_base,
-                    k_ptr, k_base, kr_ptr, kr_base,
-                    tok_clamped, tok_valid, g_offs, g_valid,
-                    scale_value, D, D_ROPE, BLOCK_G, BLOCK_K, BLOCK_D)
-
-                p = tl.exp(scores - m_final[:, None])
-                p = tl.where(tok_valid[None, :], p, 0.0)
-                v_tile = tl.load(
-                    v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
-                    mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
-                acc += tl.dot(p.to(v_tile.dtype), v_tile)
-
-            out_tile = acc / l_safe[:, None]
+            acc_dv = tl.load(
+                fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
+            out_tile = acc_dv / l_safe[:, None]
             tl.store(
                 out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
                 out_tile.to(out_ptr.dtype.element_ty),
                 mask=g_valid[:, None] & dv_valid[None, :] & row_active)
 
         if return_lse:
-            # softmax_max/sum layout (B, N2=1, S1, N1) -> flat (b*S1+s1)*N1 + g.
-            # Empty/hidden rows (l_i==0) keep the pre-filled 0 to match the golden.
             sm_base = (b * S1 + s1) * N1
             store_mask = g_valid & row_active & (l_i > 0.0)
             tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
@@ -483,6 +488,7 @@ def _infer_sfa(
     k_flat: ms.Tensor, kr_flat: ms.Tensor, v_flat: ms.Tensor,
     sparse_flat: ms.Tensor,
     out_buf: ms.Tensor, sm_max_buf: ms.Tensor, sm_sum_buf: ms.Tensor,
+    fp32_acc_buf: ms.Tensor,
     act_q: ms.Tensor, act_k: ms.Tensor,
     B_S1: int, S1: int, S2: int, N1: int, topK: int,
     D: int, D_ROPE: int,
@@ -501,6 +507,7 @@ def _sfa_core(
     k_flat: ms.Tensor, kr_flat: ms.Tensor, v_flat: ms.Tensor,
     sparse_flat: ms.Tensor,
     out_buf: ms.Tensor, sm_max_buf: ms.Tensor, sm_sum_buf: ms.Tensor,
+    fp32_acc_buf: ms.Tensor,
     act_q: ms.Tensor, act_k: ms.Tensor,
     B_S1: int, S1: int, S2: int, N1: int, topK: int,
     D: int, D_ROPE: int,
@@ -516,8 +523,8 @@ def _sfa_core(
     )
 
     # fast path when one block (BLOCK_TOPK = pow2(topK), capped at 128) covers the
-    # whole sparse window: scores/P computed once, dv-tiled P@V. Larger topK falls
-    # back to the two-pass online-softmax kernel.
+    # whole sparse window: scores/P computed once, dv-tiled P@V. Larger topK uses
+    # chunked online-softmax (fp32 global accumulator, no two-pass recompute).
     block_topk = _next_pow2(topK)
     single_block = block_topk <= 128
 
@@ -526,6 +533,7 @@ def _sfa_core(
         k_flat, kr_flat, v_flat,
         sparse_flat,
         out_buf, sm_max_buf, sm_sum_buf,
+        fp32_acc_buf,
         act_q, act_k,
         B_S1, S1, S2, N1, topK,
         D, D_ROPE,
@@ -676,12 +684,14 @@ def sparse_flash_attention_triton(
     out_buf = ms.mint.zeros((B, S1, N1, D), dtype=q_bsnd.dtype).to('Ascend')
     sm_max_buf = ms.mint.zeros((B, 1, S1, N1), dtype=ms.float32).to('Ascend')
     sm_sum_buf = ms.mint.zeros((B, 1, S1, N1), dtype=ms.float32).to('Ascend')
+    fp32_acc_buf = ms.mint.zeros((B, S1, N1, D), dtype=ms.float32).to('Ascend')
 
     out_buf, sm_max_buf, sm_sum_buf = _sfa_core(
         q_flat, qr_flat,
         k_flat, kr_flat, v_flat,
         sparse_flat,
         out_buf, sm_max_buf, sm_sum_buf,
+        fp32_acc_buf,
         act_q.to('Ascend'), act_k.to('Ascend'),
         B * S1, S1, S2, N1, topK,
         D, D_ROPE,

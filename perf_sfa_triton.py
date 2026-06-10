@@ -61,6 +61,29 @@ def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.float16, D=D_NOPE):
     return q, k, v, qr, kr, si
 
 
+def run_autotune_confirm():
+    from sparse_flash_attention_triton import SparseFlashAttentionTriton
+
+    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 2048
+    q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
+    scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
+
+    print(f"\nShape: B={B}, S1={S1}, S2={S2}, N1={N1}, topK={sparse_count}, D={D_NOPE}")
+    print("Running 1 invocation to trigger autotune — TRITON_PRINT_AUTOTUNING=1 output in stderr")
+    print("=" * 80)
+
+    cell = SparseFlashAttentionTriton(
+        scale_value=scale, sparse_mode=3, return_softmax_lse=True,
+    )
+    result = cell(q, k, v, si, query_rope=qr, key_rope=kr)
+    runtime.synchronize()
+    print(f"Autotune done. Output[0] shape: {result[0].shape}")
+
+    del q, k, v, qr, kr, si, cell, result
+    runtime.synchronize()
+    runtime.empty_cache()
+
+
 def run_timing():
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
 
@@ -217,8 +240,11 @@ if __name__ == "__main__":
     np.random.seed(42)
     ms.set_seed(42)
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--kernel-only":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "--kernel-only":
         run_kernel_only()
+    elif mode == "--autotune-confirm":
+        run_autotune_confirm()
     else:
         run_timing()
         run_profiling()
