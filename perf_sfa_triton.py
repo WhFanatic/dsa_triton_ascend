@@ -8,19 +8,23 @@ D_NOPE = 512  #客户建议优先测试数值256，来源kv_lora_rank:256
 D_ROPE = 64
 
 
-def _do_bench(fn, warmup=10, rep=100):
+def _do_bench(fn, warmup=10, rep=50):
     for _ in range(warmup):
-        fn()
-    runtime.synchronize()
+        out = fn()
+        runtime.synchronize()
+        del out
+        runtime.empty_cache()
 
     times = []
     for _ in range(rep):
         runtime.synchronize()
         t0 = time.perf_counter()
-        fn()
+        out = fn()
         runtime.synchronize()
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)
+        del out
+        runtime.empty_cache()
 
     times.sort()
     n = len(times)
@@ -64,6 +68,7 @@ def run_timing():
         (1, 128, 1024, 64, 16),
         (1, 256, 2048, 64, 32),
         (1, 512, 4096, 64, 64),
+        (1, 512, 4096, 64, 2048),
     ]
 
     for B, S1, S2, N1, sparse_count in configs:
@@ -100,6 +105,10 @@ def run_timing():
 
         if t_med is not None and o_med is not None and t_med > 0:
             print(f"speedup: {o_med / t_med:.2f}x")
+
+        del q, k, v, qr, kr, si, cell
+        runtime.synchronize()
+        runtime.empty_cache()
 
 
 def run_profiling():
