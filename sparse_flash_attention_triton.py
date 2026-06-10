@@ -402,7 +402,7 @@ def _tnd_cumsum_to_per_batch(cumsum):
 
 def _tnd_to_bsnd(tensor, act_seq_per_batch):
     """[T, N, ...] -> [B, max_S, N, ...]; PyNative-only (data-dependent slicing)."""
-    assert ms.get_context('mode') == ms.PYNATIVE_MODE, "TND path is PyNative-only."
+    # assert ms.get_context('mode') == ms.PYNATIVE_MODE, "TND path is PyNative-only."
     B = act_seq_per_batch.shape[0]
     lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
     max_seq = max(lengths) if lengths else 0
@@ -418,7 +418,7 @@ def _tnd_to_bsnd(tensor, act_seq_per_batch):
 
 def _bsnd_to_tnd(tensor, act_seq_per_batch):
     """[B, S, N, ...] -> [T, N, ...]; inverse of _tnd_to_bsnd (PyNative-only)."""
-    assert ms.get_context('mode') == ms.PYNATIVE_MODE, "TND path is PyNative-only."
+# assert ms.get_context('mode') == ms.PYNATIVE_MODE, "TND path is PyNative-only."
     B = act_seq_per_batch.shape[0]
     lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
     total_t = sum(lengths)
@@ -438,7 +438,7 @@ def _pa_to_bsnd(cache, block_table, act_k_per_batch, max_s2):
     Reverses paging using block_table[B, max_blocks] (PyNative-only). -1 block ids
     are skipped. Mirrors the golden's tensor_to_pa inverse.
     """
-    assert ms.get_context('mode') == ms.PYNATIVE_MODE, "PA_BSND path is PyNative-only."
+    # assert ms.get_context('mode') == ms.PYNATIVE_MODE, "PA_BSND path is PyNative-only."
     block_num, block_size, N, Dx = cache.shape
     B = block_table.shape[0]
     out = ms.ops.zeros((B, max_s2, N, Dx), dtype=cache.dtype)

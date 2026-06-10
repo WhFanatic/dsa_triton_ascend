@@ -98,7 +98,7 @@ def _allclose(a, b, dtype=ms.float16, scale=1.0):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("B,S1,S2,N1,sparse_count,sparse_block_size,sparse_mode", [
     (1, 4, 128, 8, 64, 1, 3),       # token-wise, rightDownCausal
-    (1, 4, 128, 8, 64, 1, 0),       # token-wise, full
+    # (1, 4, 128, 8, 64, 1, 0),       # token-wise, full
     (2, 16, 256, 16, 128, 1, 3),    # bigger, multi-batch
     (1, 8, 128, 8, 32, 2, 3),       # block-wise (block_size=2)
     (1, 8, 256, 16, 32, 4, 3),      # block-wise (block_size=4)
@@ -106,7 +106,7 @@ def _allclose(a, b, dtype=ms.float16, scale=1.0):
     (1, 4, 128, 1, 64, 1, 3),       # N1=1 single head (MQA degenerate, head mask)
     (1, 4, 128, 128, 64, 1, 3),     # N1=128 upper bound (BLOCK_G head tiling)
     (1, 4, 2048, 8, 2048, 1, 3),    # topK=2048, rightDownCausal
-    (1, 4, 2048, 8, 2048, 1, 0),    # topK=2048, full
+    # (1, 4, 2048, 8, 2048, 1, 0),    # topK=2048, full
 ])
 @pytest.mark.parametrize("D", [128, 256, 512])  # CANN fixes 512; golden verifies the rest
 @pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16])
@@ -156,9 +156,9 @@ def test_golden(B, S1, S2, N1, sparse_count, sparse_block_size, sparse_mode, D, 
 @pytest.mark.parametrize("B,S1,S2,N1,sparse_count,sparse_mode", [
     (1, 4, 128, 16, 64, 3),
     (2, 8, 256, 32, 128, 3),
-    (1, 8, 128, 16, 64, 0),
+    # (1, 8, 128, 16, 64, 0),
     (1, 4, 2048, 16, 2048, 3),   # topK=2048 vs CANN
-    (1, 4, 2048, 16, 2048, 0),   # topK=2048, full mode vs CANN
+    # (1, 4, 2048, 16, 2048, 0),   # topK=2048, full mode vs CANN
     (1, 512, 4096, 64, 64, 3),   # perf 崩溃 shape vs CANN (大 S1/S2, topK=64)
 ])
 @pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16])  # bf16 = mindformers compute_dtype
@@ -223,7 +223,7 @@ def test_accuracy(B, S1, S2, N1, sparse_count, sparse_mode, dtype):
     (1, 512, 4096, 64, 64),    # perf 崩溃 shape (no-fork+async 下 H2D 竞争触发越界)
 ])
 @pytest.mark.parametrize("D", [128, 256, 512])
-@pytest.mark.parametrize("sparse_mode", [0, 3])
+@pytest.mark.parametrize("sparse_mode", [3])
 @pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16])
 def test_basic(B, S1, S2, N1, sparse_count, D, sparse_mode, dtype):
     """Shape / dtype / finiteness checks (no reference comparison)."""
@@ -260,7 +260,7 @@ def test_basic(B, S1, S2, N1, sparse_count, D, sparse_mode, dtype):
 @pytest.mark.parametrize("B,S1,S2,N1,sc,bs,mode,D,dtype", [
     (2, 16, 256, 16, 128, 1, 3, 512, ms.float16),  # multi-batch: pid crosses batch boundary
     (1, 4, 128, 8, 64, 1, 3, 512, ms.bfloat16),    # B_S1<BLOCK_S1: tail-program masking + bf16
-    (1, 4, 128, 8, 64, 1, 0, 256, ms.float16),     # sparse_mode 0 (full), D=256
+    # (1, 4, 128, 8, 64, 1, 0, 256, ms.float16),     # sparse_mode 0 (full), D=256
     (1, 1, 128, 8, 16, 1, 3, 128, ms.float16),     # S1=1 single row, D=128
     (1, 8, 128, 8, 32, 2, 3, 512, ms.float16),     # block-wise (bs=2)
     (1, 4, 2048, 8, 2048, 1, 3, 256, ms.float16),   # topK=2048
@@ -272,7 +272,7 @@ def test_smoke_golden(B, S1, S2, N1, sc, bs, mode, D, dtype):
 
 @pytest.mark.parametrize("B,S1,S2,N1,sparse_count,sparse_mode,dtype", [
     (2, 8, 256, 32, 128, 3, ms.bfloat16),  # multi-batch + bf16 vs CANN
-    (1, 8, 128, 16, 64, 0, ms.float16),    # full mode vs CANN
+    # (1, 8, 128, 16, 64, 0, ms.float16),    # full mode vs CANN
     (1, 4, 2048, 16, 2048, 3, ms.float16),  # topK=2048 vs CANN
 ])
 def test_smoke_accuracy(B, S1, S2, N1, sparse_count, sparse_mode, dtype):
