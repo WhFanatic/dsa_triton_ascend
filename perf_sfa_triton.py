@@ -65,9 +65,9 @@ def run_timing():
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
 
     configs = [
-        (1, 128, 1024, 64, 16),
-        (1, 256, 2048, 64, 32),
-        (1, 512, 4096, 64, 64),
+        # (1, 128, 1024, 64, 16),
+        # (1, 256, 2048, 64, 32),
+        # (1, 512, 4096, 64, 64),
         (1, 512, 4096, 64, 2048),
     ]
 
