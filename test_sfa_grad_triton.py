@@ -66,7 +66,7 @@ def _make_sparse_indices(B, S1, S2, sparse_count, sparse_block_size, sparse_mode
     return ms.Tensor(si, dtype=ms.int32)
 
 
-def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.float16, D=D_NOPE):
+def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.bfloat16, D=D_NOPE):
     """Random BSND tensors (MQA: N2=1). value passed but ignored (=key)."""
     rng = np.random.RandomState(42)
 
@@ -82,7 +82,7 @@ def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.float16, D=D_NOPE):
     return q, k, v, qr, kr, do
 
 
-def _allclose(a, b, dtype=ms.float16, scale=1.0):
+def _allclose(a, b, dtype=ms.bfloat16, scale=1.0):
     # backward accumulates over topK AND scatters across S1 rows; looser tol than
     # forward. scale relaxes atol for large-magnitude grads (dk/dv sum many rows).
     rtol = 6e-2 if dtype == ms.bfloat16 else 3e-2
@@ -364,8 +364,8 @@ if __name__ == "__main__":
                   f"|gold|max={bmax:.3e} worst@{idx} tri={av:+.4e} gold={bv:+.4e}"
                   f"{'' if fin else '  [NaN/inf!]'}")
 
-    _run(1, 4, 128, 8, 64, 1, 3, 512, ms.float16)
-    _run(1, 4, 128, 8, 64, 1, 0, 128, ms.float16)
-    _run(1, 8, 128, 8, 32, 2, 3, 256, ms.float16)
     _run(1, 4, 128, 8, 64, 1, 3, 512, ms.bfloat16)
-    _run(1, 4, 2048, 8, 2048, 1, 3, 256, ms.float16)
+    _run(1, 4, 128, 8, 64, 1, 0, 128, ms.bfloat16)
+    _run(1, 8, 128, 8, 32, 2, 3, 256, ms.bfloat16)
+    _run(1, 4, 128, 8, 64, 1, 3, 512, ms.bfloat16)
+    _run(1, 4, 2048, 8, 2048, 1, 3, 256, ms.bfloat16)

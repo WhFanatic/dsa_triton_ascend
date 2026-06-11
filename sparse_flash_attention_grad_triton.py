@@ -141,18 +141,7 @@ _patch_triton_ascend_mindspore_dtype_bytes()
 
 
 def _select_block_config(D):
-    """Host-side fixed block config (no autotune).
-
-    The backward writes dk/dkr/dv via tl.atomic_add into pre-zeroed buffers.
-    triton.autotune benchmarks each config by running the kernel HUNDREDS of times
-    against the same buffers, so the atomic accumulation explodes (~config_runs×).
-    We therefore pick a fixed, hardware-validated config and launch the kernel
-    exactly once. BLOCK_G=16/BLOCK_K=16/BLOCK_D=128 is the config that passed on
-    D=512 (where _prune_configs happened to leave a single config -> no bench).
-    UB scales with D via the resident acc_dq[BLOCK_G,D]; small blocks keep all of
-    D in {128,256,512} within the ~192KB UB budget.
-    """
-    return {"BLOCK_G": 16, "BLOCK_K": 16, "BLOCK_D": 128}
+    return {"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128}
 
 
 @triton.jit
@@ -271,9 +260,9 @@ def _sfa_grad_kernel(
         acc_dq += tl.dot(dS.to(k_full.dtype), k_full).to(tl.float32)
         acc_dqr += tl.dot(dS.to(kr_full.dtype), kr_full).to(tl.float32)
 
-        # scatter dk/dv over D-tiles (bound UB on [BLOCK_K, *] fp32 contribs)
-        dS_t = tl.trans(dS)          # [BLOCK_K, BLOCK_G]
-        P_t = tl.trans(P)            # [BLOCK_K, BLOCK_G]
+        # scatter dk/dv over D-tiles
+        dS_t = tl.trans(dS)
+        P_t = tl.trans(P)
         for d_start in range(0, D, BLOCK_D):
             d_offs = d_start + tl.arange(0, BLOCK_D)
             d_valid = d_offs < D
@@ -291,7 +280,7 @@ def _sfa_grad_kernel(
             tl.atomic_add(dv_ptr + dk_offs, dv_contrib,
                           mask=tok_valid[:, None] & d_valid[None, :])
 
-        # scatter dkr (Dr single tile)
+        # scatter dkr
         qr_sub = tl.load(
             qr_ptr + qr_base + g_offs[:, None] * D_ROPE + dr_offs_full[None, :],
             mask=g_valid[:, None], other=0.0)
