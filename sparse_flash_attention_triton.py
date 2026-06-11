@@ -93,11 +93,13 @@ def _prune_configs(configs, named_args, **kwargs):
     """autotune config 过滤 (UB 上限 + grid pow2 + grid 总数上限)。
 
     Chunked kernel: p_raw[BLOCK_G,BLOCK_K] kept resident during DV loop;
-    fp32 accumulator lives in global memory (fp32_acc_ptr), not in UB. The 2.0
-    factor below is a coarse guard for Ascend's auto-multi-buffer doubling.
+    fp32_acc is loaded into UB for correction step (acc_dv buffer, previously
+    unaccounted).  D-dependent multiplier: D<=128 uses 3.0 (UB overflow proven
+    at 2.0 for both fp16 and bf16); D>=256 uses 2.0 (no overflow observed,
+    fp16 D=512 baseline verified Config 4 at ~48ms).
     """
-    _UB_LIMIT_BYTES = 180 * 1024   # headroom under the 192KB hard limit
-    _GRID_LIMIT = 131072  # 这个值持保留意见
+    _UB_LIMIT_BYTES = 180 * 1024
+    _GRID_LIMIT = 131072
 
     def _get(name):
         if name in named_args:
@@ -106,20 +108,23 @@ def _prune_configs(configs, named_args, **kwargs):
 
     N1 = _get("N1")
     BS1 = _get("B_S1")
+    D = _get("D")
+    ub_multiplier = 3.0 if (D is not None and D <= 128) else 2.0
 
     def _estimate_ub_bytes(block_g, block_k, block_d, block_dv):
         if None in (block_g, block_k, block_d, block_dv):
             return 0
-        acc_pv = block_g * block_dv * 4        # pv_tile[BG,DV] fp32 (tl.dot result)
-        v_tile = block_k * block_dv * 2        # v[BLOCK_K, BLOCK_DV] fp16
-        q_tile = block_g * block_d * 2         # q/k QK tiles fp16
+        acc_pv = block_g * block_dv * 4
+        v_tile = block_k * block_dv * 2
+        q_tile = block_g * block_d * 2
         k_tile = block_k * block_d * 2
-        s_tile = block_g * block_k * 4         # scores[BLOCK_G, BLOCK_K] fp32
-        p_tile = block_g * block_k * 2         # p_raw fp16 resident during DV loop
-        trans = block_k * block_d * 2          # tl.trans tmp
-        m_l = block_g * 2 * 4                  # m_i + l_i [BG] fp32
-        total = acc_pv + v_tile + q_tile + k_tile + s_tile + p_tile + trans + m_l
-        return int(total * 2.0)
+        s_tile = block_g * block_k * 4
+        p_tile = block_g * block_k * 2
+        trans = block_k * block_d * 2
+        m_l = block_g * 2 * 4
+        acc_dv = block_g * block_dv * 4        # fp32_acc load in chunked correction
+        total = acc_pv + v_tile + q_tile + k_tile + s_tile + p_tile + trans + m_l + acc_dv
+        return int(total * ub_multiplier)
 
     kept = []
     for c in configs:

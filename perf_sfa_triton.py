@@ -46,7 +46,7 @@ def _make_sparse_indices(B, S1, S2, sparse_count, sparse_mode):
     return ms.Tensor(si, dtype=ms.int32)
 
 
-def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.float16, D=D_NOPE):
+def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.bfloat16, D=D_NOPE):
     rng = np.random.RandomState(42)
 
     def _t(shape):
