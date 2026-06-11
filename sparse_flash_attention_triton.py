@@ -110,17 +110,15 @@ def _prune_configs(configs, named_args, **kwargs):
     def _estimate_ub_bytes(block_g, block_k, block_d, block_dv):
         if None in (block_g, block_k, block_d, block_dv):
             return 0
-        # chunked path: p_raw kept resident during DV loop; fp32 acc in global mem.
-        # pv_tile (tl.dot result) coexists with loaded acc_dv during correction.
-        m_l = block_g * 2 * 4                # m_i + l_i [BLOCK_G] fp32
-        p_raw = block_g * block_k * 2        # p_raw[BLOCK_G, BLOCK_K] fp16 resident
-        v_tile = block_k * block_dv * 2      # v[BLOCK_K, BLOCK_DV] fp16
-        pv_tile = block_g * block_dv * 4     # tl.dot(p,v) result fp32 (coexists with acc_dv load)
-        q_tile = block_g * block_d * 2       # q/k QK tiles fp16
+        acc_pv = block_g * block_dv * 4        # pv_tile[BG,DV] fp32 (tl.dot result)
+        v_tile = block_k * block_dv * 2        # v[BLOCK_K, BLOCK_DV] fp16
+        q_tile = block_g * block_d * 2         # q/k QK tiles fp16
         k_tile = block_k * block_d * 2
-        s_tile = block_g * block_k * 4       # scores[BLOCK_G, BLOCK_K] fp32
-        trans = block_k * block_d * 2        # tl.trans tmp
-        total = m_l + p_raw + v_tile + pv_tile + q_tile + k_tile + s_tile + trans
+        s_tile = block_g * block_k * 4         # scores[BLOCK_G, BLOCK_K] fp32
+        p_tile = block_g * block_k * 2         # p_raw fp16 resident during DV loop
+        trans = block_k * block_d * 2          # tl.trans tmp
+        m_l = block_g * 2 * 4                  # m_i + l_i [BG] fp32
+        total = acc_pv + v_tile + q_tile + k_tile + s_tile + p_tile + trans + m_l
         return int(total * 2.0)
 
     kept = []
@@ -189,20 +187,14 @@ def _sfa_scores_block(
 
 
 @triton.autotune(
-configs=[
-        # Chunked kernel: p_raw[BLOCK_G,BLOCK_K] kept resident during DV loop;
-        # fp32 accumulator in global memory (fp32_acc_ptr), not in UB.
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 128}),
+    configs=[
+        # BDV capped at 64: chunked fp32_acc correction creates ~4 [BG,DV] fp32 temps;
+        # Ascend compiler allocates ~4x multiplier, so BDV=128 (8KB each) exceeds UB
+        # for D=128 shapes. BDV=64 (4KB each) keeps peak under ~152KB < 192KB limit.
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 32, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
-        # BLOCK_G>=N1 -> grid1=1: MQA gathers KV once per (b,s1), no per-head re-gather.
-        triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 64,  "BLOCK_DV": 64}),
-        # same tiling, deeper software pipeline: lets the fast-path PV (cube) overlap
-        # the next dv-tile's softmax/gather-addressing (vector), hiding the cube's
-        # wait_id0 idle that dominates this shape. Falls back to stages=2 if not faster.
-        triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 64,  "BLOCK_DV": 64}, num_stages=3),
     ],
     key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
     prune_configs_by={"early_config_prune": _prune_configs},
