@@ -297,6 +297,7 @@ def _sfa_kernel(
         l_i = tl.sum(p, axis=1)
         l_safe = tl.where(l_i > 0.0, l_i, 1.0)
 
+        probs = (p / l_safe[:, None]).to(v_ptr.dtype.element_ty)
         out_base = (b * S1 + s1) * N1 * D
         for dv_start in range(0, D, BLOCK_DV):
             dv_offs = dv_start + tl.arange(0, BLOCK_DV)
@@ -304,7 +305,7 @@ def _sfa_kernel(
             v_tile = tl.load(
                 v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
                 mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
-            out_tile = tl.dot(p.to(v_tile.dtype), v_tile) / l_safe[:, None]
+            out_tile = tl.dot(probs, v_tile)
             tl.store(
                 out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
                 out_tile.to(out_ptr.dtype.element_ty),
