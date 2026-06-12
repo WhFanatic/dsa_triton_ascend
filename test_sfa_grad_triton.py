@@ -110,8 +110,16 @@ def _allclose(a, b, dtype=ms.bfloat16, scale=1.0):
 ])
 @pytest.mark.parametrize("D", [128, 256, 512])  # CANN fixes 512; golden verifies the rest
 @pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16])
-def test_golden(B, S1, S2, N1, sparse_count, sparse_block_size, sparse_mode, D, dtype):
-    """Compare triton SFA backward with the numpy golden (D 128/256/512, fp16/bf16)."""
+@pytest.mark.parametrize("fwd_source", ["triton", "cann"])
+def test_golden(B, S1, S2, N1, sparse_count, sparse_block_size, sparse_mode, D, dtype, fwd_source):
+    """Compare triton SFA backward with the numpy golden (D 128/256/512, fp16/bf16).
+
+    fwd_source="triton": triton forward -> triton backward vs golden (end-to-end triton).
+    fwd_source="cann":   CANN forward -> triton backward vs golden (isolates backward accuracy).
+    """
+    if fwd_source == "cann" and D != 512:
+        pytest.skip("CANN sparse_flash_attention only supports D=512")
+
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
     from sparse_flash_attention_grad_triton import SparseFlashAttentionGradTriton
     from sparse_flash_attention_grad_numpy import sparse_flash_attention_grad_golden_bsnd
@@ -121,12 +129,19 @@ def test_golden(B, S1, S2, N1, sparse_count, sparse_block_size, sparse_mode, D, 
     si = _make_sparse_indices(B, S1, S2, sparse_count, sparse_block_size, sparse_mode)
     scale = 1.0 / np.sqrt(D + D_ROPE)
 
-    # forward (triton) to get consistent out / softmax stats
-    fwd = SparseFlashAttentionTriton(
-        scale_value=scale, sparse_block_size=sparse_block_size,
-        sparse_mode=sparse_mode, return_softmax_lse=True,
-    )
-    out, smax, ssum = fwd(q, k, v, si, query_rope=qr, key_rope=kr)
+    if fwd_source == "triton":
+        fwd = SparseFlashAttentionTriton(
+            scale_value=scale, sparse_block_size=sparse_block_size,
+            sparse_mode=sparse_mode, return_softmax_lse=True,
+        )
+        out, smax, ssum = fwd(q, k, v, si, query_rope=qr, key_rope=kr)
+    else:
+        out, smax, ssum = ops.sparse_flash_attention(
+            q, k, v, si, scale,
+            query_rope=qr, key_rope=kr,
+            layout_query="BSND", layout_kv="BSND",
+            sparse_block_size=sparse_block_size, sparse_mode=sparse_mode,
+            attention_mode=2, return_softmax_lse=True)
 
     grad = SparseFlashAttentionGradTriton(
         scale_value=scale, sparse_block_size=sparse_block_size, sparse_mode=sparse_mode,
@@ -257,17 +272,17 @@ def test_basic(B, S1, S2, N1, sparse_count, D, sparse_mode, dtype):
 # test_accuracy bodies. Run after every edit:  pytest --forked -k smoke
 # Run the full matrix only after large structural / logic changes.
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("B,S1,S2,N1,sc,bs,mode,D,dtype", [
-    (2, 16, 256, 16, 128, 1, 3, 512, ms.float16),  # multi-batch: pid crosses batch boundary
-    (1, 4, 128, 8, 64, 1, 3, 512, ms.bfloat16),    # B_S1<BLOCK_S1: tail-program masking + bf16
-    # (1, 4, 128, 8, 64, 1, 0, 256, ms.float16),     # sparse_mode 0 (full), D=256
-    (1, 1, 128, 8, 16, 1, 3, 128, ms.float16),     # S1=1 single row, D=128
-    (1, 8, 128, 8, 32, 2, 3, 512, ms.float16),     # block-wise (bs=2)
-    (1, 4, 2048, 8, 2048, 1, 3, 256, ms.float16),   # topK=2048
+@pytest.mark.parametrize("B,S1,S2,N1,sc,bs,mode,D,dtype,fwd_source", [
+    (2, 16, 256, 16, 128, 1, 3, 512, ms.float16, "cann"),    # multi-batch, CANN fwd
+    (1, 4, 128, 8, 64, 1, 3, 512, ms.bfloat16, "triton"),    # B_S1<BLOCK_S1, triton fwd
+    # (1, 4, 128, 8, 64, 1, 0, 256, ms.float16, "triton"),   # sparse_mode 0 (full), D=256
+    (1, 1, 128, 8, 16, 1, 3, 128, ms.float16, "triton"),     # S1=1 single row, D=128
+    (1, 8, 128, 8, 32, 2, 3, 512, ms.float16, "cann"),       # block-wise (bs=2), CANN fwd
+    (1, 4, 2048, 8, 2048, 1, 3, 256, ms.float16, "triton"),  # topK=2048
 ])
-def test_smoke_golden(B, S1, S2, N1, sc, bs, mode, D, dtype):
+def test_smoke_golden(B, S1, S2, N1, sc, bs, mode, D, dtype, fwd_source):
     """Fast backward golden subset covering the BLOCK_S1 folding risk points."""
-    test_golden(B, S1, S2, N1, sc, bs, mode, D, dtype)
+    test_golden(B, S1, S2, N1, sc, bs, mode, D, dtype, fwd_source)
 
 
 @pytest.mark.parametrize("B,S1,S2,N1,sparse_count,sparse_mode,dtype", [
@@ -338,13 +353,21 @@ if __name__ == "__main__":
                 float(over.mean()), idx, a[idx], b[idx],
                 float(np.abs(b).max()))
 
-    def _run(B, S1, S2, N1, sc, bs, mode, D, dtype):
+    def _run(B, S1, S2, N1, sc, bs, mode, D, dtype, fwd_source="triton"):
         q, k, v, qr, kr, do = _make_inputs(B, S1, S2, N1, sc, dtype, D=D)
         si = _make_sparse_indices(B, S1, S2, sc, bs, mode)
         scale = 1.0 / np.sqrt(D + D_ROPE)
-        fwd = SparseFlashAttentionTriton(scale_value=scale, sparse_block_size=bs,
-                                         sparse_mode=mode, return_softmax_lse=True)
-        out, smax, ssum = fwd(q, k, v, si, query_rope=qr, key_rope=kr)
+        if fwd_source == "triton":
+            fwd = SparseFlashAttentionTriton(scale_value=scale, sparse_block_size=bs,
+                                             sparse_mode=mode, return_softmax_lse=True)
+            out, smax, ssum = fwd(q, k, v, si, query_rope=qr, key_rope=kr)
+        else:
+            out, smax, ssum = ops.sparse_flash_attention(
+                q, k, v, si, scale,
+                query_rope=qr, key_rope=kr,
+                layout_query="BSND", layout_kv="BSND",
+                sparse_block_size=bs, sparse_mode=mode,
+                attention_mode=2, return_softmax_lse=True)
         grad = SparseFlashAttentionGradTriton(scale_value=scale,
                                               sparse_block_size=bs, sparse_mode=mode)
         dq, dk, dv, dqr, dkr = grad(q, k, v, si, do, out, smax, ssum,
@@ -354,7 +377,7 @@ if __name__ == "__main__":
             _to_np_f32(do), _to_np_f32(out), _to_np_f32(smax), _to_np_f32(ssum),
             _to_np_f32(qr), _to_np_f32(kr), scale, [S1] * B, [S2] * B,
             sparse_block_size=bs, sparse_mode=mode, dtype=_NP_DTYPE[dtype])
-        print(f"\n=== D={D} mode{mode} bs={bs} {dtype} (S1={S1} scale_atol={S1}) ===")
+        print(f"\n=== D={D} mode{mode} bs={bs} {dtype} fwd={fwd_source} (S1={S1} scale_atol={S1}) ===")
         for name, t, gld, sc_ in (("dq", dq, g[0], 1), ("dk", dk, g[1], S1),
                                   ("dv", dv, g[2], S1), ("dqr", dqr, g[3], 1),
                                   ("dkr", dkr, g[4], S1)):
@@ -364,8 +387,8 @@ if __name__ == "__main__":
                   f"|gold|max={bmax:.3e} worst@{idx} tri={av:+.4e} gold={bv:+.4e}"
                   f"{'' if fin else '  [NaN/inf!]'}")
 
-    _run(1, 4, 128, 8, 64, 1, 3, 512, ms.bfloat16)
-    _run(1, 4, 128, 8, 64, 1, 0, 128, ms.bfloat16)
-    _run(1, 8, 128, 8, 32, 2, 3, 256, ms.bfloat16)
-    _run(1, 4, 128, 8, 64, 1, 3, 512, ms.bfloat16)
-    _run(1, 4, 2048, 8, 2048, 1, 3, 256, ms.bfloat16)
+    _run(1, 4, 128, 8, 64, 1, 3, 512, ms.bfloat16, "cann")
+    _run(1, 4, 128, 8, 64, 1, 0, 128, ms.bfloat16, "triton")
+    _run(1, 8, 128, 8, 32, 2, 3, 256, ms.bfloat16, "triton")
+    _run(1, 4, 128, 8, 64, 1, 3, 512, ms.bfloat16, "triton")
+    _run(1, 4, 2048, 8, 2048, 1, 3, 256, ms.bfloat16, "triton")

@@ -154,7 +154,6 @@ def run_timing():
 
 
 def run_profiling():
-    from sparse_flash_attention_triton import SparseFlashAttentionTriton
     from sparse_flash_attention_grad_triton import SparseFlashAttentionGradTriton
 
     total_steps = 10
@@ -165,9 +164,13 @@ def run_profiling():
     q, k, v, qr, kr, do, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
 
-    fwd = SparseFlashAttentionTriton(
-        scale_value=scale, sparse_mode=3, return_softmax_lse=True)
-    out, smax, ssum = fwd(q, k, v, si, query_rope=qr, key_rope=kr)
+    # Use CANN forward to generate stats (avoid triton forward autotune UB overflow)
+    out, smax, ssum = ops.sparse_flash_attention(
+        q, k, v, si, scale,
+        query_rope=qr, key_rope=kr,
+        layout_query="BSND", layout_kv="BSND",
+        sparse_block_size=1, sparse_mode=3,
+        attention_mode=2, return_softmax_lse=True)
 
     grad = SparseFlashAttentionGradTriton(scale_value=scale, sparse_mode=3)
 
@@ -245,7 +248,6 @@ def run_profiling_cann():
 
 
 def run_kernel_only():
-    from sparse_flash_attention_triton import SparseFlashAttentionTriton
     from sparse_flash_attention_grad_triton import SparseFlashAttentionGradTriton
 
     B, S1, S2, N1, sparse_count = PROF_SHAPE
@@ -253,9 +255,13 @@ def run_kernel_only():
     q, k, v, qr, kr, do, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
 
-    fwd = SparseFlashAttentionTriton(
-        scale_value=scale, sparse_mode=3, return_softmax_lse=True)
-    out, smax, ssum = fwd(q, k, v, si, query_rope=qr, key_rope=kr)
+    # Use CANN forward to generate stats (avoid triton forward autotune UB overflow)
+    out, smax, ssum = ops.sparse_flash_attention(
+        q, k, v, si, scale,
+        query_rope=qr, key_rope=kr,
+        layout_query="BSND", layout_kv="BSND",
+        sparse_block_size=1, sparse_mode=3,
+        attention_mode=2, return_softmax_lse=True)
 
     grad = SparseFlashAttentionGradTriton(scale_value=scale, sparse_mode=3)
 

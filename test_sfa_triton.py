@@ -86,13 +86,39 @@ def _make_sparse_indices(B, S1, S2, sparse_count, sparse_block_size, sparse_mode
 
 
 def _allclose(a, b, dtype=ms.float16):
-    # bf16 (8-bit mantissa) needs looser tol than fp16 (10-bit); both accumulate
-    # over topK in fp32 but round probs/out to the in/out dtype before bmm2.
-    rtol = atol = 4e-2 if dtype == ms.bfloat16 else 2e-2
-    a = np.asarray(a, np.float32)
-    b = np.asarray(b, np.float32)
+    if dtype == ms.bfloat16:
+        rtol, atol = 7.8125e-3, 1e-3
+    else:
+        rtol, atol = 5e-3, 2.5e-4
+    max_diff_hd = 10
+    pct_thd = 99.5
+
+    a = np.asarray(a, np.float32).flatten()
+    b = np.asarray(b, np.float32).flatten()
     assert a.shape == b.shape, f"Shape mismatch: {a.shape} vs {b.shape}"
-    return np.allclose(a, b, rtol=rtol, atol=atol)
+
+    close = np.isclose(a, b, rtol=rtol, atol=atol, equal_nan=True)
+    fail_mask = ~close
+    if fail_mask.any():
+        fa, fb = a[fail_mask], b[fail_mask]
+        diff = np.abs(fa - fb)
+        rtol_only = np.abs(fb) * rtol
+        print(f"[diag] failed {fail_mask.sum()}/{fail_mask.size}  "
+              f"atol={atol} rtol={rtol}")
+        print(f"[diag]   |diff|  min={diff.min():.6e} max={diff.max():.6e}")
+        print(f"[diag]   rtol*|b| min={rtol_only.min():.6e} max={rtol_only.max():.6e}")
+        print(f"[diag]   atol-dominated (|b|<{atol/rtol:.4f}): "
+              f"{(np.abs(fb) < atol/rtol).sum()}")
+    pass_pct = close.sum() / close.size * 100.0
+    if pass_pct < pct_thd:
+        return False
+
+    diff_abs = np.abs(a - b)
+    denom = np.maximum(np.abs(a), np.abs(b)) + 1e-10
+    rel_err = diff_abs / denom
+    if np.any(rel_err[~close] >= max_diff_hd):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -148,9 +174,9 @@ def test_golden(B, S1, S2, N1, sparse_count, sparse_block_size, sparse_mode, D, 
     (2, 8, 256, 32, 128, 3),
     # (1, 8, 128, 16, 64, 0),
     (1, 4, 2048, 16, 2048, 3),   # two-pass path vs CANN
-    # (1, 4, 2048, 16, 2048, 0),   # two-pass path, full mode vs CANN
+    (1, 4, 2048, 16, 2048, 0),   # two-pass path, full mode vs CANN
 ])
-@pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16])  # bf16 = mindformers compute_dtype
+@pytest.mark.parametrize("dtype", [ms.bfloat16])  # bf16 = mindformers compute_dtype; fp16 covered by test_basic
 def test_accuracy(B, S1, S2, N1, sparse_count, sparse_mode, dtype):
     """Compare triton SFA with ops.sparse_flash_attention (BSND, token-wise)."""
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
