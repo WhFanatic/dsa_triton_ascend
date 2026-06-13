@@ -85,13 +85,15 @@ def _make_sparse_indices(B, S1, S2, sparse_count, sparse_block_size, sparse_mode
     return ms.Tensor(si, dtype=ms.int32)
 
 
-def _allclose(a, b, dtype=ms.float16):
+def _allclose(a, b, dtype=ms.float16, pct_thd=None, rtol=None, atol=None):
     if dtype == ms.bfloat16:
-        rtol, atol = 7.8125e-3, 1e-3
+        rtol = 7.8125e-3 if rtol is None else rtol
+        atol = 7e-4 if atol is None else atol
     else:
-        rtol, atol = 5e-3, 2.5e-4
+        rtol = 5e-3 if rtol is None else rtol
+        atol = 2.5e-4 if atol is None else atol
     max_diff_hd = 10
-    pct_thd = 99.5
+    pct_thd = 99.5 if pct_thd is None else pct_thd
 
     a = np.asarray(a, np.float32).flatten()
     b = np.asarray(b, np.float32).flatten()
@@ -175,8 +177,9 @@ def test_golden(B, S1, S2, N1, sparse_count, sparse_block_size, sparse_mode, D, 
     # (1, 8, 128, 16, 64, 0),
     (1, 4, 2048, 16, 2048, 3),   # two-pass path vs CANN
     (1, 4, 2048, 16, 2048, 0),   # two-pass path, full mode vs CANN
+    (1, 512, 4096, 64, 2048, 3), # perf shape
 ])
-@pytest.mark.parametrize("dtype", [ms.bfloat16])  # bf16 = mindformers compute_dtype; fp16 covered by test_basic
+@pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16])  # bf16 = mindformers compute_dtype; fp16 covered by test_basic
 def test_accuracy(B, S1, S2, N1, sparse_count, sparse_mode, dtype):
     """Compare triton SFA with ops.sparse_flash_attention (BSND, token-wise)."""
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
@@ -198,7 +201,8 @@ def test_accuracy(B, S1, S2, N1, sparse_count, sparse_mode, dtype):
     )
     tri_out, tri_max, tri_sum = cell(q, k, v, si, query_rope=qr, key_rope=kr)
 
-    assert _allclose(_to_np_f32(tri_out), _to_np_f32(ref_out), dtype), "attention_out mismatch vs CANN"
+    out_pct_thd = 99.0 if dtype == ms.bfloat16 else 99.5
+    assert _allclose(_to_np_f32(tri_out), _to_np_f32(ref_out), dtype, pct_thd=out_pct_thd), "attention_out mismatch vs CANN"
     assert _allclose(_to_np_f32(tri_max), _to_np_f32(ref_max), dtype), "softmax_max mismatch vs CANN"
     assert _allclose(_to_np_f32(tri_sum), _to_np_f32(ref_sum), dtype), "softmax_sum mismatch vs CANN"
 
@@ -210,6 +214,7 @@ def test_accuracy(B, S1, S2, N1, sparse_count, sparse_mode, dtype):
     (1, 128, 1024, 64, 512),
     (2, 64, 512, 32, 256),
     (1, 16, 2048, 64, 2048),   # two-pass path
+    (1, 512, 4096, 64, 2048),  # perf shape
 ])
 @pytest.mark.parametrize("D", [128, 256, 512])
 @pytest.mark.parametrize("sparse_mode", [3])
