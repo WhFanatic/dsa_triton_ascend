@@ -77,54 +77,11 @@ import triton.backends.ascend.runtime
 import mindspore as ms
 from mindspore import ops
 
-def _default_actual_seq_lens(actual_seq_lens, batch_size, seq_len):
-    return ms.ops.fill(ms.int32, (batch_size,), seq_len) if actual_seq_lens is None else \
-           ms.Tensor(list(actual_seq_lens), dtype=ms.int32) if isinstance(actual_seq_lens, (list, tuple)) else \
-           actual_seq_lens
-
-
-def _tnd_cumsum_to_per_batch(cumsum):
-    return cumsum - ops.pad(cumsum[:-1], (1, 0))
-
-
-def _tnd_to_bsnd(tensor, act_seq_per_batch):
-    B = act_seq_per_batch.shape[0]
-    lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
-    max_seq = max(lengths) if lengths else 0
-    out = ms.ops.zeros((B, max_seq, *tensor.shape[1:]), dtype=tensor.dtype)
-    start = 0
-    for b_idx in range(B):
-        length = lengths[b_idx]
-        if length > 0:
-            out[b_idx, :length] = tensor[start:start + length]
-            start += length
-    return out
-
-
-def _bsnd_to_tnd(tensor, act_seq_per_batch):
-    B = act_seq_per_batch.shape[0]
-    lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
-    total_t = sum(lengths)
-    out = ms.ops.zeros((total_t, *tensor.shape[2:]), dtype=tensor.dtype)
-    start = 0
-    for b_idx in range(B):
-        length = lengths[b_idx]
-        if length > 0:
-            out[start:start + length] = tensor[b_idx, :length]
-            start += length
-    return out
-
-
-def _expand_block_indices(sparse_indices, sparse_block_size):
-    if sparse_block_size == 1:
-        return sparse_indices
-    bs = sparse_block_size
-    base = sparse_indices.astype(ms.int32)
-    *lead, topK = base.shape
-    base = base.reshape(*lead, topK, 1)
-    offs = ms.ops.arange(0, bs, dtype=ms.int32).reshape(*([1] * len(lead)), 1, bs)
-    tokens = ms.ops.where(base == -1, ms.Tensor(-1, ms.int32), base * bs + offs)
-    return tokens.reshape(*lead, topK * bs)
+# host-side layout helpers shared with the forward (same normalization rules)
+from sparse_flash_attention_triton import (
+    _default_actual_seq_lens, _tnd_cumsum_to_per_batch,
+    _tnd_to_bsnd, _bsnd_to_tnd, _expand_block_indices,
+)
 
 INT64_MAX = 9223372036854775807
 
@@ -182,11 +139,178 @@ def _patch_triton_ascend_mindspore_dtype_bytes():
 
 _patch_triton_ascend_mindspore_dtype_bytes()
 
+def _prune_configs(configs, named_args, **kwargs):
+    """autotune config 过滤 (UB 上限 + grid pow2 + grid 总数上限)。
 
-def _select_block_config(D):
-    return {"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128}
+    SFA backward kernel: 无 BLOCK_DV 维度，D 和 D_ROPE 通过 BLOCK_D 分块。
+    UB 占用项：
+      - q_nope/q_rope/do_tile/o_tile: 4 × BLOCK_G × max(D, D_ROPE) × 2 (fp16/bf16)
+      - k_full/kr_full: 2 × BLOCK_K × max(D, D_ROPE) × 2
+      - scores/P/dS: 3 × BLOCK_G × BLOCK_K × 4 (fp32)
+      - acc_dq/acc_dqr: 2 × BLOCK_G × max(D, D_ROPE) × 4 (fp32)
+      - q_sub/do_sub (内层 D 循环): 2 × BLOCK_G × BLOCK_D × 2
+      - dk_contrib/dv_contrib (内层 D 循环): 2 × BLOCK_K × BLOCK_D × 4
+      - qr_sub/dkr_contrib (D 循环结束后): BLOCK_G × D_ROPE × 2 + BLOCK_K × D_ROPE × 4
+      - 转置缓冲: BLOCK_K × D_MAX × 2 (仅 k_full)
+    """
+    _UB_LIMIT_BYTES = 192 * 1024
+    _GRID_LIMIT = 131072
+
+    def _get(name):
+        if name in named_args:
+            return named_args[name]
+        return kwargs.get(name, None)
+
+    N1 = _get("N1")
+    BS1 = _get("B_S1")
+    D = _get("D")
+    D_ROPE = _get("D_ROPE")
+    # 取 D 和 D_ROPE 的最大值用于统一估算
+    D_MAX = max(D, D_ROPE) if None not in (D, D_ROPE) else (D or D_ROPE or 512)
+
+    def _estimate_ub_bytes(block_g, block_k, block_d):
+        if None in (block_g, block_k, block_d):
+            return 0
+
+        # 按 kernel 实际执行阶段分阶段估算峰值 UB；不同阶段使用的缓冲不叠加。
+        # Phase 1: 加载 resident tiles + 计算 scores/P/dS/acc_dq/acc_dqr（D-loop 之前）。
+        # Phase 2: D-tile 循环内部（q_sub/do_sub/dk_contrib/dv_contrib 与 P/dS 转置缓冲共存）。
+        # Phase 3: D-loop 结束后 scatter dkr（qr_sub/dkr_contrib）。
+
+        # Phase 1
+        q_nope = block_g * D_MAX * 2          # fp16/bf16
+        q_rope = block_g * D_ROPE * 2 if D_ROPE else 0
+        do_tile = block_g * D_MAX * 2
+        o_tile = block_g * D_MAX * 2
+        k_full = block_k * D_MAX * 2          # gather 结果
+        kr_full = block_k * D_ROPE * 2 if D_ROPE else 0
+
+        scores = block_g * block_k * 4        # fp32
+        P = block_g * block_k * 4
+        dS = block_g * block_k * 4
+        dS_bf16 = block_g * block_k * 2       # cast before dot
+
+        acc_dq = block_g * D_MAX * 4          # fp32 accumulator
+        acc_dqr = block_g * D_ROPE * 4 if D_ROPE else 0
+
+        trans_k = block_k * D_MAX * 2         # tl.trans(k_full)
+
+        phase1 = (
+            q_nope + q_rope + do_tile + o_tile + k_full + kr_full
+            + scores + P + dS + dS_bf16
+            + acc_dq + acc_dqr + trans_k
+        )
+
+        # Phase 2: P/dS/dS_bf16 仍存活，并生成 P_bf16/P_t_cast/dS_t_cast
+        P_bf16 = block_g * block_k * 2
+        P_t_cast = block_g * block_k * 2
+        dS_t_cast = block_g * block_k * 2
+
+        q_sub = block_g * block_d * 2
+        do_sub = block_g * block_d * 2
+        dk_contrib = block_k * block_d * 4    # fp32
+        dv_contrib = block_k * block_d * 4
+
+        phase2 = (
+            scores + P + dS + dS_bf16 + P_bf16 + P_t_cast + dS_t_cast
+            + acc_dq + acc_dqr
+            + q_sub + do_sub + dk_contrib + dv_contrib
+        )
+
+        # Phase 3: dkr scatter，qr_sub 复用 q_rope 数据但 worst-case 重新 load
+        qr_sub = block_g * D_ROPE * 2 if D_ROPE else 0
+        dkr_contrib = block_k * D_ROPE * 4 if D_ROPE else 0
+
+        phase3 = (
+            scores + P + dS + dS_bf16 + P_bf16 + P_t_cast + dS_t_cast
+            + acc_dq + acc_dqr
+            + qr_sub + dkr_contrib
+        )
+
+        total = max(phase1, phase2, phase3)
+
+        # 10% 余量给编译器临时缓冲；分阶段估算本身已比全加保守
+        return int(total * 1.1)
+
+    topK = _get("topK")
+
+    kept = []
+    for c in configs:
+        bg = c.kwargs.get("BLOCK_G")
+        bk = c.kwargs.get("BLOCK_K")
+        bd = c.kwargs.get("BLOCK_D")
+
+        # BLOCK_D > D 浪费：内层 D-loop 只有 1 个 tile，多分配的 BLOCK_D 不会被使用，
+        # 但 q_sub/do_sub/dk_contrib/dv_contrib 仍按 BLOCK_D 分配 UB 与 dot 算力。
+        if D and bd > D:
+            continue
+
+        # BLOCK_K > pow2(topK) 没意义：多出的 lane 全是 tok==-1 mask 空转，
+        # 不会带来更多并行度，只浪费 UB 和 dot 算力。
+        if topK and bk > _next_pow2(topK):
+            continue
+
+        if _estimate_ub_bytes(bg, bk, bd) > _UB_LIMIT_BYTES:
+            continue
+
+        # Grid 限制：不基于 BLOCK_G > N1 剪枝（kernel 内部有 g_valid 掩码处理）
+        if None not in (BS1, N1) and bg:
+            grid0 = _next_pow2(BS1)
+            grid1 = _next_pow2((N1 + bg - 1) // bg)
+            if grid0 * grid1 > _GRID_LIMIT:
+                continue
+        kept.append(c)
+
+    if not kept:
+        print('Warning: all autotune params pruned')
+        kept = [min(configs, key=lambda c: _estimate_ub_bytes(
+            c.kwargs.get("BLOCK_G"), c.kwargs.get("BLOCK_K"),
+            c.kwargs.get("BLOCK_D")))]
+    return kept
+
+def _grad_configs():
+    # base 已去重；mb/uf 锁到 (True, True) — 这两个旋钮的最优值在已落地的 autotune
+    # 历史里高度一致 (multibuffer=True 几乎总赢，unit_flag=True 同步原语更省)，全展开
+    # 会让 autotune 多跑 4 倍但常常选回同一组合。需要重新 sweep 时改这一行即可。
+    base = [
+        {"BLOCK_G": 8,  "BLOCK_K": 16,  "BLOCK_D": 128},
+        {"BLOCK_G": 8,  "BLOCK_K": 16,  "BLOCK_D": 256},
+        {"BLOCK_G": 8,  "BLOCK_K": 16,  "BLOCK_D": 512},
+        {"BLOCK_G": 16, "BLOCK_K": 16,  "BLOCK_D": 128},
+        {"BLOCK_G": 16, "BLOCK_K": 16,  "BLOCK_D": 256},
+        {"BLOCK_G": 16, "BLOCK_K": 16,  "BLOCK_D": 512},
+        {"BLOCK_G": 4,  "BLOCK_K": 16,  "BLOCK_D": 128},
+        {"BLOCK_G": 4,  "BLOCK_K": 16,  "BLOCK_D": 256},
+        {"BLOCK_G": 4,  "BLOCK_K": 16,  "BLOCK_D": 512},
+        {"BLOCK_G": 16, "BLOCK_K": 32,  "BLOCK_D": 128},
+        {"BLOCK_G": 16, "BLOCK_K": 32,  "BLOCK_D": 256},
+        {"BLOCK_G": 16, "BLOCK_K": 64,  "BLOCK_D": 128},
+        {"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128},
+        {"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 128},
+        {"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 512},
+        {"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 128},
+        {"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 256},
+        {"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 512},
+        {"BLOCK_G": 32, "BLOCK_K": 256, "BLOCK_D": 128},
+        {"BLOCK_G": 32, "BLOCK_K": 512, "BLOCK_D": 256},
+        {"BLOCK_G": 8,  "BLOCK_K": 32,  "BLOCK_D": 256},
+        {"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 256},
+        {"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256},
+        {"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 512},
+        {"BLOCK_G": 8,  "BLOCK_K": 512, "BLOCK_D": 256},
+        {"BLOCK_G": 8,  "BLOCK_K": 512, "BLOCK_D": 512},
+        {"BLOCK_G": 4,  "BLOCK_K": 256, "BLOCK_D": 128},
+        {"BLOCK_G": 4,  "BLOCK_K": 512, "BLOCK_D": 256},
+    ]
+    return [triton.Config({**c, "multibuffer": True, "unit_flag": True}) for c in base]
 
 
+@triton.autotune(
+    configs=_grad_configs(),
+    key=["B_S1", "N1", "D", "D_ROPE"],
+    reset_to_zero=["dk_ptr", "dkr_ptr", "dv_ptr"],
+    prune_configs_by={"early_config_prune": _prune_configs},
+)
 @triton.jit
 def _sfa_grad_kernel(
     q_ptr, qr_ptr,                       # query[B,S1,N1,D], query_rope[B,S1,N1,Dr]
@@ -263,7 +387,6 @@ def _sfa_grad_kernel(
 
     sm_max = tl.load(sm_max_ptr + sm_base + g_offs, mask=g_valid, other=0.0)
     sm_sum = tl.load(sm_sum_ptr + sm_base + g_offs, mask=g_valid, other=1.0)
-    sm_sum = tl.where(sm_sum > 0.0, sm_sum, 1.0)
 
     # delta[g] = rowsum(dO * O)  (== sum_p P·dPv)
     delta = tl.sum(do_tile.to(tl.float32) * o_tile.to(tl.float32), axis=1)
@@ -276,13 +399,12 @@ def _sfa_grad_kernel(
         blk_in_count = blk_offs < topK
         tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
         tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-        tok_clamped = tl.where(tok_valid, tok, 0)
 
         k_full = tl.load(
-            k_ptr + k_base + tok_clamped[:, None] * D + d_offs_full[None, :],
+            k_ptr + k_base + tok[:, None] * D + d_offs_full[None, :],
             mask=tok_valid[:, None], other=0.0)
         kr_full = tl.load(
-            kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + dr_offs_full[None, :],
+            kr_ptr + kr_base + tok[:, None] * D_ROPE + dr_offs_full[None, :],
             mask=tok_valid[:, None], other=0.0)
 
         # scores[g,k] = (q_nope·k_nope + q_rope·k_rope)·scale
@@ -290,22 +412,24 @@ def _sfa_grad_kernel(
         scores += tl.dot(q_rope, tl.trans(kr_full)).to(tl.float32)
         scores = scores * scale_value
 
-        # P from saved stats; masked tokens -> 0
+        # P from saved stats; invalid tokens naturally become 0 via -inf scores
+        scores = tl.where(tok_valid[None, :], scores, float('-inf'))
         P = tl.exp(scores - sm_max[:, None]) / sm_sum[:, None]
-        P = tl.where(tok_valid[None, :], P, 0.0)
 
         # dPv[g,k] = dO·v, v = k_nope (MLA-absorb)
         dPv = tl.dot(do_tile, tl.trans(k_full)).to(tl.float32)
         dS = P * (dPv - delta[:, None]) * scale_value
-        dS = tl.where(tok_valid[None, :], dS, 0.0)
+        dS_bf16 = dS.to(k_full.dtype)
 
         # dq/dqr accumulate (owned, no atomics)
-        acc_dq += tl.dot(dS.to(k_full.dtype), k_full).to(tl.float32)
-        acc_dqr += tl.dot(dS.to(kr_full.dtype), kr_full).to(tl.float32)
+        acc_dq += tl.dot(dS_bf16, k_full).to(tl.float32)
+        acc_dqr += tl.dot(dS_bf16, kr_full).to(tl.float32)
 
         # scatter dk/dv over D-tiles
-        dS_t = tl.trans(dS)
-        P_t = tl.trans(P)
+        # pre-cast transposed tiles once per k-block to avoid repeated conversions
+        P_bf16 = P.to(k_full.dtype)
+        P_t_cast = tl.trans(P_bf16)
+        dS_t_cast = tl.trans(dS_bf16)
         for d_start in range(0, D, BLOCK_D):
             d_offs = d_start + tl.arange(0, BLOCK_D)
             d_valid = d_offs < D
@@ -315,9 +439,9 @@ def _sfa_grad_kernel(
             do_sub = tl.load(
                 do_ptr + o_base + g_offs[:, None] * D + d_offs[None, :],
                 mask=g_valid[:, None] & d_valid[None, :], other=0.0)
-            dk_contrib = tl.dot(dS_t.to(q_sub.dtype), q_sub).to(tl.float32)
-            dv_contrib = tl.dot(P_t.to(do_sub.dtype), do_sub).to(tl.float32)
-            dk_offs = v_base + tok_clamped[:, None] * D + d_offs[None, :]
+            dk_contrib = tl.dot(dS_t_cast, q_sub).to(tl.float32)
+            dv_contrib = tl.dot(P_t_cast, do_sub).to(tl.float32)
+            dk_offs = v_base + tok[:, None] * D + d_offs[None, :]
             tl.atomic_add(dk_ptr + dk_offs, dk_contrib,
                           mask=tok_valid[:, None] & d_valid[None, :])
             tl.atomic_add(dv_ptr + dk_offs, dv_contrib,
@@ -327,8 +451,8 @@ def _sfa_grad_kernel(
         qr_sub = tl.load(
             qr_ptr + qr_base + g_offs[:, None] * D_ROPE + dr_offs_full[None, :],
             mask=g_valid[:, None], other=0.0)
-        dkr_contrib = tl.dot(dS_t.to(qr_sub.dtype), qr_sub).to(tl.float32)
-        dkr_offs = kr_base + tok_clamped[:, None] * D_ROPE + dr_offs_full[None, :]
+        dkr_contrib = tl.dot(dS_t_cast, qr_sub).to(tl.float32)
+        dkr_offs = kr_base + tok[:, None] * D_ROPE + dr_offs_full[None, :]
         tl.atomic_add(dkr_ptr + dkr_offs, dkr_contrib, mask=tok_valid[:, None])
 
     # store dq/dqr (per (b,s1,head-group), no contention)
@@ -362,6 +486,95 @@ def _infer_sfa_grad(
             ms.mint.empty_like(dk_buf), ms.mint.empty_like(dkr_buf),
             ms.mint.empty_like(dv_buf))
 
+import os
+import pickle
+from datetime import datetime
+
+def _save_sfa_grad_inputs(
+    q_flat, qr_flat, k_flat, kr_flat, v_flat,
+    sparse_flat,
+    do_flat, o_flat,
+    sm_max_flat, sm_sum_flat,
+    dq_buf, dqr_buf, dk_buf, dkr_buf, dv_buf,
+    act_q, act_k,
+    B_S1, S1, S2, N1, topK,
+    D, D_ROPE, scale_value, sparse_mode,
+    save_dir="/tmp/sfa_inputs"
+):
+    """保存 _sfa_grad_kernel 的所有输入到本地文件"""
+    os.makedirs(save_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    save_path = os.path.join(save_dir, f"sfa_grad_inputs_{timestamp}.pkl")
+    
+    import torch
+    import numpy as np
+    import mindspore as ms
+    
+    def ms_tensor_to_torch(ms_t):
+        """将 ms.Tensor 转为 torch.Tensor，兼容 bfloat16"""
+        if not hasattr(ms_t, "dtype"):
+            return ms_t  # 不是 ms.Tensor
+        
+        ms_dtype = ms_t.dtype
+        shape = ms_t.shape
+        
+        # bfloat16 特殊处理：通过 uint16 字节视图中转
+        if ms_dtype == ms.bfloat16:
+            uint16_tensor = ms_t.view(ms.uint16)
+            np_uint16 = uint16_tensor.asnumpy()
+            torch_uint16 = torch.from_numpy(np_uint16)
+            return torch_uint16.view(torch.bfloat16).reshape(shape)
+        
+        # 其他类型正常转换
+        try:
+            np_arr = ms_t.asnumpy()
+            dtype_map = {
+                ms.float16: torch.float16,
+                ms.float32: torch.float32,
+                ms.float64: torch.float64,
+                ms.int8: torch.int8,
+                ms.int16: torch.int16,
+                ms.int32: torch.int32,
+                ms.int64: torch.int64,
+                ms.uint8: torch.uint8,
+                ms.bool_: torch.bool,
+            }
+            torch_dtype = dtype_map.get(ms_dtype, torch.float32)
+            return torch.from_numpy(np_arr).to(torch_dtype)
+        except Exception as e:
+            # 兜底：float32 中转
+            np_f32 = ms_t.astype(ms.float32).asnumpy()
+            target_dtype = dtype_map.get(ms_dtype, torch.float32)
+            return torch.from_numpy(np_f32).to(target_dtype)
+
+    inputs = {
+        "q_flat":       ms_tensor_to_torch(q_flat),
+        "qr_flat":      ms_tensor_to_torch(qr_flat),
+        "k_flat":       ms_tensor_to_torch(k_flat),
+        "kr_flat":      ms_tensor_to_torch(kr_flat),
+        "v_flat":       ms_tensor_to_torch(v_flat),
+        "sparse_flat":  ms_tensor_to_torch(sparse_flat),
+        "do_flat":      ms_tensor_to_torch(do_flat),
+        "o_flat":       ms_tensor_to_torch(o_flat),
+        "sm_max_flat":  ms_tensor_to_torch(sm_max_flat),
+        "sm_sum_flat":  ms_tensor_to_torch(sm_sum_flat),
+        "dq_buf":       ms_tensor_to_torch(dq_buf),
+        "dqr_buf":      ms_tensor_to_torch(dqr_buf),
+        "dk_buf":       ms_tensor_to_torch(dk_buf),
+        "dkr_buf":      ms_tensor_to_torch(dkr_buf),
+        "dv_buf":       ms_tensor_to_torch(dv_buf),
+        "act_q":        ms_tensor_to_torch(act_q),
+        "act_k":        ms_tensor_to_torch(act_k),
+        "B_S1": B_S1, "S1": S1, "S2": S2, "N1": N1, "topK": topK,
+        "D": D, "D_ROPE": D_ROPE, "scale_value": scale_value,
+        "sparse_mode": sparse_mode,
+    }
+    
+    with open(save_path, "wb") as f:
+        pickle.dump(inputs, f)
+    
+    print(f"[SFA] Grad 输入已保存到: {save_path}")
+    return save_path
 
 @ms.ops._ms_pyfunc(infer_func=_infer_sfa_grad)
 def _sfa_grad_core(
@@ -381,12 +594,21 @@ def _sfa_grad_core(
     # Fixed block config + single launch (NO autotune): autotune re-runs the
     # kernel many times to benchmark, which double-counts the atomic_add scatter
     # into dk/dkr/dv. See _select_block_config.
-    cfg = _select_block_config(D)
-    block_g = cfg["BLOCK_G"]
-
-    # grid both dims pow2-padded (Ascend traps on non-pow2 grid); out-of-range
-    # programs idle via in_range masks.
-    grid = (_next_pow2(B_S1), _next_pow2(triton.cdiv(N1, block_g)))
+    grid = lambda meta: (
+        _next_pow2(B_S1), 
+        _next_pow2(triton.cdiv(N1, meta['BLOCK_G']))
+    )
+    # _save_sfa_grad_inputs(
+    #     q_flat, qr_flat, k_flat, kr_flat, v_flat,
+    #     sparse_flat,
+    #     do_flat, o_flat,
+    #     sm_max_flat, sm_sum_flat,
+    #     dq_buf, dqr_buf, dk_buf, dkr_buf, dv_buf,
+    #     act_q, act_k,
+    #     B_S1, S1, S2, N1, topK,
+    #     D, D_ROPE, scale_value, sparse_mode,
+    #     save_dir="/home/z00841464/SFA/data/sfa_grad_inputs"
+    # )
 
     _sfa_grad_kernel[grid](
         q_flat, qr_flat,
@@ -400,10 +622,7 @@ def _sfa_grad_core(
         B_S1, S1, S2, N1, topK,
         D, D_ROPE,
         scale_value,
-        sparse_mode=sparse_mode,
-        BLOCK_G=block_g,
-        BLOCK_K=cfg["BLOCK_K"],
-        BLOCK_D=cfg["BLOCK_D"],
+        sparse_mode=sparse_mode
     )
     return dq_buf, dqr_buf, dk_buf, dkr_buf, dv_buf
 

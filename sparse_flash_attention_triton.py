@@ -24,7 +24,6 @@ sparse_block_size 1 (token-wise) and 2^n in [1,128] (block-wise) supported.
 import triton
 import triton.language as tl
 import triton.backends.ascend.runtime
-
 import mindspore as ms
 from mindspore import ops
 
@@ -109,7 +108,7 @@ def _prune_configs(configs, named_args, **kwargs):
     N1 = _get("N1")
     BS1 = _get("B_S1")
     D = _get("D")
-    ub_multiplier = 3.0 if (D is not None and D <= 128) else 2.0
+    ub_multiplier = 4.0 if (D is not None and D <= 128) else 2.0
 
     def _estimate_ub_bytes(block_g, block_k, block_d, block_dv):
         if None in (block_g, block_k, block_d, block_dv):
@@ -193,13 +192,38 @@ def _sfa_scores_block(
 
 @triton.autotune(
     configs=[
-        # BDV capped at 64: chunked fp32_acc correction creates ~4 [BG,DV] fp32 temps;
-        # Ascend compiler allocates ~4x multiplier, so BDV=128 (8KB each) exceeds UB
-        # for D=128 shapes. BDV=64 (4KB each) keeps peak under ~152KB < 192KB limit.
+        # Original configs (BLOCK_G=16)
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # BLOCK_G=8: lower UB pressure, finer grid for small N1
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # BLOCK_G=32: higher per-core work density for large N1
+        triton.Config({"BLOCK_G": 32, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 32, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # BLOCK_G=64: one program covers all 64 heads, minimizing grid1
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # Wider BLOCK_K ranges
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 16, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # Larger BLOCK_DV: fewer dv-tile iterations, fewer fp32_acc GM round-trips
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        # Larger BLOCK_D=256: fewer nope d-tile iterations (2 vs 4 for D=512)
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        # Large BLOCK_DV + BLOCK_D combos: minimize both dv and d iterations
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 256}),
     ],
     key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
     prune_configs_by={"early_config_prune": _prune_configs},
@@ -212,7 +236,8 @@ def _sfa_kernel(
     out_ptr, sm_max_ptr, sm_sum_ptr,     # outputs
     fp32_acc_ptr,                        # fp32 accumulator [B,S1,N1,D] for chunked path
     act_q_ptr, act_k_ptr,
-    B_S1, S1, S2, N1, topK,
+    S2, N1, topK,
+    B_S1: tl.constexpr, S1: tl.constexpr,
     D: tl.constexpr, D_ROPE: tl.constexpr,
     scale_value,
     sparse_mode: tl.constexpr,
@@ -242,6 +267,19 @@ def _sfa_kernel(
     sparse_ptr holds token positions directly; block-wise (sparse_block_size>1)
     is pre-expanded on host into per-token indices, so this kernel is token-wise.
     """
+    # Alignment hints: tensors are contiguous and start at least 128-byte aligned,
+    # so vector loads/stores can use aligned addressing (vector_core_partition.md).
+    q_ptr = tl.multiple_of(q_ptr, 128)
+    qr_ptr = tl.multiple_of(qr_ptr, 128)
+    k_ptr = tl.multiple_of(k_ptr, 128)
+    kr_ptr = tl.multiple_of(kr_ptr, 128)
+    v_ptr = tl.multiple_of(v_ptr, 128)
+    out_ptr = tl.multiple_of(out_ptr, 128)
+    fp32_acc_ptr = tl.multiple_of(fp32_acc_ptr, 128)
+    sparse_ptr = tl.multiple_of(sparse_ptr, 128)
+    sm_max_ptr = tl.multiple_of(sm_max_ptr, 128)
+    sm_sum_ptr = tl.multiple_of(sm_sum_ptr, 128)
+
     pid_bs1 = tl.program_id(0)
     pid_g = tl.program_id(1)
 
@@ -297,7 +335,6 @@ def _sfa_kernel(
         l_i = tl.sum(p, axis=1)
         l_safe = tl.where(l_i > 0.0, l_i, 1.0)
 
-        probs = (p / l_safe[:, None]).to(v_ptr.dtype.element_ty)
         out_base = (b * S1 + s1) * N1 * D
         for dv_start in range(0, D, BLOCK_DV):
             dv_offs = dv_start + tl.arange(0, BLOCK_DV)
@@ -305,7 +342,8 @@ def _sfa_kernel(
             v_tile = tl.load(
                 v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
                 mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
-            out_tile = tl.dot(probs, v_tile)
+            p_norm = p / l_safe[:, None]
+            out_tile = tl.dot(p_norm.to(v_tile.dtype), v_tile)
             tl.store(
                 out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
                 out_tile.to(out_ptr.dtype.element_ty),
@@ -319,23 +357,49 @@ def _sfa_kernel(
     else:
         # ---- chunked online-softmax: one pass over KV chunks, per-chunk
         # correction of fp32 global accumulator. Eliminates two-pass score
-        # recompute, reduces dots ~69% (928 -> 288 for the profiled shape). ----
+        # recompute, reduces dots ~69% (928 -> 288 for the profiled shape).
+        # Score computation inlined (was _sfa_scores_block) so the compiler
+        # can see Q/QR loads are loop-invariant across blk_start and
+        # potentially reuse/cache them (loop-invariant-hoisting.md). ----
         m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
         l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
         fp32_base = (b * S1 + s1) * N1 * D
 
-        for blk_start in range(0, topK, BLOCK_K):
+        for blk_start in range(0, topK - BLOCK_K, BLOCK_K):
             blk_offs = blk_start + tl.arange(0, BLOCK_K)
             blk_in_count = blk_offs < topK
             tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
             tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
             tok_clamped = tl.where(tok_valid, tok, 0)
 
-            scores = _sfa_scores_block(
-                q_ptr, q_base, qr_ptr, qr_base,
-                k_ptr, k_base, kr_ptr, kr_base,
-                tok_clamped, tok_valid, g_offs, g_valid,
-                scale_value, D, D_ROPE, BLOCK_G, BLOCK_K, BLOCK_D)
+            # Inline score computation (inlined from _sfa_scores_block) so the
+            # compiler sees the full loop structure and can detect that Q/QR
+            # loads are loop-invariant across blk_start iterations.
+            # Load order: Q before K (Q has no dep on tok_clamped, can overlap
+            # with prev iter's fp32_acc store per load-order.md).
+            scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
+            for d_start in range(0, D, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < D
+                q_tile = tl.load(
+                    q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                    mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+                k_tile = tl.load(
+                    k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
+                    mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+                scores += tl.dot(q_tile, tl.trans(k_tile))
+            for d_start in range(0, D_ROPE, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < D_ROPE
+                qr_tile = tl.load(
+                    qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                    mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+                kr_tile = tl.load(
+                    kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + d_offs[None, :],
+                    mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+                scores += tl.dot(qr_tile, tl.trans(kr_tile))
+            scores = scores * scale_value
+            scores = tl.where(tok_valid[None, :], scores, float('-inf'))
 
             m_blk = tl.max(scores, axis=1)
             m_new = tl.maximum(m_i, m_blk)
@@ -345,20 +409,26 @@ def _sfa_kernel(
 
             m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
             p_raw = tl.exp(scores - m_blk_safe[:, None])
-            p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
+            # p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
             l_chunk = tl.sum(p_raw, axis=1)
             l_i = l_i * alpha_old + l_chunk * alpha_new
 
             for dv_start in range(0, D, BLOCK_DV):
                 dv_offs = dv_start + tl.arange(0, BLOCK_DV)
                 dv_valid = dv_offs < D
+                # Load fp32_acc before V so the independent load can overlap
+                # with the previous iteration's fp32_acc store (load-order.md).
+                acc_dv = tl.load(
+                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                    mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
+                # SIMD index_select for V: replaces a discrete tl.load whose
+                # offsets are random (tok_clamped). NPU intrinsic uses
+                # multi-DMA gather instead of element-wise scalar gather,
+                # cutting MTE2 latency on this hotspot.
                 v_tile = tl.load(
                     v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
                     mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
                 pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
-                acc_dv = tl.load(
-                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
-                    mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
                 acc_dv = acc_dv * alpha_old[:, None] + pv_tile
                 tl.store(
                     fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
@@ -367,26 +437,82 @@ def _sfa_kernel(
 
             m_i = m_new
 
+        # Last k-block: compute scores/softmax as above, but fuse the
+        # fp32_acc normalization (divide by l_safe) and write directly to
+        # out_ptr.  Eliminates the separate post-loop dv-tile pass that
+        # reads fp32_acc back from GM (discrete_memory_access.md: eliminate
+        # redundant GM round-trips).
+        last_blk_start = topK - BLOCK_K
+        blk_offs = last_blk_start + tl.arange(0, BLOCK_K)
+        blk_in_count = blk_offs < topK
+        tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
+        tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
+        tok_clamped = tl.where(tok_valid, tok, 0)
+
+        scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
+        for d_start in range(0, D, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D
+            q_tile = tl.load(
+                q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            k_tile = tl.load(
+                k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
+                mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(q_tile, tl.trans(k_tile))
+        for d_start in range(0, D_ROPE, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D_ROPE
+            qr_tile = tl.load(
+                qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            kr_tile = tl.load(
+                kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + d_offs[None, :],
+                mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(qr_tile, tl.trans(kr_tile))
+        scores = scores * scale_value
+        scores = tl.where(tok_valid[None, :], scores, float('-inf'))
+
+        m_blk = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_blk)
+        m_new_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+        alpha_old = tl.exp(m_i - m_new_safe)
+        alpha_new = tl.exp(m_blk - m_new_safe)
+
+        m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
+        p_raw = tl.exp(scores - m_blk_safe[:, None])
+        p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
+        l_chunk = tl.sum(p_raw, axis=1)
+        l_i = l_i * alpha_old + l_chunk * alpha_new
         l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+
         out_base = (b * S1 + s1) * N1 * D
         for dv_start in range(0, D, BLOCK_DV):
             dv_offs = dv_start + tl.arange(0, BLOCK_DV)
             dv_valid = dv_offs < D
+            # Load fp32_acc before V to overlap with previous store.
             acc_dv = tl.load(
                 fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
                 mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
-            out_tile = acc_dv / l_safe[:, None]
+            v_tile = tl.load(
+                v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
+                mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+            pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
+            # Fuse normalization: write directly to out_ptr instead of
+            # fp32_acc_ptr, saving a full dv-tile GM read+write pass.
+            out_tile = (acc_dv * alpha_old[:, None] + pv_tile) / l_safe[:, None]
             tl.store(
                 out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
                 out_tile.to(out_ptr.dtype.element_ty),
                 mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+        m_i = m_new
 
         if return_lse:
             sm_base = (b * S1 + s1) * N1
             store_mask = g_valid & row_active & (l_i > 0.0)
             tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
             tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
-
 
 # ---------------------------------------------------------------------------
 # host-side helpers
@@ -498,6 +624,90 @@ def _infer_sfa(
             ms.mint.empty_like(sm_max_buf),
             ms.mint.empty_like(sm_sum_buf))
 
+import os
+import pickle
+from datetime import datetime
+
+def _save_sfa_inputs(
+    q_flat, qr_flat, k_flat, kr_flat, v_flat,
+    sparse_flat, out_buf, sm_max_buf, sm_sum_buf,
+    fp32_acc_buf, act_q, act_k,
+    B_S1, S1, S2, N1, topK,
+    D, D_ROPE, scale_value, sparse_mode, return_lse,
+    single_block, block_topk,
+    save_dir="/tmp/sfa_inputs"
+):
+    """保存 _sfa_kernel 的所有输入到本地文件"""
+    os.makedirs(save_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    save_path = os.path.join(save_dir, f"sfa_inputs_{timestamp}.pkl")
+    
+    import torch
+    import numpy as np
+    import mindspore as ms
+    
+    def ms_tensor_to_torch(ms_t):
+        """将 ms.Tensor 转为 torch.Tensor，兼容 bfloat16"""
+        if not hasattr(ms_t, "dtype"):
+            return ms_t  # 不是 ms.Tensor
+        
+        ms_dtype = ms_t.dtype
+        shape = ms_t.shape
+        
+        # bfloat16 特殊处理：通过 uint16 字节视图中转
+        if ms_dtype == ms.bfloat16:
+            # 方法：先 view 为 uint16，再 asnumpy，再 torch.from_numpy，最后 view 回 bfloat16
+            uint16_tensor = ms_t.view(ms.uint16)
+            np_uint16 = uint16_tensor.asnumpy()
+            torch_uint16 = torch.from_numpy(np_uint16)
+            return torch_uint16.view(torch.bfloat16).reshape(shape)
+        
+        # 其他类型正常转换
+        try:
+            np_arr = ms_t.asnumpy()
+            dtype_map = {
+                ms.float16: torch.float16,
+                ms.float32: torch.float32,
+                ms.float64: torch.float64,
+                ms.int8: torch.int8,
+                ms.int16: torch.int16,
+                ms.int32: torch.int32,
+                ms.int64: torch.int64,
+                ms.uint8: torch.uint8,
+                ms.bool_: torch.bool,
+            }
+            torch_dtype = dtype_map.get(ms_dtype, torch.float32)
+            return torch.from_numpy(np_arr).to(torch_dtype)
+        except Exception as e:
+            # 兜底：float32 中转
+            np_f32 = ms_t.astype(ms.float32).asnumpy()
+            target_dtype = dtype_map.get(ms_dtype, torch.float32)
+            return torch.from_numpy(np_f32).to(target_dtype)
+
+    inputs = {
+        "q_flat":       ms_tensor_to_torch(q_flat),
+        "qr_flat":      ms_tensor_to_torch(qr_flat),
+        "k_flat":       ms_tensor_to_torch(k_flat),
+        "kr_flat":      ms_tensor_to_torch(kr_flat),
+        "v_flat":       ms_tensor_to_torch(v_flat),
+        "sparse_flat":  ms_tensor_to_torch(sparse_flat),
+        "out_buf":      ms_tensor_to_torch(out_buf),
+        "sm_max_buf":   ms_tensor_to_torch(sm_max_buf),
+        "sm_sum_buf":   ms_tensor_to_torch(sm_sum_buf),
+        "fp32_acc_buf": ms_tensor_to_torch(fp32_acc_buf),
+        "act_q":        ms_tensor_to_torch(act_q),
+        "act_k":        ms_tensor_to_torch(act_k),
+        "B_S1": B_S1, "S1": S1, "S2": S2, "N1": N1, "topK": topK,
+        "D": D, "D_ROPE": D_ROPE, "scale_value": scale_value,
+        "sparse_mode": sparse_mode, "return_lse": return_lse,
+        "single_block": single_block, "block_topk": block_topk,
+    }
+    
+    with open(save_path, "wb") as f:
+        pickle.dump(inputs, f)
+    
+    print(f"[SFA] 输入已保存到: {save_path}")
+    return save_path
 
 @ms.ops._ms_pyfunc(infer_func=_infer_sfa)
 def _sfa_core(
@@ -526,6 +736,16 @@ def _sfa_core(
     block_topk = _next_pow2(topK)
     single_block = block_topk <= 128
 
+    # _save_sfa_inputs(
+    #         q_flat, qr_flat, k_flat, kr_flat, v_flat,
+    #         sparse_flat, out_buf, sm_max_buf, sm_sum_buf,
+    #         fp32_acc_buf, act_q, act_k,
+    #         B_S1, S1, S2, N1, topK,
+    #         D, D_ROPE, scale_value, sparse_mode, return_lse,
+    #         single_block, block_topk,
+    #         save_dir="/home/z00841464/SFA/data/sfa_inputs"  # 可修改保存路径
+    #     )
+
     _sfa_kernel[grid_fn](
         q_flat, qr_flat,
         k_flat, kr_flat, v_flat,
@@ -533,9 +753,10 @@ def _sfa_core(
         out_buf, sm_max_buf, sm_sum_buf,
         fp32_acc_buf,
         act_q, act_k,
-        B_S1, S1, S2, N1, topK,
-        D, D_ROPE,
-        scale_value,
+        S2, N1, topK,
+        B_S1=B_S1, S1=S1,
+        D=D, D_ROPE=D_ROPE,
+        scale_value=scale_value,
         sparse_mode=sparse_mode,
         return_lse=return_lse,
         SINGLE_BLOCK=single_block,
