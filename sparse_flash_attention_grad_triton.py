@@ -77,11 +77,54 @@ import triton.backends.ascend.runtime
 import mindspore as ms
 from mindspore import ops
 
-# host-side layout helpers shared with the forward (same normalization rules)
-from sparse_flash_attention_triton import (
-    _default_actual_seq_lens, _tnd_cumsum_to_per_batch,
-    _tnd_to_bsnd, _bsnd_to_tnd, _expand_block_indices,
-)
+def _default_actual_seq_lens(actual_seq_lens, batch_size, seq_len):
+    return ms.ops.fill(ms.int32, (batch_size,), seq_len) if actual_seq_lens is None else \
+           ms.Tensor(list(actual_seq_lens), dtype=ms.int32) if isinstance(actual_seq_lens, (list, tuple)) else \
+           actual_seq_lens
+
+
+def _tnd_cumsum_to_per_batch(cumsum):
+    return cumsum - ops.pad(cumsum[:-1], (1, 0))
+
+
+def _tnd_to_bsnd(tensor, act_seq_per_batch):
+    B = act_seq_per_batch.shape[0]
+    lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
+    max_seq = max(lengths) if lengths else 0
+    out = ms.ops.zeros((B, max_seq, *tensor.shape[1:]), dtype=tensor.dtype)
+    start = 0
+    for b_idx in range(B):
+        length = lengths[b_idx]
+        if length > 0:
+            out[b_idx, :length] = tensor[start:start + length]
+            start += length
+    return out
+
+
+def _bsnd_to_tnd(tensor, act_seq_per_batch):
+    B = act_seq_per_batch.shape[0]
+    lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
+    total_t = sum(lengths)
+    out = ms.ops.zeros((total_t, *tensor.shape[2:]), dtype=tensor.dtype)
+    start = 0
+    for b_idx in range(B):
+        length = lengths[b_idx]
+        if length > 0:
+            out[start:start + length] = tensor[b_idx, :length]
+            start += length
+    return out
+
+
+def _expand_block_indices(sparse_indices, sparse_block_size):
+    if sparse_block_size == 1:
+        return sparse_indices
+    bs = sparse_block_size
+    base = sparse_indices.astype(ms.int32)
+    *lead, topK = base.shape
+    base = base.reshape(*lead, topK, 1)
+    offs = ms.ops.arange(0, bs, dtype=ms.int32).reshape(*([1] * len(lead)), 1, bs)
+    tokens = ms.ops.where(base == -1, ms.Tensor(-1, ms.int32), base * bs + offs)
+    return tokens.reshape(*lead, topK * bs)
 
 INT64_MAX = 9223372036854775807
 
