@@ -234,8 +234,6 @@ def _lightning_indexer_score_kernel(
 
             tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
 
-            # G 外 / D 内分块。k_tile 与 g 无关却每个 g-block 重 load 一遍 (G=64/BLOCK_G=16 时 4 次),
-            # K 带宽吃紧时可提到 g 循环外复用。
             for g_start in range(0, G, BLOCK_G):
                 g_rel   = g_start + tl.arange(0, BLOCK_G)
                 g_valid = g_rel < G
@@ -263,10 +261,7 @@ def _lightning_indexer_score_kernel(
 
                     acc += tl.dot(q_tile, tl.trans(k_tile))
 
-                # indexer 打分 = 各 head ReLU(Q·K) 按 W 加权求和; padding 的 g 行先清零。
-                acc = tl.maximum(acc, 0.0)
-                acc = tl.where(g_valid[:, None], acc, 0.0)
-                tile_scores += tl.sum(acc * w_g[:, None], axis=0)
+                tile_scores += tl.sum(tl.maximum(acc, 0.0) * w_g[:, None], axis=0)
 
             # 超出 causal / act_k 的不可见位置置 -inf, topk 时会被映射成 index -1。
             if sparse_mode == 3:
