@@ -24,6 +24,8 @@ sparse_block_size 1 (token-wise) and 2^n in [1,128] (block-wise) supported.
 import triton
 import triton.language as tl
 import triton.backends.ascend.runtime
+
+
 import mindspore as ms
 from mindspore import ops
 
@@ -91,11 +93,10 @@ _patch_triton_ascend_mindspore_dtype_bytes()
 def _prune_configs(configs, named_args, **kwargs):
     """autotune config 过滤 (UB 上限 + grid pow2 + grid 总数上限)。
 
-    Chunked kernel: p_raw[BLOCK_G,BLOCK_K] kept resident during DV loop;
-    fp32_acc is loaded into UB for correction step (acc_dv buffer, previously
-    unaccounted).  D-dependent multiplier: D<=128 uses 3.0 (UB overflow proven
-    at 2.0 for both fp16 and bf16); D>=256 uses 2.0 (no overflow observed,
-    fp16 D=512 baseline verified Config 4 at ~48ms).
+    Phased UB estimation: the chunked path has two non-overlapping phases
+    per chunk — (1) score: Q@K^T, (2) P@V + accumulation. Buffers from
+    phase 1 (q_tile, k_tile) are freed before phase 2 starts, so the peak
+    UB is max(phase1, phase2), not the sum.
     """
     _UB_LIMIT_BYTES = 180 * 1024
     _GRID_LIMIT = 131072
@@ -108,21 +109,35 @@ def _prune_configs(configs, named_args, **kwargs):
     N1 = _get("N1")
     BS1 = _get("B_S1")
     D = _get("D")
-    ub_multiplier = 4.0 if (D is not None and D <= 128) else 2.0
+    # Conservative multiplier for D<=128: the compiler may keep all tiles
+    # (nope + rope + scores) alive simultaneously across d-loops, and may
+    # retain intermediate dot products. D>=256 uses 1.0 (verified safe).
+    ub_multiplier = 2.5 if (D is not None and D <= 128) else 1.0
 
     def _estimate_ub_bytes(block_g, block_k, block_d, block_dv):
         if None in (block_g, block_k, block_d, block_dv):
             return 0
-        acc_pv = block_g * block_dv * 4
-        v_tile = block_k * block_dv * 2
+        # Phase 1 (score computation): the compiler may keep all tiles alive
+        # simultaneously across nope/rope d-loops (q, k, qr, kr, scores, m/l).
+        # Critical for D<=128 where BLOCK_D covers both D and D_ROPE=64 in one
+        # iteration, making all tiles peak-resident at the same time.
+        rope_d = min(block_d, _D_ROPE)
         q_tile = block_g * block_d * 2
         k_tile = block_k * block_d * 2
+        qr_tile = block_g * rope_d * 2
+        kr_tile = block_k * rope_d * 2
         s_tile = block_g * block_k * 4
-        p_tile = block_g * block_k * 2
-        trans = block_k * block_d * 2
         m_l = block_g * 2 * 4
-        acc_dv = block_g * block_dv * 4        # fp32_acc load in chunked correction
-        total = acc_pv + v_tile + q_tile + k_tile + s_tile + p_tile + trans + m_l + acc_dv
+        phase1 = q_tile + k_tile + qr_tile + kr_tile + s_tile + m_l
+
+        # Phase 2 (P@V + accumulation): p_raw + v_tile + pv_tile + acc_dv
+        p_tile = block_g * block_k * 4  # p_raw in fp32 (kept across dv-tiles)
+        v_tile = block_k * block_dv * 2
+        pv_tile = block_g * block_dv * 4
+        acc_dv = block_g * block_dv * 4
+        phase2 = p_tile + v_tile + pv_tile + acc_dv + m_l
+
+        total = max(phase1, phase2)
         return int(total * ub_multiplier)
 
     kept = []
@@ -133,6 +148,15 @@ def _prune_configs(configs, named_args, **kwargs):
         bdv = c.kwargs.get("BLOCK_DV")
 
         if _estimate_ub_bytes(bg, bk, bd, bdv) > _UB_LIMIT_BYTES:
+            continue
+        # index_select_simd has no mask; BLOCK_D/DV > D causes out-of-bounds MPU access.
+        if bd is not None and D is not None and bd > D:
+            continue
+        if bdv is not None and D is not None and bdv > D:
+            continue
+        # Hard limit: BLOCK_G > 16 causes UB overflow for D=128 regardless of
+        # multiplier (verified: BG=32/64 crash, BG=16/8 safe across all shapes).
+        if D is not None and D <= 128 and bg is not None and bg > 16:
             continue
         # NB: BLOCK_G may exceed N1; the kernel masks padded heads (g_valid),
         # so we do NOT prune on bg > N1 (would kill all configs for small N1).
@@ -156,8 +180,7 @@ def _sfa_scores_block(
     q_ptr, q_base, qr_ptr, qr_base,
     k_ptr, k_base, kr_ptr, kr_base,
     tok_clamped, tok_valid, g_offs, g_valid,
-    scale_value,
-    D: tl.constexpr, D_ROPE: tl.constexpr,
+    scale_value: tl.constexpr, D: tl.constexpr, D_ROPE: tl.constexpr,
     BLOCK_G: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """scores[BLOCK_G, BLOCK_K] = (q_nope·k_nope + q_rope·k_rope) * scale.
@@ -171,20 +194,24 @@ def _sfa_scores_block(
         d_valid = d_offs < D
         q_tile = tl.load(
             q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
-            mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            mask=g_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
         k_tile = tl.load(
             k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
-            mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+            mask=tok_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
         scores += tl.dot(q_tile, tl.trans(k_tile))
     for d_start in range(0, D_ROPE, BLOCK_D):
         d_offs = d_start + tl.arange(0, BLOCK_D)
         d_valid = d_offs < D_ROPE
         qr_tile = tl.load(
             qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
-            mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            mask=g_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
         kr_tile = tl.load(
             kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + d_offs[None, :],
-            mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+            mask=tok_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
         scores += tl.dot(qr_tile, tl.trans(kr_tile))
     scores = scores * scale_value
     return tl.where(tok_valid[None, :], scores, float('-inf'))
@@ -207,6 +234,12 @@ def _sfa_scores_block(
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # BLOCK_G=64 with larger BLOCK_K to halve chunked loop count (32 -> 16
+        # chunks at topK=2048). Larger BLOCK_K also makes the K_nope gather
+        # better-aligned with index_select_simd's preferred chunk size.
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # Wider BLOCK_K ranges
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 16, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
@@ -224,6 +257,45 @@ def _sfa_scores_block(
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 128}),
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        # BLOCK_DV=512 (full D=512 in one dv tile, no inner dv loop)
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 256, "BLOCK_DV": 512}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        # Previously pruned by sum-based UB estimator; now allowed by phased estimator.
+        # BK=512+BD=128: 1 nope d-tile, 4 chunks (vs 16 for BK=128)
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 512, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # BK=256+BD=256: 2 nope d-tiles, 8 chunks; high cube utilization
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 128}),
+        # BG=64 + BK=256 + BD=128: covers all 64 heads, larger tiles
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # BG=64 + BK=128 + BD=128 + BDV=128: full-head with wider dv tiles
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # BK=256 + BDV=128: fewer dv-tile iterations
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # More configs unlocked by phased UB estimator
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 32, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # More configs unlocked by ub_multiplier=1.1
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 4,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        # Extreme configs unlocked by ub_multiplier=1.0
+        triton.Config({"BLOCK_G": 32, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 128}),
+        # Large BLOCK_DV=256/512 configs: minimize dv-tile iterations
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 512}),
+        # BLOCK_D=512: single nope d-tile iteration for D=512, eliminating loop overhead
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 256}),
     ],
     key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
     prune_configs_by={"early_config_prune": _prune_configs},
@@ -336,13 +408,13 @@ def _sfa_kernel(
         l_safe = tl.where(l_i > 0.0, l_i, 1.0)
 
         out_base = (b * S1 + s1) * N1 * D
+        p_norm = p / l_safe[:, None]
         for dv_start in range(0, D, BLOCK_DV):
             dv_offs = dv_start + tl.arange(0, BLOCK_DV)
             dv_valid = dv_offs < D
             v_tile = tl.load(
                 v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
                 mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
-            p_norm = p / l_safe[:, None]
             out_tile = tl.dot(p_norm.to(v_tile.dtype), v_tile)
             tl.store(
                 out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
@@ -421,10 +493,6 @@ def _sfa_kernel(
                 acc_dv = tl.load(
                     fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
                     mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
-                # SIMD index_select for V: replaces a discrete tl.load whose
-                # offsets are random (tok_clamped). NPU intrinsic uses
-                # multi-DMA gather instead of element-wise scalar gather,
-                # cutting MTE2 latency on this hotspot.
                 v_tile = tl.load(
                     v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
                     mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
