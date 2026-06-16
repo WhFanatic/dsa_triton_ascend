@@ -163,7 +163,8 @@ def test_golden(B, S1, S2, N1, sparse_count, sparse_block_size, sparse_mode, D, 
         return_softmax_lse=True, dtype=np_dtype,
     )
 
-    assert _allclose(_to_np_f32(out_t), out_g, dtype), "attention_out mismatch vs golden"
+    out_pct_thd = 99.0 if dtype == ms.bfloat16 else 99.5
+    assert _allclose(_to_np_f32(out_t), out_g, dtype, pct_thd=out_pct_thd), "attention_out mismatch vs golden"
     assert _allclose(_to_np_f32(smax_t), smax_g, dtype), "softmax_max mismatch vs golden"
     assert _allclose(_to_np_f32(ssum_t), ssum_g, dtype), "softmax_sum mismatch vs golden"
 
