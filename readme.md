@@ -8,7 +8,9 @@
 - mindspore 2.9.0
 - triton-ascend 3.2.1
 - pytest-forked (全量测试需要 pytest --forked ...)
+- 
 https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly/triton-ascend/
+https://gitcode.com/Ascend/triton-ascend-kernels/tree/master/src/triton_ascend_kernels/attention
 ## 文件
 
 | 文件 | 说明 |
