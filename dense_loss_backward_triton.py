@@ -12,6 +12,12 @@ from mindspore import ops
 SUPPORTED_D = (128, 256, 512)
 SUPPORTED_NIDX1 = (32, 64, 128)
 INT64_MAX = 9223372036854775807
+MAX_TRITON_ASCEND_COREDIM = 65535
+
+
+def _bs1_chunk_for_core_dim(total_bs1, programs_per_bs1):
+    programs_per_bs1 = max(1, programs_per_bs1)
+    return max(1, min(total_bs1, MAX_TRITON_ASCEND_COREDIM // programs_per_bs1))
 
 
 def _check_in(name, value, supported):
@@ -188,11 +194,11 @@ def _dense_main_grad_kernel(
     d_query_index_ptr, d_weights_ptr,
     act_q_ptr, act_k_ptr,
     B, S1, S2, N1, N2, G, Nidx1, D, D_idx, D_rope,
-    scale_value,
+    scale_value, BS1_OFFSET,
     BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
     HAS_ROPE: tl.constexpr,
 ):
-    bs1_idx = tl.program_id(0)
+    bs1_idx = BS1_OFFSET + tl.program_id(0)
     g = tl.program_id(1)
     d_block = tl.program_id(2)
     b = bs1_idx // S1
@@ -329,14 +335,14 @@ def _dense_dkey_index_kernel(
     d_key_index_ptr,
     act_q_ptr, act_k_ptr,
     B, S1, S2, N1, N2, G, Nidx1, D, D_idx, D_rope,
-    scale_value,
+    scale_value, BS1_OFFSET, KD_OFFSET,
     NUM_D_BLOCKS: tl.constexpr,
     BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
     HAS_ROPE: tl.constexpr,
 ):
-    bs1_idx = tl.program_id(0)
+    bs1_idx = BS1_OFFSET + tl.program_id(0)
     g = tl.program_id(1)
-    kd_block = tl.program_id(2)
+    kd_block = KD_OFFSET + tl.program_id(2)
     k_block = kd_block // NUM_D_BLOCKS
     d_block = kd_block % NUM_D_BLOCKS
     b = bs1_idx // S1
@@ -509,30 +515,45 @@ def _dense_loss_backward_core(
         BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
     )
 
-    _dense_main_grad_kernel[(B * S1, Nidx1, triton.cdiv(D_idx, BLOCK_D))](
-        q_flat, k_flat, qr_flat, kr_flat,
-        qi_flat, ki_flat, w_flat,
-        sm_max_flat, sm_sum_flat,
-        max_index, sum_index,
-        d_query_index, d_weights,
-        actual_seq_q, actual_seq_k,
-        B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
-        scale_value,
-        BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
-    )
+    total_bs1 = B * S1
+    num_d_blocks = (D_idx + BLOCK_D - 1) // BLOCK_D
+    main_bs1_chunk = _bs1_chunk_for_core_dim(total_bs1, Nidx1 * num_d_blocks)
+    for bs1_start in range(0, total_bs1, main_bs1_chunk):
+        bs1_chunk = min(main_bs1_chunk, total_bs1 - bs1_start)
+        _dense_main_grad_kernel[(bs1_chunk, Nidx1, num_d_blocks)](
+            q_flat, k_flat, qr_flat, kr_flat,
+            qi_flat, ki_flat, w_flat,
+            sm_max_flat, sm_sum_flat,
+            max_index, sum_index,
+            d_query_index, d_weights,
+            actual_seq_q, actual_seq_k,
+            B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
+            scale_value, bs1_start,
+            BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
+        )
 
-    num_d_blocks = triton.cdiv(D_idx, BLOCK_D)
-    _dense_dkey_index_kernel[(B * S1, Nidx1, triton.cdiv(S2, BLOCK_K) * num_d_blocks)](
-        q_flat, k_flat, qr_flat, kr_flat,
-        qi_flat, ki_flat, w_flat,
-        sm_max_flat, sm_sum_flat,
-        max_index, sum_index,
-        d_key_index_acc,
-        actual_seq_q, actual_seq_k,
-        B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
-        scale_value, num_d_blocks,
-        BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
+    num_k_blocks = (S2 + BLOCK_K - 1) // BLOCK_K
+    total_kd_blocks = num_k_blocks * num_d_blocks
+    kd_chunk = min(
+        total_kd_blocks,
+        max(1, MAX_TRITON_ASCEND_COREDIM // max(1, Nidx1)),
     )
+    dkey_bs1_chunk = _bs1_chunk_for_core_dim(total_bs1, Nidx1 * kd_chunk)
+    for bs1_start in range(0, total_bs1, dkey_bs1_chunk):
+        bs1_chunk = min(dkey_bs1_chunk, total_bs1 - bs1_start)
+        for kd_start in range(0, total_kd_blocks, kd_chunk):
+            kd_block_chunk = min(kd_chunk, total_kd_blocks - kd_start)
+            _dense_dkey_index_kernel[(bs1_chunk, Nidx1, kd_block_chunk)](
+                q_flat, k_flat, qr_flat, kr_flat,
+                qi_flat, ki_flat, w_flat,
+                sm_max_flat, sm_sum_flat,
+                max_index, sum_index,
+                d_key_index_acc,
+                actual_seq_q, actual_seq_k,
+                B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
+                scale_value, bs1_start, kd_start, num_d_blocks,
+                BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
+            )
 
     return (
         d_query_index.reshape(query_index.shape),
@@ -613,30 +634,45 @@ def _dense_loss_backward_with_index_core(
         BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
     )
 
-    _dense_main_grad_kernel[(B * S1, Nidx1, triton.cdiv(D_idx, BLOCK_D))](
-        q_flat, k_flat, qr_flat, kr_flat,
-        qi_flat, ki_flat, w_flat,
-        sm_max_flat, sm_sum_flat,
-        max_index, sum_index,
-        d_query_index, d_weights,
-        actual_seq_q, actual_seq_k,
-        B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
-        scale_value,
-        BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
-    )
+    total_bs1 = B * S1
+    num_d_blocks = (D_idx + BLOCK_D - 1) // BLOCK_D
+    main_bs1_chunk = _bs1_chunk_for_core_dim(total_bs1, Nidx1 * num_d_blocks)
+    for bs1_start in range(0, total_bs1, main_bs1_chunk):
+        bs1_chunk = min(main_bs1_chunk, total_bs1 - bs1_start)
+        _dense_main_grad_kernel[(bs1_chunk, Nidx1, num_d_blocks)](
+            q_flat, k_flat, qr_flat, kr_flat,
+            qi_flat, ki_flat, w_flat,
+            sm_max_flat, sm_sum_flat,
+            max_index, sum_index,
+            d_query_index, d_weights,
+            actual_seq_q, actual_seq_k,
+            B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
+            scale_value, bs1_start,
+            BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
+        )
 
-    num_d_blocks = triton.cdiv(D_idx, BLOCK_D)
-    _dense_dkey_index_kernel[(B * S1, Nidx1, triton.cdiv(S2, BLOCK_K) * num_d_blocks)](
-        q_flat, k_flat, qr_flat, kr_flat,
-        qi_flat, ki_flat, w_flat,
-        sm_max_flat, sm_sum_flat,
-        max_index, sum_index,
-        d_key_index_acc,
-        actual_seq_q, actual_seq_k,
-        B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
-        scale_value, num_d_blocks,
-        BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
+    num_k_blocks = (S2 + BLOCK_K - 1) // BLOCK_K
+    total_kd_blocks = num_k_blocks * num_d_blocks
+    kd_chunk = min(
+        total_kd_blocks,
+        max(1, MAX_TRITON_ASCEND_COREDIM // max(1, Nidx1)),
     )
+    dkey_bs1_chunk = _bs1_chunk_for_core_dim(total_bs1, Nidx1 * kd_chunk)
+    for bs1_start in range(0, total_bs1, dkey_bs1_chunk):
+        bs1_chunk = min(dkey_bs1_chunk, total_bs1 - bs1_start)
+        for kd_start in range(0, total_kd_blocks, kd_chunk):
+            kd_block_chunk = min(kd_chunk, total_kd_blocks - kd_start)
+            _dense_dkey_index_kernel[(bs1_chunk, Nidx1, kd_block_chunk)](
+                q_flat, k_flat, qr_flat, kr_flat,
+                qi_flat, ki_flat, w_flat,
+                sm_max_flat, sm_sum_flat,
+                max_index, sum_index,
+                d_key_index_acc,
+                actual_seq_q, actual_seq_k,
+                B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
+                scale_value, bs1_start, kd_start, num_d_blocks,
+                BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
+            )
 
     return (
         d_query_index.reshape(query_index.shape),

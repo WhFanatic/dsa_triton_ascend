@@ -1,27 +1,40 @@
 import time
 import numpy as np
 import mindspore as ms
-from mindspore import ops, runtime
+from mindspore import runtime, ops
 from mindspore.profiler import ProfilerLevel, ProfilerActivity, AicoreMetrics
 
-D_NOPE = 512
-D_ROPE = 64
-D_IDX = 128
+from sparse_lightning_indexer_grad_kl_loss_triton import (
+    SparseLightningIndexerGradKLLossTriton,
+)
+from sli_grad_kl_loss_cann import SparseLightningIndexerGradKLLoss
 
 
-def _do_bench(fn, warmup=10, rep=100):
+DROPE = 64
+
+
+def _cann_supports_config(D, topK):
+    return D == 512 and topK % 1024 == 0
+
+
+def _do_bench(fn, warmup=10, rep=50):
+    """Simple benchmarking with manual timing (Ascend-compatible)."""
     for _ in range(warmup):
-        fn()
-    runtime.synchronize()
+        out = fn()
+        runtime.synchronize()
+        del out
+        runtime.empty_cache()
 
     times = []
     for _ in range(rep):
         runtime.synchronize()
         t0 = time.perf_counter()
-        fn()
+        out = fn()
         runtime.synchronize()
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)
+        del out
+        runtime.empty_cache()
 
     times.sort()
     n = len(times)
@@ -29,107 +42,135 @@ def _do_bench(fn, warmup=10, rep=100):
 
 
 def _make_sparse_indices(B, S1, S2, topK):
-    rng = np.random.RandomState(7)
-    si = np.full((B, S1, 1, topK), -1, dtype=np.int32)
-    for b in range(B):
-        for s1 in range(S1):
-            threshold = S2 - S1 + s1 + 1
-            if threshold <= 0:
-                continue
-            n = min(topK, threshold)
-            perm = rng.permutation(threshold)[:n]
-            si[b, s1, 0, :n] = np.sort(perm).astype(np.int32)
-    return ms.Tensor(si, dtype=ms.int32).to('Ascend')
+    si = np.zeros((B, S1, 1, topK), dtype=np.int32)
+    for s1 in range(S1):
+        visible = min(max(S2 - S1 + s1 + 1, 1), S2)
+        valid_k = min(topK, visible)
+        si[:, s1, 0, :valid_k] = np.arange(valid_k, dtype=np.int32)
+    return ms.Tensor(si, dtype=ms.int32).to("Ascend")
 
 
-def _make_inputs(B, S1, S2, N1, Nidx1, topK, dtype=ms.float16):
-    rng = np.random.RandomState(42)
-    N2, Nidx2 = 1, 1
-
-    def _t(shape, d=dtype):
-        return ms.Tensor(rng.randn(*shape).astype(np.float16), dtype=d).to('Ascend')
-
-    q = _t((B, S1, N1, D_NOPE))
-    k = _t((B, S2, N2, D_NOPE))
-    qr = _t((B, S1, N1, D_ROPE))
-    kr = _t((B, S2, N2, D_ROPE))
-    qi = _t((B, S1, Nidx1, D_IDX))
-    ki = _t((B, S2, Nidx2, D_IDX))
-    w = ms.Tensor(np.abs(rng.randn(B, S1, Nidx1)).astype(np.float16), dtype=dtype).to('Ascend')
+def _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=ms.float16):
+    q = ms.Tensor(np.random.randn(B, S1, N1, D).astype(np.float16), dtype=dtype).to("Ascend")
+    k = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float16), dtype=dtype).to("Ascend")
+    qr = ms.Tensor(np.random.randn(B, S1, N1, DROPE).astype(np.float16), dtype=dtype).to("Ascend")
+    kr = ms.Tensor(np.random.randn(B, S2, 1, DROPE).astype(np.float16), dtype=dtype).to("Ascend")
+    qi = ms.Tensor(np.random.randn(B, S1, Nidx1, D_idx).astype(np.float16), dtype=dtype).to("Ascend")
+    ki = ms.Tensor(np.random.randn(B, S2, 1, D_idx).astype(np.float16), dtype=dtype).to("Ascend")
+    w = ms.Tensor(np.abs(np.random.randn(B, S1, Nidx1)).astype(np.float16), dtype=dtype).to("Ascend")
     si = _make_sparse_indices(B, S1, S2, topK)
-    sm_max = ms.Tensor(np.abs(rng.randn(B, N2, S1, N1)).astype(np.float32), dtype=ms.float32).to('Ascend')
-    sm_sum = ms.Tensor(np.abs(rng.randn(B, N2, S1, N1)).astype(np.float32), dtype=ms.float32).to('Ascend')
-    return q, k, qr, kr, qi, ki, w, si, sm_max, sm_sum
+    softmax_max = ms.Tensor(
+        np.random.randn(B, 1, S1, N1).astype(np.float32), dtype=ms.float32
+    ).to("Ascend")
+    softmax_sum = ms.Tensor(
+        np.random.uniform(1.0, 32.0, (B, 1, S1, N1)).astype(np.float32), dtype=ms.float32
+    ).to("Ascend")
+    return q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum
+
+
+def _force_grad_outputs(outputs):
+    """Keep all returned gradients live for fair profiling.
+
+    The perf path does not inspect returned tensors. After loss accumulation was
+    changed from an in-kernel atomic side effect to loss_parts + ReduceSum, graph
+    optimization can otherwise remove the main backward kernel from task_time.
+    """
+    d_qi, d_ki, d_w, loss = outputs
+    token = ops.depend(loss, d_qi)
+    token = ops.depend(token, d_ki)
+    token = ops.depend(token, d_w)
+    return token
+
+
+def _materialize_grad_outputs(outputs):
+    """Force all returned tensors to be materialized in profiler runs."""
+    d_qi, d_ki, d_w, loss = outputs
+    d_qi.asnumpy()
+    d_ki.asnumpy()
+    d_w.asnumpy()
+    loss.asnumpy()
+    return outputs
 
 
 def run_timing():
-    from sparse_lightning_indexer_grad_kl_loss_triton import SparseLightningIndexerGradKLLossTriton
-    from sli_grad_kl_loss_cann import SparseLightningIndexerGradKLLoss
-
     configs = [
-        (1, 128, 512, 64, 8, 1024),
-        (1, 256, 2048, 64, 8, 2048),
-        (1, 1024, 4096, 64, 8, 2048),
-        (1, 4096, 4096, 64, 8, 2048),
-        (1, 4096, 8192, 64, 8, 2048),
+        # (1, 128, 2048, 64, 512, 64, 128, 2048),
+        # (1, 1024, 2048, 64, 512, 64, 128, 2048),
+        (1, 4096, 4096, 64, 512, 64, 128, 2048),
     ]
 
-    for B, S1, S2, N1, Nidx1, topK in configs:
-        print(f"\nB={B}, S1={S1}, S2={S2}, N1={N1}, Nidx1={Nidx1}, topK={topK}")
+    for B, S1, S2, N1, D, Nidx1, D_idx, topK in configs:
+        print(
+            f"\nB={B}, S1={S1}, S2={S2}, N1={N1}, N2=1, D={D}, "
+            f"Nidx1={Nidx1}, Nidx2=1, D_idx={D_idx}, topK={topK}"
+        )
 
-        q, k, qr, kr, qi, ki, w, si, sm_max, sm_sum = _make_inputs(B, S1, S2, N1, Nidx1, topK)
-        scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
+        scale_value = 1.0 / np.sqrt(D)
+        q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum = _make_inputs(
+            B, S1, S2, N1, D, Nidx1, D_idx, topK
+        )
+        cell = SparseLightningIndexerGradKLLossTriton(
+            scale_value=scale_value, layout="BSND", sparse_mode=3,
+        )
 
-        cell_tri = SparseLightningIndexerGradKLLossTriton(scale_value=scale)
-        cell_cann = SparseLightningIndexerGradKLLoss()
+        def _triton_call(cell=cell):
+            return _force_grad_outputs(cell(
+                q, k, qi, ki, w, si, softmax_max, softmax_sum,
+                query_rope=qr, key_rope=kr,
+            ))
 
-        try:
-            t_med, t_p20, t_p80 = _do_bench(
-                lambda: cell_tri(q, k, qi, ki, w, si, sm_max, sm_sum,
-                                 query_rope=qr, key_rope=kr))
-            print(f"triton:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
-        except Exception as e:
-            print(f"triton:  FAILED - {e}")
-            t_med = None
+        t_med, t_p20, t_p80 = _do_bench(_triton_call)
+        print(f"triton:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
 
-        try:
-            o_med, o_p20, o_p80 = _do_bench(
-                lambda: cell_cann(q, k, qi, ki, w, si, sm_max, sm_sum,
-                                  scale_value=scale, query_rope=qr, key_rope=kr,
-                                  layout="BSND", sparse_mode=3))
-            print(f"cann:    median={o_med:.2f}ms, p20={o_p20:.2f}ms, p80={o_p80:.2f}ms")
-        except Exception as e:
-            print(f"cann:    FAILED - {e}")
-            o_med = None
+        if not _cann_supports_config(D, topK):
+            print("cann:    skipped (CANN requires D=512 for this op)")
+            del q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum, cell
+            runtime.synchronize()
+            runtime.empty_cache()
+            continue
 
-        if t_med is not None and o_med is not None and t_med > 0:
-            print(f"speedup: {o_med / t_med:.2f}x")
+        op = SparseLightningIndexerGradKLLoss()
+        def _cann_call(op=op):
+            return _force_grad_outputs(op(
+                q, k, qi, ki, w, si, softmax_max, softmax_sum,
+                scale_value=scale_value,
+                query_rope=qr, key_rope=kr,
+                layout="BSND",
+                sparse_mode=3,
+            ))
+
+        o_med, o_p20, o_p80 = _do_bench(_cann_call)
+        speedup = o_med / t_med if t_med > 0 else float("inf")
+
+        print(f"cann:    median={o_med:.2f}ms, p20={o_p20:.2f}ms, p80={o_p80:.2f}ms")
+        print(f"speedup: {speedup:.2f}x")
+
+        del q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum, cell, op
+        runtime.synchronize()
+        runtime.empty_cache()
 
 
 def run_profiling():
-    from sparse_lightning_indexer_grad_kl_loss_triton import SparseLightningIndexerGradKLLossTriton
-
     total_steps = 10
-    out_dir = './profiler_data_sli'
+    out_dir = "./profiler_data_sli_grad_kl_loss"
 
-    B, S1, S2, N1, Nidx1, topK = 1, 4096, 4096, 64, 8, 2048
+    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 4096, 4096, 64, 512, 64, 128, 2048
 
-    q, k, qr, kr, qi, ki, w, si, sm_max, sm_sum = _make_inputs(B, S1, S2, N1, Nidx1, topK)
-    scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
-
-    cell = SparseLightningIndexerGradKLLossTriton(scale_value=scale)
+    scale_value = 1.0 / np.sqrt(D)
+    q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum = _make_inputs(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK
+    )
+    cell = SparseLightningIndexerGradKLLossTriton(
+        scale_value=scale_value, layout="BSND", sparse_mode=3,
+    )
 
     experimental_config = ms.profiler._ExperimentalConfig(
         profiler_level=ProfilerLevel.Level0,
         aic_metrics=AicoreMetrics.AiCoreNone,
-        # aic_metrics=AicoreMetrics.ArithmeticUtilization,
-        # aic_metrics=AicoreMetrics.PipeUtilization,
-        # aic_metrics=AicoreMetrics.Memory,
-        # aic_metrics=AicoreMetrics.MemoryUB,
         l2_cache=False,
         mstx=False,
         data_simplification=False,
-    )
+        )
 
     with ms.profiler.profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
@@ -137,28 +178,39 @@ def run_profiling():
         schedule=ms.profiler.schedule(wait=2, warmup=2, active=4, repeat=1, skip_first=2),
         on_trace_ready=ms.profiler.tensorboard_trace_handler(out_dir),
         profile_memory=False,
-        experimental_config=experimental_config,
-    ) as prof:
+        experimental_config=experimental_config
+        ) as prof:
 
         for _ in range(total_steps):
-            cell(q, k, qi, ki, w, si, sm_max, sm_sum, query_rope=qr, key_rope=kr)
+            out = cell(
+                q, k, qi, ki, w, si, softmax_max, softmax_sum,
+                query_rope=qr, key_rope=kr,
+            )
+            _materialize_grad_outputs(out)
+            runtime.synchronize()
             prof.step()
+            del out
 
     print(f"Profiler data saved to {out_dir}")
 
 
 def run_profiling_cann():
-    from sli_grad_kl_loss_cann import SparseLightningIndexerGradKLLoss
-
     total_steps = 10
-    out_dir = './profiler_data_sli_cann'
+    out_dir = "./profiler_data_sli_grad_kl_loss_cann"
 
-    B, S1, S2, N1, Nidx1, topK = 1, 4096, 4096, 64, 8, 2048
+    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 4096, 4096, 64, 512, 64, 128, 2048
+    if not _cann_supports_config(D, topK):
+        print(
+            "CANN profiling skipped: CANN requires D=512 for "
+            f"this op, got D={D}, topK={topK}"
+        )
+        return
 
-    q, k, qr, kr, qi, ki, w, si, sm_max, sm_sum = _make_inputs(B, S1, S2, N1, Nidx1, topK)
-    scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
-
-    cell = SparseLightningIndexerGradKLLoss()
+    scale_value = 1.0 / np.sqrt(D)
+    q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum = _make_inputs(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK
+    )
+    op = SparseLightningIndexerGradKLLoss()
 
     experimental_config = ms.profiler._ExperimentalConfig(
         profiler_level=ProfilerLevel.Level0,
@@ -178,33 +230,47 @@ def run_profiling_cann():
     ) as prof:
 
         for _ in range(total_steps):
-            cell(q, k, qi, ki, w, si, sm_max, sm_sum,
-                 scale_value=scale, query_rope=qr, key_rope=kr,
-                 layout="BSND", sparse_mode=3)
+            out = op(
+                q, k, qi, ki, w, si, softmax_max, softmax_sum,
+                scale_value=scale_value,
+                query_rope=qr, key_rope=kr,
+                layout="BSND",
+                sparse_mode=3,
+            )
+            _materialize_grad_outputs(out)
+            runtime.synchronize()
             prof.step()
+            del out
 
     print(f"Profiler data saved to {out_dir}")
 
 
 def run_kernel_only():
-    from sparse_lightning_indexer_grad_kl_loss_triton import SparseLightningIndexerGradKLLossTriton
+    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 4096, 4096, 64, 512, 64, 128, 2048
 
-    B, S1, S2, N1, Nidx1, topK = 1, 4096, 4096, 64, 8, 2048
-
-    q, k, qr, kr, qi, ki, w, si, sm_max, sm_sum = _make_inputs(B, S1, S2, N1, Nidx1, topK)
-    scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
-
-    cell = SparseLightningIndexerGradKLLossTriton(scale_value=scale)
+    scale_value = 1.0 / np.sqrt(D)
+    q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum = _make_inputs(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK
+    )
+    cell = SparseLightningIndexerGradKLLossTriton(
+        scale_value=scale_value, layout="BSND", sparse_mode=3,
+    )
 
     for _ in range(10):
-        cell(q, k, qi, ki, w, si, sm_max, sm_sum, query_rope=qr, key_rope=kr)
+        out = cell(
+            q, k, qi, ki, w, si, softmax_max, softmax_sum,
+            query_rope=qr, key_rope=kr,
+        )
+        _materialize_grad_outputs(out)
+        runtime.synchronize()
+        del out
     print("kernel-only run finished")
 
 
 if __name__ == "__main__":
     import sys
 
-    ms.set_context(mode=ms.GRAPH_MODE)
+    ms.set_context(mode=ms.GRAPH_MODE, jit_config={"jit_level": "O0"})
     np.random.seed(42)
     ms.set_seed(42)
 
