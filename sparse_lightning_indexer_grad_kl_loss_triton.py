@@ -19,6 +19,8 @@ from mindspore import ops, runtime
 
 SPARSE_GRAD_S1_CHUNK = 512
 SPARSE_GRAD_PROFILE_MARKERS = os.getenv("SPARSE_GRAD_PROFILE_MARKERS", "0") == "1"
+_SLISYNC = os.getenv("SLI_SYNC", "0") == "1"
+_DEBUG_DUMP = {}
 
 
 # vec[D] @ mat[K, D]^T -> [K]
@@ -150,7 +152,7 @@ def _teacher_distribution_kernel(
                 + k_offs[:, None] * D + d_offs[None, :],
                 mask=k_mask[:, None] & d_valid[None, :],
                 other=0.0)
-            scores += tl.dot(q_tile, tl.trans(k_tile))
+            scores += tl.dot(q_tile.to(tl.float32), tl.trans(k_tile.to(tl.float32)))
 
         for d_start in range(0, D_rope, BLOCK_D):
             d_offs = d_start + d_local
@@ -165,7 +167,7 @@ def _teacher_distribution_kernel(
                 + k_offs[:, None] * D_rope + d_offs[None, :],
                 mask=k_mask[:, None] & d_valid[None, :],
                 other=0.0)
-            scores += tl.dot(qr_tile, tl.trans(kr_tile))
+            scores += tl.dot(qr_tile.to(tl.float32), tl.trans(kr_tile.to(tl.float32)))
 
         sm_max = tl.load(softmax_max_ptr + sm_base + h_offs,
                          mask=h_mask, other=0.0).to(tl.float32)
@@ -248,7 +250,7 @@ def _indexer_grad_kl_loss_kernel(
                         + k_offs[:, None] * D_idx + d_offs[None, :],
                         mask=k_mask[:, None] & d_valid[None, :],
                         other=0.0)
-                    idx_scores += tl.dot(qi_tile, tl.trans(ki_tile)).to(tl.float32)
+                    idx_scores += tl.dot(qi_tile.to(tl.float32), tl.trans(ki_tile.to(tl.float32)))
 
                 relu = tl.maximum(idx_scores, 0.0)
                 relu = tl.where(g_mask[:, None] & k_mask[None, :], relu, 0.0)
@@ -354,12 +356,12 @@ def _query_index_weight_grad_kernel(
     d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
     d_valid = d_offs < D_idx
 
-    for g_local in range(0, BLOCK_G):
+    for g_local in tl.static_range(0, BLOCK_G):
         g = g_block * BLOCK_G + g_local
         g_valid = g < Nidx1
         w_g = tl.load(weights_ptr + w_base + g,
                       mask=g_valid, other=0.0).to(tl.float32)
-        dw_g = tl.zeros([1], dtype=tl.float32)
+        dw_g = tl.zeros((), dtype=tl.float32)
         dqi_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
         for k_start in range(0, VALID_K, BLOCK_K):
@@ -389,7 +391,7 @@ def _query_index_weight_grad_kernel(
 
         if d_block == 0:
             tl.store(d_weights_ptr + pid * Nidx1 + g,
-                     tl.sum(dw_g).to(d_weights_ptr.dtype.element_ty),
+                     dw_g.to(d_weights_ptr.dtype.element_ty),
                      mask=g_valid)
 
 
@@ -572,7 +574,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     BLOCK_G_MAIN = 16
     BLOCK_D_GATHER = 128
     BLOCK_D_MAIN = 64
-    BLOCK_K_QUERY_WEIGHT = 128
+    BLOCK_K_QUERY_WEIGHT = 64
     BLOCK_G_QUERY_WEIGHT = 2
     BLOCK_D_QUERY_WEIGHT = 64
     BLOCK_K_SCATTER = 64
@@ -593,10 +595,10 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     sm_sum_flat = softmax_sum.reshape(B * S1, N1).contiguous()
 
     # Intermediates
-    di = ms.mint.empty((B * S1, topK), dtype=ms.float32)
-    s_idx_buf = ms.mint.empty((B * S1, Nidx1, topK), dtype=ms.float32)
-    buf_i = ms.mint.empty((B * S1, topK), dtype=ms.float32)
-    buf_p = ms.mint.empty((B * S1, topK), dtype=ms.float32)
+    di = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
+    s_idx_buf = ms.mint.zeros((B * S1, Nidx1, topK), dtype=ms.float32)
+    buf_i = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
+    buf_p = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
 
     # Outputs
     d_query_index = ms.mint.zeros((B * S1, Nidx1, D_idx), dtype=query_index.dtype)
@@ -605,9 +607,9 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     loss_parts = ms.mint.zeros((B * S1,), dtype=ms.float32)
 
     # Gathered
-    key_gathered = ms.mint.empty((B * S1, topK, D), dtype=key.dtype)
-    key_index_gathered = ms.mint.empty((B * S1, topK, D_idx), dtype=key_index.dtype)
-    key_rope_gathered = ms.mint.empty((B * S1, topK, D_rope), dtype=key_rope.dtype)
+    key_gathered = ms.mint.zeros((B * S1, topK, D), dtype=key.dtype)
+    key_index_gathered = ms.mint.zeros((B * S1, topK, D_idx), dtype=key_index.dtype)
+    key_rope_gathered = ms.mint.zeros((B * S1, topK, D_rope), dtype=key_rope.dtype)
 
     # gather key / keyIndex / keyRope at sparse positions
     grid_bs1 = (B * S1,)
@@ -642,6 +644,9 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         S1, S2, topK, D_rope, s1_offset,
         VALID_K=valid_k, BLOCK_K=BLOCK_K_GATHER, BLOCK_D=BLOCK_D_GATHER)
 
+    if _SLISYNC:
+        runtime.synchronize()
+
     if SPARSE_GRAD_PROFILE_MARKERS:
         _profile_marker_teacher_start_kernel[(1,)](loss_parts)
         runtime.synchronize()
@@ -659,6 +664,9 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         VALID_K=valid_k, BLOCK_K=BLOCK_K_MAIN, BLOCK_D=BLOCK_D_MAIN,
         BLOCK_H=BLOCK_H_TEACHER,
     )
+
+    if _SLISYNC:
+        runtime.synchronize()
 
     if SPARSE_GRAD_PROFILE_MARKERS:
         runtime.synchronize()
@@ -683,6 +691,9 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         BLOCK_H=BLOCK_H_MAIN, BLOCK_G=BLOCK_G_MAIN,
     )
 
+    if _SLISYNC:
+        runtime.synchronize()
+
     if SPARSE_GRAD_PROFILE_MARKERS:
         runtime.synchronize()
         _profile_marker_main_end_kernel[(1,)](loss_parts)
@@ -692,6 +703,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         _profile_marker_query_start_kernel[(1,)](loss_parts)
         runtime.synchronize()
 
+    runtime.synchronize()
     _query_index_weight_grad_kernel[
         (B * S1, triton.cdiv(Nidx1, BLOCK_G_QUERY_WEIGHT),
          triton.cdiv(D_idx, BLOCK_D_QUERY_WEIGHT))
@@ -736,6 +748,12 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         _profile_marker_scatter_end_kernel[(1,)](loss_parts)
         runtime.synchronize()
 
+    if os.getenv("SLI_DUMP"):
+        _DEBUG_DUMP.setdefault("act", []).append(
+            (actual_seq_qlen.asnumpy().copy(),
+             actual_seq_klen.asnumpy().copy()))
+        _DEBUG_DUMP.setdefault("chunks", []).append(
+            (s_idx_buf, buf_i, buf_p, di, loss_parts, key_index_gathered))
     d_query_index = d_query_index.reshape(query_index.shape)
     d_key_index_acc = d_key_index_acc.reshape(key_index.shape)
     d_weights = d_weights.reshape(weights.shape)

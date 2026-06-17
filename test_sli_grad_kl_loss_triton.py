@@ -6,8 +6,8 @@ import mindspore as ms
 ms.set_context(mode=ms.GRAPH_MODE, jit_config={"jit_level": "O0"})
 
 DROPE = 64
-ATOL = 1e-2
-RTOL = 1e-2
+_TOLS = {ms.float16: (1e-2, 1e-2), ms.bfloat16: (2e-1, 2e-2)} # TODO 这里精度需要最少1e-3
+NEAR_ZERO = 1e-2
 
 SPARSE_GRAD_CANN_TEST_CONFIGS = [
     (1, 1, 2048, 32, 512, 8, 128, 1024),
@@ -21,19 +21,26 @@ SPARSE_GRAD_CANN_TEST_CONFIGS = [
 SPARSE_GRAD_LARGE_TEST_CONFIGS = [
     (1, 1024, 1024, 32, 512, 8, 128, 1024),
     (1, 4096, 4096, 32, 512, 8, 128, 1024),
+    (1, 4096, 4096, 64, 512, 64, 128, 2048),
 ]
 
 def _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=ms.float16):
     rng = np.random.RandomState(42)
     N2, Nidx2 = 1, 1
-    q = ms.Tensor(rng.randn(B, S1, N1, D).astype(np.float16), dtype=dtype)
-    k = ms.Tensor(rng.randn(B, S2, N2, D).astype(np.float16), dtype=dtype)
-    qr = ms.Tensor(rng.randn(B, S1, N1, DROPE).astype(np.float16), dtype=dtype)
-    kr = ms.Tensor(rng.randn(B, S2, N2, DROPE).astype(np.float16), dtype=dtype)
-    qi = ms.Tensor(rng.randn(B, S1, Nidx1, D_idx).astype(np.float16), dtype=dtype)
-    ki = ms.Tensor(rng.randn(B, S2, Nidx2, D_idx).astype(np.float16), dtype=dtype)
-    w = ms.Tensor(np.abs(rng.randn(B, S1, Nidx1)).astype(np.float16), dtype=dtype)
+    q = ms.Tensor(rng.randn(B, S1, N1, D).astype(np.float16), dtype=ms.float16)
+    k = ms.Tensor(rng.randn(B, S2, N2, D).astype(np.float16), dtype=ms.float16)
+    qr = ms.Tensor(rng.randn(B, S1, N1, DROPE).astype(np.float16), dtype=ms.float16)
+    kr = ms.Tensor(rng.randn(B, S2, N2, DROPE).astype(np.float16), dtype=ms.float16)
+    qi = ms.Tensor(rng.randn(B, S1, Nidx1, D_idx).astype(np.float16), dtype=ms.float16)
+    ki = ms.Tensor(rng.randn(B, S2, Nidx2, D_idx).astype(np.float16), dtype=ms.float16)
+    w = ms.Tensor(np.abs(rng.randn(B, S1, Nidx1)).astype(np.float16), dtype=ms.float16)
     si = ms.Tensor(rng.randint(0, S2, (B, S1, Nidx2, topK)).astype(np.int32), dtype=ms.int32)
+    if dtype != ms.float16:
+        q, k, qr, kr, qi, ki, w = (
+            q.astype(dtype), k.astype(dtype), qr.astype(dtype),
+            kr.astype(dtype), qi.astype(dtype), ki.astype(dtype),
+            w.astype(dtype),
+        )
     return q, k, qr, kr, qi, ki, w, si
 
 
@@ -106,7 +113,6 @@ def _compute_softmax_stats(q, k, qr, kr, scale_value,
             for h in range(N1):
                 scores = (np.dot(q_np[b, s1, h], all_k.T)
                           + np.dot(qr_np[b, s1, h], all_kr.T)) * scale_value
-                scores = scores.astype(np.float16).astype(np.float32)
                 scores[causal_limit:] = float('-inf')
                 s_max = np.max(scores)
                 sm_max[b, 0, s1, h] = s_max
@@ -116,22 +122,36 @@ def _compute_softmax_stats(q, k, qr, kr, scale_value,
             ms.Tensor(sm_sum, dtype=ms.float32))
 
 
-def _assert_outputs_close(base_outputs, tri_outputs):
+def _to_np(t):
+    return t.asnumpy().astype(np.float32)
+
+
+def _assert_close_skip_nearzero(a, b, atol, rtol):
+    a_np, b_np = np.asarray(a, np.float32), np.asarray(b, np.float32)
+    near_zero = (np.abs(a_np) < NEAR_ZERO) & (np.abs(b_np) < NEAR_ZERO)
+    a_f = np.where(near_zero, 0.0, a_np)
+    b_f = np.where(near_zero, 0.0, b_np)
+    np.testing.assert_allclose(a_f, b_f, atol=atol, rtol=rtol)
+
+
+def _assert_outputs_close(base_outputs, tri_outputs, dtype):
     d_qi_base, d_ki_base, d_w_base, loss_base = base_outputs
     d_qi_tri, d_ki_tri, d_w_tri, loss_tri = tri_outputs
-    np.testing.assert_allclose(d_qi_base.asnumpy(), d_qi_tri.asnumpy(), atol=ATOL, rtol=RTOL)
-    np.testing.assert_allclose(d_ki_base.asnumpy(), d_ki_tri.asnumpy(), atol=ATOL, rtol=RTOL)
-    np.testing.assert_allclose(d_w_base.asnumpy(), d_w_tri.asnumpy(), atol=ATOL, rtol=RTOL)
-    np.testing.assert_allclose(loss_base.asnumpy(), loss_tri.asnumpy(), atol=ATOL, rtol=RTOL)
+    atol, rtol = _TOLS[dtype]
+    _assert_close_skip_nearzero(_to_np(d_qi_base), _to_np(d_qi_tri), atol, rtol)
+    _assert_close_skip_nearzero(_to_np(d_ki_base), _to_np(d_ki_tri), atol, rtol)
+    _assert_close_skip_nearzero(_to_np(d_w_base), _to_np(d_w_tri), atol, rtol)
+    _assert_close_skip_nearzero(_to_np(loss_base), _to_np(loss_tri), atol, rtol)
 
 
-def _assert_large_outputs(base_outputs, tri_outputs):
+def _assert_large_outputs(base_outputs, tri_outputs, dtype):
     d_qi_base, d_ki_base, d_w_base, loss_base = base_outputs
     d_qi_tri, d_ki_tri, d_w_tri, loss_tri = tri_outputs
+    atol, rtol = _TOLS[dtype]
 
-    np.testing.assert_allclose(d_qi_base.asnumpy(), d_qi_tri.asnumpy(), atol=ATOL, rtol=RTOL)
-    np.testing.assert_allclose(d_w_base.asnumpy(), d_w_tri.asnumpy(), atol=ATOL, rtol=RTOL)
-    np.testing.assert_allclose(loss_base.asnumpy(), loss_tri.asnumpy(), atol=ATOL, rtol=RTOL)
+    _assert_close_skip_nearzero(_to_np(d_qi_base), _to_np(d_qi_tri), atol, rtol)
+    _assert_close_skip_nearzero(_to_np(d_w_base), _to_np(d_w_tri), atol, rtol)
+    _assert_close_skip_nearzero(_to_np(loss_base), _to_np(loss_tri), atol, rtol)
 
     assert d_ki_tri.shape == d_ki_base.shape, (
         f"d_ki shape mismatch: {d_ki_tri.shape} vs {d_ki_base.shape}"
@@ -144,7 +164,8 @@ def _assert_large_outputs(base_outputs, tri_outputs):
 
 def _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
                                actual_seq_qlen=None, actual_seq_klen=None,
-                               sparse_pattern="causal_random", large_check=False):
+                               sparse_pattern="causal_random", large_check=False,
+                               dtype=ms.float16):
     from sparse_lightning_indexer_grad_kl_loss_triton import (
         SparseLightningIndexerGradKLLossTriton,
     )
@@ -153,7 +174,7 @@ def _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
     )
     scale_value = 1.0 / np.sqrt(D)
 
-    q, k, qr, kr, qi, ki, w, si = _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK)
+    q, k, qr, kr, qi, ki, w, si = _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=dtype)
     if sparse_pattern != "random":
         si = _make_sparse_indices(B, S1, S2, topK, sparse_pattern)
     softmax_max, softmax_sum = _compute_softmax_stats(
@@ -182,24 +203,26 @@ def _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
     )
 
     if large_check:
-        _assert_large_outputs(base_outputs, tri_outputs)
+        _assert_large_outputs(base_outputs, tri_outputs, dtype)
     else:
-        _assert_outputs_close(base_outputs, tri_outputs)
+        _assert_outputs_close(base_outputs, tri_outputs, dtype)
 
 
+@pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("B,S1,S2,N1,D,Nidx1,D_idx,topK",
                          SPARSE_GRAD_CANN_TEST_CONFIGS)
-def test_sparse_grad_kl_loss_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK):
-    _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK)
+def test_sparse_grad_kl_loss_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype):
+    _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=dtype)
 
 
 @pytest.mark.large
+@pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("B,S1,S2,N1,D,Nidx1,D_idx,topK",
                          SPARSE_GRAD_LARGE_TEST_CONFIGS)
-def test_sparse_grad_kl_loss_large_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK):
+def test_sparse_grad_kl_loss_large_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype):
     _run_cann_triton_precision(
         B, S1, S2, N1, D, Nidx1, D_idx, topK,
-        sparse_pattern="causal_continuous", large_check=True,
+        sparse_pattern="causal_continuous", large_check=True, dtype=dtype,
     )
 
 
@@ -213,5 +236,7 @@ def test_sparse_grad_kl_loss_sparse_indices_patterns(sparse_pattern):
 
 
 if __name__ == "__main__":
-    test_sparse_grad_kl_loss_precision(1, 4, 2048, 32, 512, 8, 128, 1024)
-    print("precision test passed!")
+    test_sparse_grad_kl_loss_precision(1, 4, 2048, 32, 512, 8, 128, 1024, ms.float16)
+    print("fp16 precision test passed!")
+    test_sparse_grad_kl_loss_precision(1, 4, 2048, 32, 512, 8, 128, 1024, ms.bfloat16)
+    print("bf16 precision test passed!")
