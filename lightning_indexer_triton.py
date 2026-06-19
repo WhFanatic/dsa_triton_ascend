@@ -79,15 +79,21 @@ def _prune_configs(configs, named_args, **kwargs):
     """autotune config 过滤
 
     - UB 容量上限(910B 单核 ~192KB)
+
+    Phased UB estimation: the kernel has two non-overlapping phases per
+    G-iteration — (1) dot accumulation: q/k tiles + acc + trans_tmp,
+    (2) reduce: acc → tile_scores. Buffers from phase 1 are freed before
+    phase 2 starts, so peak UB is max(phase1, phase2), not the sum.
     """
     _UB_LIMIT_BYTES = 192 * 1024
-    _GRID_LIMIT = 65536  # Ascend coreDim 硬件上限（65536）
+    _GRID_LIMIT = 65535  # Ascend coreDim 硬件上限（65536）
 
     def _estimate_ub_bytes(block_s2, block_d, block_g):
-        """粗估单 tile 主要 buffer 的 UB 占用 (bytes)。
+        """分阶段估算 UB 峰值 (bytes)。
 
-        1.25 系数近似 double-buffering + tl.trans 临时空间, 由实测反推:
-        (BLOCK_S2=256,BLOCK_D=128,BLOCK_G=64) 实测要 ~262KB。
+        Phase 1 (dot): q_tile + k_tile + acc + trans_tmp
+        Phase 2 (reduce): acc + tile_scores (k_tile/trans_tmp 已释放)
+        Peak = max(phase1, phase2)
         """
         if block_s2 is None or block_d is None or block_g is None:
             return 0
@@ -96,8 +102,9 @@ def _prune_configs(configs, named_args, **kwargs):
         q_tile     = block_g  * block_d * 2   # q_tile[BLOCK_G, BLOCK_D] fp16
         trans_tmp  = block_s2 * block_d * 2   # tl.trans 中间空间
         tile_score = block_s2 * 4             # tile_scores[BLOCK_S2] fp32
-        total = acc + k_tile + q_tile + trans_tmp + tile_score
-        return int(total * 1.25)
+        phase1 = q_tile + k_tile + acc + trans_tmp
+        phase2 = acc + tile_score
+        return max(phase1, phase2)
 
     def _get(name):
         if name in named_args:
@@ -160,7 +167,9 @@ def _prune_configs(configs, named_args, **kwargs):
         # 大 BLOCK_S1: 大 shape 用它把 grid0 压回限内, 同时调大 BLOCK_S2 摊薄 grid1、调小 BLOCK_D 守 UB。
         triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=16384 选中
         triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),  # G=64 融合, 减少 K tile 重复加载
         triton.Config({"BLOCK_S1": 32, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 32, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),  # G=64 融合
         triton.Config({"BLOCK_S1": 128, "BLOCK_S2": 256,  "BLOCK_D": 64, "BLOCK_G": 16}),
         triton.Config({"BLOCK_S1": 256, "BLOCK_S2": 512,  "BLOCK_D": 32, "BLOCK_G": 16}),
         triton.Config({"BLOCK_S1": 512, "BLOCK_S2": 1024, "BLOCK_D": 16, "BLOCK_G": 16}),

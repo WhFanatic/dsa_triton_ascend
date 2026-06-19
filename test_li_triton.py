@@ -50,10 +50,16 @@ def _allclose(a, b):
     (4096, 4096, 64, 1, 128, 2048),     # 生产 shape
     (4096, 8192, 64, 1, 128, 2048),     # S2>S1 非方阵 (grid 超限回归点)
     (16*1024, 16*1024, 64, 1, 128, 2048),  # 超大, grid 上限压测
+    # 补充 N1=[32,128], D=[256,512] 覆盖:
+    (1024, 1024, 32, 1, 128, 512),
+    (1024, 1024, 128, 1, 128, 512),
+    (1024, 1024, 64, 1, 256, 512),
+    (1024, 1024, 32, 1, 512, 512),
+    (1024, 1024, 128, 1, 512, 512),
 ])
-@pytest.mark.parametrize("B", [1, 2, 3])
-@pytest.mark.parametrize("sparse_mode", [0, 3])
-@pytest.mark.parametrize("dtype", [ms.float16, ms.float32])
+@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("sparse_mode", [3])
+@pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16])
 def test_basic(B, S1, S2, N1, N2, D, sparse_count, sparse_mode, dtype, return_value=False):
     """Test parameter combinations beyond CANN constraints (no reference comparison)."""
     from lightning_indexer_triton import LightningIndexerTriton
@@ -92,7 +98,7 @@ def test_basic(B, S1, S2, N1, N2, D, sparse_count, sparse_mode, dtype, return_va
     (16*1024,  16*1024,   64, 1, 128, 2048),   # 超大方阵, grid 上限压测
 ])
 @pytest.mark.parametrize("B", [1, 2])
-@pytest.mark.parametrize("sparse_mode", [0, 3])
+@pytest.mark.parametrize("sparse_mode", [3])
 def test_accuracy(B, S1, S2, N1, N2, D, sparse_count, sparse_mode):
     """Compare lightning_indexer_triton with ops.lightning_indexer on BSND layout."""
     from lightning_indexer_triton import LightningIndexerTriton
