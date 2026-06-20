@@ -196,7 +196,7 @@ pytest --forked test_sfa_triton.py -v
 
 - `test_li_triton.py`: 参数化覆盖 BSND 布局、fp16、sparse_mode 0/3、return_value True/False，对比 `ops.lightning_indexer`
 - `test_sli_grad_kl_loss_triton.py`: 对比 CANN `SparseLightningIndexerGradKLLoss` 验证 dQueryIndex、dKeyIndex、dWeights、loss 一致性
-- `test_sfa_triton.py`: `test_golden` 对比 numpy golden（任意 shape，验算法）、`test_accuracy` 对比 `ops.sparse_flash_attention`（BSND, CANN 基准）、`test_basic` 形状/dtype/有限性自检；覆盖 fp16/bf16（bf16=mindformers `compute_dtype`）、sparse_mode 0/3、token/block-wise、D∈{128,256,512}、return_softmax_lse。bf16 容差放宽到 4e-2（8-bit 尾数）。TND/PA_BSND 为 host 归一化的 PyNative-only 路径，GRAPH_MODE 接入只走 BSND，故测试只覆盖 BSND。
+- `test_sfa_triton.py`: `test_golden` 对比 numpy golden（任意 shape，验算法）、`test_accuracy` 对比 `ops.sparse_flash_attention`（BSND, CANN 基准）、`test_basic` 形状/dtype/有限性自检；覆盖 fp16/bf16（bf16=mindformers `compute_dtype`）、sparse_mode 0/3、token/block-wise、D∈{128,256,512}、return_softmax_lse。TND/PA_BSND 为 host 归一化的 PyNative-only 路径，GRAPH_MODE 接入只走 BSND，故测试只覆盖 BSND。
 
 ## 接入路径
 

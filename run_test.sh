@@ -9,14 +9,28 @@ export TRITON_CACHE_DIR=./my_triton_cache
 # LightningIndexer 算子测试
 # ####################
 
-# 基础调试
+# ---- lightning_indexer_triton ----
+# 基础调试（__main__，跑固定 shape）
 # python test_li_triton.py
-# 全量测试
-# pytest --forked test_li_triton.py -v "$@"
-# 性能测试
-# TRITON_PRINT_AUTOTUNING=1 python perf_li_triton.py
+# 功能测试（triton vs numpy golden，验算法正确性，覆盖 GQA + fp16/bf16）
+# pytest --forked test_li_triton.py -v -k test_golden "$@"
+# 精度测试（triton vs CANN ops.lightning_indexer）
+# pytest --forked test_li_triton.py -v -k test_accuracy "$@"
+# 功能自检（shape/dtype/indices 范围，超 CANN 约束的大 shape）
+# pytest --forked test_li_triton.py -v -k test_basic "$@"
+
+# ---- 日常快速回归（改完代码先跑这条：smoke，精选 3 个典型 case）----
+# 命中 GQA / multi-batch / 不同 dtype 场景
+# pytest --forked test_li_triton.py -v -k "smoke" "$@"
+
+# ---- 全量功能+精度回归（结构/逻辑大改后才跑：golden & accuracy）----
+# pytest --forked test_li_triton.py -v -k "test_golden or test_accuracy" "$@"
+
+# ---- 性能 / profiling ----
+# 计时 + speedup（triton vs CANN）
+TRITON_PRINT_AUTOTUNING=1 python perf_li_triton.py
 # 内核性能测试（msprof op 指定 kernel，避免全量采集与 triton driver 冲突导致 segfault）
-# msprof op --kernel-name="_lightning_indexer_score_kernel" --output=./profilers python perf_li_triton.py --kernel-only
+msprof op --kernel-name="_lightning_indexer_score_kernel" --output=./profilers python perf_li_triton.py --kernel-only
 
 # ####################
 # SparseLightningIndexerGradKLLoss 算子测试----脚本待调试
