@@ -86,7 +86,7 @@ def _prune_configs(configs, named_args, **kwargs):
     phase 2 starts, so peak UB is max(phase1, phase2), not the sum.
     """
     _UB_LIMIT_BYTES = 192 * 1024
-    _GRID_LIMIT = 65535  # Ascend coreDim 硬件上限（65536）
+    _GRID_LIMIT = 65535  # Ascend coreDim 硬件上限（65535）
 
     def _estimate_ub_bytes(block_s2, block_d, block_g):
         """分阶段估算 UB 峰值 (bytes)。
@@ -154,18 +154,18 @@ def _prune_configs(configs, named_args, **kwargs):
 @triton.autotune(
     configs=[
         # BLOCK_S1=8/4: 小~中 shape, 并行度高; 每档给 G=16 与 G=64 两种 reduce 宽度。
-        triton.Config({"BLOCK_S1": 8, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=128 选中
-        triton.Config({"BLOCK_S1": 8, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),  # S1=1024/2048 选中
+        triton.Config({"BLOCK_S1": 8, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=128 
+        triton.Config({"BLOCK_S1": 8, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),  # S1=1024/2048 
         triton.Config({"BLOCK_S1": 4, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
         triton.Config({"BLOCK_S1": 4, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),
 
         # BLOCK_S1=1/2: 并行度最高, 但只在 B*S1 很小时存活 (大 shape 下 grid0 超 coreDim 被剪)。
-        triton.Config({"BLOCK_S1": 1, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=4096 选中
+        triton.Config({"BLOCK_S1": 1, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=4096 
         triton.Config({"BLOCK_S1": 1, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),
         triton.Config({"BLOCK_S1": 2, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
 
         # 大 BLOCK_S1: 大 shape 用它把 grid0 压回限内, 同时调大 BLOCK_S2 摊薄 grid1、调小 BLOCK_D 守 UB。
-        triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=16384 选中
+        triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=16384 
         triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
         triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),  # G=64 融合, 减少 K tile 重复加载
         triton.Config({"BLOCK_S1": 32, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),
