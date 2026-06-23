@@ -1,12 +1,11 @@
 #!/bin/bash
 # ============================================================================
-# Sparse 算子功能与精度测试
-# 用法: ./script/test_sparse.sh [test_type]
-#   test_type: smoke | golden | accuracy | basic | all (默认all)
+# Sparse operator function and accuracy tests
+# Usage: ./script/test_sparse.sh [test_type]
+#   test_type: smoke | golden | accuracy | basic | all (default all)
 #
-# 环境要求: Ascend NPU, mindspore 2.9.0, triton-ascend 3.2.1
+# Requirements: Ascend NPU, mindspore 2.9.0, triton-ascend 3.2.1
 # ============================================================================
-set -euo pipefail
 
 export ASCEND_RT_VISIBLE_DEVICES=0
 export TRITON_END=mindspore
@@ -18,38 +17,38 @@ TEST_TYPE="${1:-all}"
 TEST_FILE="test_sli_grad_kl_loss_triton.py"
 
 echo "================================================"
-echo "Sparse 算子测试"
-echo "测试类型: ${TEST_TYPE}"
-echo "测试文件: ${TEST_FILE}"
-echo "NPU 设备: ${ASCEND_RT_VISIBLE_DEVICES}"
+echo "Sparse Operator Test"
+echo "Test type: ${TEST_TYPE}"
+echo "Test file: ${TEST_FILE}"
+echo "NPU device: ${ASCEND_RT_VISIBLE_DEVICES}"
 echo "================================================"
 
 run_smoke() {
     echo ""
-    echo ">>> [smoke] 快速冒烟 (CANN 兼容 shape, triton vs CANN)"
+    echo ">>> [smoke] Quick smoke test (CANN-compatible shape, triton vs CANN)"
     python -m pytest "${TEST_FILE}" -v -k "test_sparse_grad_kl_loss_large_precision[1-4096-4096-64-512-64-128-2048-fp16]" "$@"
-    echo ">>> [smoke] 通过"
+    echo ">>> [smoke] PASSED"
 }
 
 run_golden() {
     echo ""
-    echo ">>> [golden] 算法正确性 (triton vs numpy)"
+    echo ">>> [golden] Algorithm correctness (triton vs numpy)"
     python -m pytest "${TEST_FILE}" -v -k "test_golden" "$@"
-    echo ">>> [golden] 通过"
+    echo ">>> [golden] PASSED"
 }
 
 run_accuracy() {
     echo ""
-    echo ">>> [accuracy] CANN 精度对齐 (triton vs CANN)"
+    echo ">>> [accuracy] CANN accuracy alignment (triton vs CANN)"
     python -m pytest "${TEST_FILE}" -v -k "test_accuracy" "$@"
-    echo ">>> [accuracy] 通过"
+    echo ">>> [accuracy] PASSED"
 }
 
 run_basic() {
     echo ""
-    echo ">>> [basic] 功能自检 (shape/dtype, 多处超 CANN 约束)"
+    echo ">>> [basic] Self-check (shape/dtype, beyond CANN constraints)"
     python -m pytest "${TEST_FILE}" -v -k "test_basic" "$@"
-    echo ">>> [basic] 通过"
+    echo ">>> [basic] PASSED"
 }
 
 run_all() {
@@ -66,7 +65,7 @@ case "${TEST_TYPE}" in
     basic)   run_basic ;;
     all)     run_all ;;
     *)
-        echo "用法: $0 {smoke|golden|accuracy|basic|all}"
+        echo "Usage: $0 {smoke|golden|accuracy|basic|all}"
         exit 1
         ;;
 esac
