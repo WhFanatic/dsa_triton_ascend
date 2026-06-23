@@ -2,5 +2,12 @@ references/
 temp/
 trash/
 *__pycache__*
+.pytest_cache*
 prompts.md
 profiler*
+custom_kernel_meta/
+my_triton_cache/
+profiler_data*/
+.omo/
+kernel_meta/
+sparse_profile_report.txt
