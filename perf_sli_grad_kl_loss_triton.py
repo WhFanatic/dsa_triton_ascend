@@ -17,7 +17,7 @@ def _cann_supports_config(D, topK):
     return D == 512 and topK % 1024 == 0
 
 
-def _do_bench(fn, warmup=10, rep=5):
+def _do_bench(fn, warmup=10, rep=1):
     """Simple benchmarking with manual timing (Ascend-compatible)."""
     for _ in range(warmup):
         out = fn()
@@ -152,7 +152,7 @@ def run_timing():
 
 
 def run_profiling():
-    total_steps = 10
+    total_steps = 2
     out_dir = "./profiler_data_sli_grad_kl_loss"
 
     B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 4096, 4096, 64, 512, 64, 128, 2048
@@ -176,7 +176,7 @@ def run_profiling():
     with ms.profiler.profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
         with_stack=True,
-        schedule=ms.profiler.schedule(wait=2, warmup=2, active=4, repeat=1, skip_first=2),
+        schedule=ms.profiler.schedule(wait=0, warmup=1, active=1, repeat=1, skip_first=0),
         on_trace_ready=ms.profiler.tensorboard_trace_handler(out_dir),
         profile_memory=False,
         experimental_config=experimental_config
