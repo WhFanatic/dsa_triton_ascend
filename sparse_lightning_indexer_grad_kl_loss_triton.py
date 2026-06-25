@@ -18,30 +18,8 @@ from mindspore import ops, runtime
 
 
 SPARSE_GRAD_S1_CHUNK = 512
-SPARSE_GRAD_PROFILE_MARKERS = os.getenv("SPARSE_GRAD_PROFILE_MARKERS", "0") == "1"
 _SLISYNC = os.getenv("SLI_SYNC", "0") == "1"
 _DEBUG_DUMP = {}
-
-
-# vec[D] @ mat[K, D]^T -> [K]
-@triton.jit
-def _block_dot_1xD_vs_KxD(
-    vec_ptr, vec_base,
-    mat_ptr, mat_base, mat_stride_k,
-    D_total, k_arange, topk_mask,
-    BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
-):
-    acc = tl.zeros([BLOCK_K], dtype=tl.float32)
-    for d_start in range(0, D_total, BLOCK_D):
-        d_offs = d_start + tl.arange(0, BLOCK_D)
-        d_valid = d_offs < D_total
-        v = tl.load(vec_ptr + vec_base + d_offs,
-                     mask=d_valid, other=0.0).to(tl.float32)
-        m = tl.load(mat_ptr + mat_base + k_arange[:, None] * mat_stride_k + d_offs[None, :],
-                     mask=topk_mask[:, None] & d_valid[None, :],
-                     other=0.0).to(tl.float32)
-        acc += tl.sum(v[None, :] * m, axis=1)
-    return acc
 
 
 # gather kernel
@@ -460,64 +438,6 @@ def _scatter_dkey_index_kernel(
                   mask=k_mask[:, None] & d_valid[None, :])
 
 
-@triton.jit
-def _cast_dkey_index_kernel(src_ptr, dst_ptr, total,
-                            BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < total
-    vals = tl.load(src_ptr + offsets, mask=mask, other=0.0)
-    tl.store(dst_ptr + offsets, vals.to(dst_ptr.dtype.element_ty), mask=mask)
-
-
-@triton.jit
-def _profile_marker_teacher_start_kernel(marker_ptr):
-    val = tl.load(marker_ptr)
-    tl.store(marker_ptr, val)
-
-
-@triton.jit
-def _profile_marker_teacher_end_kernel(marker_ptr):
-    val = tl.load(marker_ptr)
-    tl.store(marker_ptr, val)
-
-
-@triton.jit
-def _profile_marker_main_start_kernel(marker_ptr):
-    val = tl.load(marker_ptr)
-    tl.store(marker_ptr, val)
-
-
-@triton.jit
-def _profile_marker_main_end_kernel(marker_ptr):
-    val = tl.load(marker_ptr)
-    tl.store(marker_ptr, val)
-
-
-@triton.jit
-def _profile_marker_query_start_kernel(marker_ptr):
-    val = tl.load(marker_ptr)
-    tl.store(marker_ptr, val)
-
-
-@triton.jit
-def _profile_marker_query_end_kernel(marker_ptr):
-    val = tl.load(marker_ptr)
-    tl.store(marker_ptr, val)
-
-
-@triton.jit
-def _profile_marker_scatter_start_kernel(marker_ptr):
-    val = tl.load(marker_ptr)
-    tl.store(marker_ptr, val)
-
-
-@triton.jit
-def _profile_marker_scatter_end_kernel(marker_ptr):
-    val = tl.load(marker_ptr)
-    tl.store(marker_ptr, val)
-
-
 # helpers
 def _default_actual_seq(actual_seq, seq_len, ref_tensor):
     device_zeros = ops.cast(
@@ -647,10 +567,6 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     if _SLISYNC:
         runtime.synchronize()
 
-    if SPARSE_GRAD_PROFILE_MARKERS:
-        _profile_marker_teacher_start_kernel[(1,)](loss_parts)
-        runtime.synchronize()
-
     _teacher_distribution_kernel[
         (B * S1, triton.cdiv(valid_k, BLOCK_K_MAIN))
     ](
@@ -666,13 +582,6 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     )
 
     if _SLISYNC:
-        runtime.synchronize()
-
-    if SPARSE_GRAD_PROFILE_MARKERS:
-        runtime.synchronize()
-        _profile_marker_teacher_end_kernel[(1,)](loss_parts)
-        runtime.synchronize()
-        _profile_marker_main_start_kernel[(1,)](loss_parts)
         runtime.synchronize()
 
     _indexer_grad_kl_loss_kernel[grid_bs1](
@@ -694,15 +603,6 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     if _SLISYNC:
         runtime.synchronize()
 
-    if SPARSE_GRAD_PROFILE_MARKERS:
-        runtime.synchronize()
-        _profile_marker_main_end_kernel[(1,)](loss_parts)
-        runtime.synchronize()
-
-    if SPARSE_GRAD_PROFILE_MARKERS:
-        _profile_marker_query_start_kernel[(1,)](loss_parts)
-        runtime.synchronize()
-
     runtime.synchronize()
     _query_index_weight_grad_kernel[
         (B * S1, triton.cdiv(Nidx1, BLOCK_G_QUERY_WEIGHT),
@@ -722,13 +622,6 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         BLOCK_D=BLOCK_D_QUERY_WEIGHT, BLOCK_G=BLOCK_G_QUERY_WEIGHT,
     )
 
-    if SPARSE_GRAD_PROFILE_MARKERS:
-        runtime.synchronize()
-        _profile_marker_query_end_kernel[(1,)](loss_parts)
-        runtime.synchronize()
-        _profile_marker_scatter_start_kernel[(1,)](loss_parts)
-        runtime.synchronize()
-
     _scatter_dkey_index_kernel[
         (B * S1, triton.cdiv(valid_k, BLOCK_K_SCATTER),
          triton.cdiv(D_idx, BLOCK_D_SCATTER))
@@ -742,11 +635,6 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         valid_k, s1_offset,
         BLOCK_K=BLOCK_K_SCATTER, BLOCK_D=BLOCK_D_SCATTER,
     )
-
-    if SPARSE_GRAD_PROFILE_MARKERS:
-        runtime.synchronize()
-        _profile_marker_scatter_end_kernel[(1,)](loss_parts)
-        runtime.synchronize()
 
     if os.getenv("SLI_DUMP"):
         _DEBUG_DUMP.setdefault("act", []).append(
