@@ -257,7 +257,7 @@ def run_kernel_only():
         scale_value=scale_value, layout="BSND", sparse_mode=3,
     )
 
-    for _ in range(10):
+    for _ in range(1):
         out = cell(
             q, k, qi, ki, w, si, softmax_max, softmax_sum,
             query_rope=qr, key_rope=kr,
