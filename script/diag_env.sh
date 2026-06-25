@@ -7,7 +7,7 @@
 # Works on both A2 and A3 servers.
 # ============================================================================
 
-DEVICE_ID="${1:-0}"
+DEVICE_ID="${1:-6}"
 OUTPUT="diag_env_device${DEVICE_ID}.log"
 
 echo "NPU Memory Diagnostic - device ${DEVICE_ID}" | tee "${OUTPUT}"

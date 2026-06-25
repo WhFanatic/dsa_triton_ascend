@@ -40,7 +40,13 @@ section() {
 
 latest_parse_dir() {
     local base="$1"
-    find "${base}" -maxdepth 1 -name "syn-*" -type d 2>/dev/null | sort -r | head -1 | tr -d '\n'
+    # triton profiler uses "syn-*", cann profiler uses "{hostname}_*_ascend_ms"
+    local d
+    d=$(find "${base}" -maxdepth 1 -name "syn-*" -type d 2>/dev/null | sort -r | head -1 | tr -d '\n')
+    if [ -z "${d}" ]; then
+        d=$(find "${base}" -maxdepth 1 -name "*_ascend_ms" -type d 2>/dev/null | sort -r | head -1 | tr -d '\n')
+    fi
+    echo "${d}"
 }
 
 extract_kernel_summary() {
@@ -221,42 +227,94 @@ else
     echo "(no CANN profiling data in ${CANN_DIR})" >> "${OUTPUT_FILE}"
 fi
 
-# ---- Part 3: msprof full detailed profiling ----
-section "Part 3: msprof full detailed profiling (msprof op)"
-MSPROF_OPPROF=$(find "${MSPROF_DIR}" -maxdepth 2 -name "OpBasicInfo.csv" -type f 2>/dev/null | head -1)
-if [ -n "${MSPROF_OPPROF}" ]; then
-    opprof_dir=$(dirname "${MSPROF_OPPROF}")
-    echo "[msprof] Data directory: ${opprof_dir}" >> "${OUTPUT_FILE}"
+# ---- Part 3: msprof per-kernel detailed profiling ----
+section "Part 3: msprof per-kernel profiling (msprof op, 5 kernels)"
+MSPROF_OPPROF_DIR=$(find "${MSPROF_DIR}" -maxdepth 2 -type d -name "OPPROF_*" 2>/dev/null | head -1)
+if [ -n "${MSPROF_OPPROF_DIR}" ]; then
+    echo "[msprof] Data directory: ${MSPROF_OPPROF_DIR}" >> "${OUTPUT_FILE}"
 
+    # 收集所有 kernel 的 OpBasicInfo
     echo "" >> "${OUTPUT_FILE}"
-    echo "[msprof] Kernel timing (OpBasicInfo.csv)" >> "${OUTPUT_FILE}"
-    echo "  ---------------------------------------------------------------------------" >> "${OUTPUT_FILE}"
+    echo "[msprof] Per-kernel timing (OpBasicInfo, avg over all instances)" >> "${OUTPUT_FILE}"
+    echo "  ---------------------------------------------------------------" >> "${OUTPUT_FILE}"
+    printf "  %-45s %12s %10s %8s %6s\n" "Kernel Name" "AvgDur(us)" "Block Dim" "Type" "N" >> "${OUTPUT_FILE}"
+
     {
-        head -1 "${MSPROF_OPPROF}"
-        tail -n +2 "${MSPROF_OPPROF}"
+        for csv in $(find "${MSPROF_OPPROF_DIR}" -name "OpBasicInfo_*.csv" -type f 2>/dev/null | sort); do
+            tail -1 "${csv}"
+        done
     } | awk -F',' '
-    NR==1 {
-        for(i=1;i<=NF;i++) {
-            gsub(/^[ \t]+|[ \t]+$/, "", $i)
-            col[$i]=i
-        }
-        printf "  %-50s %12s\n", "Op Name", "Duration(us)"
-        next
-    }
     {
-        name=$col["Op Name"]; dur=$col["Task Duration(us)"]
+        name=$1; type=$2; dur=$3; blk=$4
         gsub(/^[ \t]+|[ \t]+$/, "", name)
         gsub(/^[ \t]+|[ \t]+$/, "", dur)
-        if (dur+0 > 0) printf "  %-50s %12s\n", name, dur
-    }' 2>/dev/null | sort -t$'\t' -k2 -rn | head -30 >> "${OUTPUT_FILE}"
+        gsub(/^[ \t]+|[ \t]+$/, "", blk)
+        gsub(/^[ \t]+|[ \t]+$/, "", type)
+        dur_num = dur + 0
+        if (dur_num <= 0) next
+        sum[name] += dur_num
+        cnt[name]++
+        blkdim[name] = blk
+        typeinfo[name] = type
+    }
+    END {
+        for (name in sum) {
+            avg = sum[name] / cnt[name]
+            printf "  %-45s %12.2f %10s %8s %6d\n", name, avg, blkdim[name], typeinfo[name], cnt[name]
+        }
+    }' >> "${OUTPUT_FILE}"
 
-    for csv in ArithmeticUtilization PipeUtilization MemoryUB Memory; do
-        csv_path="${opprof_dir}/${csv}.csv"
-        if [ -f "${csv_path}" ]; then
-            echo "" >> "${OUTPUT_FILE}"
-            echo "[msprof] ${csv}.csv overview (first block)" >> "${OUTPUT_FILE}"
-            head -2 "${csv_path}" >> "${OUTPUT_FILE}" || true
-        fi
+    # 汇总
+    echo "" >> "${OUTPUT_FILE}"
+    echo "[msprof] Kernel stage breakdown (single launch, per-chunk)" >> "${OUTPUT_FILE}"
+    echo "  ---------------------------------------------------------------" >> "${OUTPUT_FILE}"
+    {
+        for csv in $(find "${MSPROF_OPPROF_DIR}" -name "OpBasicInfo_*.csv" -type f 2>/dev/null | sort); do
+            tail -1 "${csv}"
+        done
+    } | awk -F',' '
+    {
+        name=$1; dur=$3
+        gsub(/^[ \t]+|[ \t]+$/, "", name)
+        gsub(/^[ \t]+|[ \t]+$/, "", dur)
+        dur_num = dur + 0
+        if (dur_num <= 0) next
+        if (name ~ /gather_kv/)       { gs += dur_num; gc++ }
+        else if (name ~ /teacher/)    { ts += dur_num; tc++ }
+        else if (name ~ /indexer/)    { is += dur_num; ic++ }
+        else if (name ~ /query_index/){ qs += dur_num; qc++ }
+        else if (name ~ /scatter/)    { ss += dur_num; sc++ }
+    }
+    END {
+        if (gc > 0) ga = gs / gc; if (tc > 0) ta = ts / tc
+        if (ic > 0) ia = is / ic; if (qc > 0) qa = qs / qc
+        if (sc > 0) sa = ss / sc
+        sum_avg = ga + ta + ia + qa + sa
+        if (sum_avg <= 0) exit
+        printf "  %-35s %8.1f us  (%5.1f%%)\n", "gather_kv", ga, ga*100/sum_avg
+        if (tc > 0) printf "  %-35s %8.1f us  (%5.1f%%)\n", "teacher_dist", ta, ta*100/sum_avg
+        else         printf "  %-35s %8s  (not captured)\n", "teacher_dist", "-"
+        printf "  %-35s %8.1f us  (%5.1f%%)\n", "indexer_grad_kl", ia, ia*100/sum_avg
+        printf "  %-35s %8.1f us  (%5.1f%%)\n", "query_index_weight", qa, qa*100/sum_avg
+        printf "  %-35s %8.1f us  (%5.1f%%)\n", "scatter_dkey", sa, sa*100/sum_avg
+        printf "  %-35s %8.1f us\n", "--- per-chunk avg ---", sum_avg
+    }' >> "${OUTPUT_FILE}"
+
+    # 硬件指标（每个 kernel 的 PipeUtilization / ArithmeticUtilization）
+    for csv in $(find "${MSPROF_OPPROF_DIR}" -name "OpBasicInfo_*.csv" -type f 2>/dev/null | sort); do
+        kdir=$(dirname "${csv}")
+        kname=$(basename "${kdir}")
+        echo "" >> "${OUTPUT_FILE}"
+        echo "[msprof] ${kname} hardware metrics" >> "${OUTPUT_FILE}"
+
+        for metric in PipeUtilization ArithmeticUtilization MemoryUB Memory L2Cache; do
+            mfile="${kdir}/${metric}_*.csv"
+            mfile=$(ls ${mfile} 2>/dev/null | head -1)
+            if [ -f "${mfile}" ]; then
+                echo "  --- ${metric} (first 2 rows) ---" >> "${OUTPUT_FILE}"
+                head -2 "${mfile}" | awk -F',' '{printf "    "; for(i=1;i<=NF;i++) printf "%s%s", $i, (i==NF?"\n":" | ")}' >> "${OUTPUT_FILE}" 2>/dev/null || true
+            fi
+        done
     done
 else
     echo "(no msprof op data in ${MSPROF_DIR})" >> "${OUTPUT_FILE}"
@@ -270,7 +328,46 @@ echo "  Production shape: B=1, S1/S2=4096, N1=64, D=512, Nidx1=64, D_idx=128, to
 # ---- Part 5: summary statistics ----
 section "Part 5: Summary statistics"
 echo "  Triton kernel stage breakdown:" >> "${OUTPUT_FILE}"
-if [ -n "${TRITON_PARSE}" ]; then
+
+if [ -n "${MSPROF_OPPROF_DIR}" ]; then
+    echo "  (from msprof op per-kernel profiling, avg over all instances)" >> "${OUTPUT_FILE}"
+    echo "" >> "${OUTPUT_FILE}"
+    find "${MSPROF_OPPROF_DIR}" -name "OpBasicInfo_*.csv" -type f 2>/dev/null | sort | while read -r csv; do
+        tail -1 "${csv}"
+    done | awk -F',' '
+    {
+        name=$1; dur=$3
+        gsub(/^[ \t]+|[ \t]+$/, "", name)
+        gsub(/^[ \t]+|[ \t]+$/, "", dur)
+        dur_num = dur + 0
+        if (dur_num <= 0) next
+
+        if (name ~ /gather_kv/)            { gs += dur_num; gc++ }
+        else if (name ~ /teacher/)         { ts += dur_num; tc++ }
+        else if (name ~ /indexer/)         { is += dur_num; ic++ }
+        else if (name ~ /query_index/)     { qs += dur_num; qc++ }
+        else if (name ~ /scatter/)         { ss += dur_num; sc++ }
+        total_instances++
+    }
+    END {
+        if (gc > 0) ga = gs / gc; if (tc > 0) ta = ts / tc
+        if (ic > 0) ia = is / ic; if (qc > 0) qa = qs / qc
+        if (sc > 0) sa = ss / sc
+        sum_avg = ga + ta + ia + qa + sa
+        if (sum_avg <= 0) exit
+        if (gc > 0) printf "  gather_kv:          %8.1f us  (%5.1f%%)  n=%d\n", ga, ga*100/sum_avg, gc
+        if (tc > 0) printf "  teacher_dist:       %8.1f us  (%5.1f%%)  n=%d\n", ta, ta*100/sum_avg, tc
+        else         printf "  teacher_dist:       (not captured)\n"
+        if (ic > 0) printf "  indexer_grad_kl:    %8.1f us  (%5.1f%%)  n=%d\n", ia, ia*100/sum_avg, ic
+        if (qc > 0) printf "  query_idx_weight:   %8.1f us  (%5.1f%%)  n=%d\n", qa, qa*100/sum_avg, qc
+        if (sc > 0) printf "  scatter_dkey:       %8.1f us  (%5.1f%%)  n=%d\n", sa, sa*100/sum_avg, sc
+        printf "  --- per-chunk avg:  %8.1f us  (single launch)\n", sum_avg
+        printf "  --- 4 chunks est:   %8.1f ms  (NPU-only, per-chunk avg × 4)\n", sum_avg*4/1000
+        printf "  instances: %d  (1 row per kernel launch)\n", total_instances
+    }' >> "${OUTPUT_FILE}"
+
+else
+    echo "  (from kernel_details.csv, no msprof data)" >> "${OUTPUT_FILE}"
     kd="${TRITON_PARSE}/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
     if [ -f "${kd}" ]; then
         echo "" >> "${OUTPUT_FILE}"

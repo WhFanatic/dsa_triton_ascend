@@ -17,7 +17,7 @@ def _cann_supports_config(D, topK):
     return D == 512 and topK % 1024 == 0
 
 
-def _do_bench(fn, warmup=10, rep=50):
+def _do_bench(fn, warmup=10, rep=5):
     """Simple benchmarking with manual timing (Ascend-compatible)."""
     for _ in range(warmup):
         out = fn()
@@ -143,7 +143,8 @@ def run_timing():
         speedup = o_med / t_med if t_med > 0 else float("inf")
 
         print(f"cann:    median={o_med:.2f}ms, p20={o_p20:.2f}ms, p80={o_p80:.2f}ms")
-        print(f"speedup: {speedup:.2f}x")
+        if t_med > 0:
+            print(f"speedup: {speedup:.2f}x")
 
         del q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum, cell, op
         runtime.synchronize()
@@ -274,8 +275,14 @@ if __name__ == "__main__":
     np.random.seed(42)
     ms.set_seed(42)
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--kernel-only":
+    if len(sys.argv) > 1 and sys.argv[1] == "--timing-only":
+        run_timing()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--kernel-only":
         run_kernel_only()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--triton-only":
+        run_profiling()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--cann-only":
+        run_profiling_cann()
     else:
         run_timing()
         run_profiling()
