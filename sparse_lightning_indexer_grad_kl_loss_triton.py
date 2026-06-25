@@ -26,14 +26,16 @@ _DEBUG_DUMP = {}
 @triton.jit
 def _gather_kv_kernel(
     src_ptr, indices_ptr, dst_ptr,
+    src_idx_ptr, dst_idx_ptr,
+    src_rope_ptr, dst_rope_ptr,
     act_q_ptr, act_k_ptr,
-    S1, S2, topK, D, S1_OFFSET,
+    S1, S2, topK, D, D_IDX: tl.constexpr, D_ROPE: tl.constexpr, S1_OFFSET,
     VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    """Gather sparse KV at positions specified by indices.
+    """Fused gather of key, key_index, key_rope at sparse positions.
 
-    Grid: (B * S1, cdiv(valid_k, BLOCK_K), cdiv(D, BLOCK_D)).
-    src: [B, S2, D]   dst: [B*S1, topK, D]
+    Grid: (B * S1, cdiv(valid_k, BLOCK_K), cdiv(max(D,D_IDX,D_ROPE), BLOCK_D)).
+    src: [B, S2, D_x]   dst: [B*S1, topK, D_x]
     """
     pid = tl.program_id(0)
     k_block = tl.program_id(1)
@@ -41,7 +43,6 @@ def _gather_kv_kernel(
     b = pid // S1
     s1 = pid % S1
     s1_global = s1 + S1_OFFSET
-    batch_src_offset = b * S2 * D
     act_q = tl.load(act_q_ptr + b)
     act_k = tl.load(act_k_ptr + b)
     s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1_global + 1, 0))
@@ -49,20 +50,41 @@ def _gather_kv_kernel(
     s2_bound = tl.minimum(s2_real, VALID_K)
     if k_block * BLOCK_K >= s2_bound:
         return
-    if d_block * BLOCK_D >= D:
-        return
 
     k_offs = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
-    d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
     k_mask = k_offs < s2_bound
-    d_mask = d_offs < D
     idx = tl.load(indices_ptr + pid * topK + k_offs, mask=k_mask, other=0)
     idx = tl.maximum(tl.minimum(idx, S2 - 1), 0)
-    mask_2d = k_mask[:, None] & d_mask[None, :]
-    src_offs = batch_src_offset + idx[:, None] * D + d_offs[None, :]
-    vals = tl.load(src_ptr + src_offs, mask=mask_2d, other=0.0)
-    dst_offs = pid * topK * D + k_offs[:, None] * D + d_offs[None, :]
-    tl.store(dst_ptr + dst_offs, vals, mask=mask_2d)
+
+    # Key gather (D=512)
+    if d_block * BLOCK_D < D:
+        d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+        mask_2d = k_mask[:, None] & d_mask[None, :]
+        src_offs = b * S2 * D + idx[:, None] * D + d_offs[None, :]
+        vals = tl.load(src_ptr + src_offs, mask=mask_2d, other=0.0)
+        dst_offs = pid * topK * D + k_offs[:, None] * D + d_offs[None, :]
+        tl.store(dst_ptr + dst_offs, vals, mask=mask_2d)
+
+    # Key index gather (D_idx=128)
+    if d_block * BLOCK_D < D_IDX:
+        d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D_IDX
+        mask_2d = k_mask[:, None] & d_mask[None, :]
+        src_offs = b * S2 * D_IDX + idx[:, None] * D_IDX + d_offs[None, :]
+        vals = tl.load(src_idx_ptr + src_offs, mask=mask_2d, other=0.0)
+        dst_offs = pid * topK * D_IDX + k_offs[:, None] * D_IDX + d_offs[None, :]
+        tl.store(dst_idx_ptr + dst_offs, vals, mask=mask_2d)
+
+    # Key rope gather (D_rope=64)
+    if d_block * BLOCK_D < D_ROPE:
+        d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D_ROPE
+        mask_2d = k_mask[:, None] & d_mask[None, :]
+        src_offs = b * S2 * D_ROPE + idx[:, None] * D_ROPE + d_offs[None, :]
+        vals = tl.load(src_rope_ptr + src_offs, mask=mask_2d, other=0.0)
+        dst_offs = pid * topK * D_ROPE + k_offs[:, None] * D_ROPE + d_offs[None, :]
+        tl.store(dst_rope_ptr + dst_offs, vals, mask=mask_2d)
 
 
 @triton.jit
@@ -531,39 +553,22 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     key_index_gathered = ms.mint.zeros((B * S1, topK, D_idx), dtype=key_index.dtype)
     key_rope_gathered = ms.mint.zeros((B * S1, topK, D_rope), dtype=key_rope.dtype)
 
-    # gather key / keyIndex / keyRope at sparse positions
-    grid_bs1 = (B * S1,)
-    grid_gather_key = (
+    # gather key / keyIndex / keyRope at sparse positions (single fused launch)
+    max_d = max(D, D_idx, D_rope)
+    grid_gather = (
         B * S1,
         triton.cdiv(valid_k, BLOCK_K_GATHER),
-        triton.cdiv(D, BLOCK_D_GATHER),
+        triton.cdiv(max_d, BLOCK_D_GATHER),
     )
-    _gather_kv_kernel[grid_gather_key](
+    _gather_kv_kernel[grid_gather](
         k_flat, sparse_flat, key_gathered,
+        ki_flat, key_index_gathered,
+        kr_flat, key_rope_gathered,
         actual_seq_qlen, actual_seq_klen,
-        S1, S2, topK, D, s1_offset,
-        VALID_K=valid_k, BLOCK_K=BLOCK_K_GATHER, BLOCK_D=BLOCK_D_GATHER)
-    grid_gather_index = (
-        B * S1,
-        triton.cdiv(valid_k, BLOCK_K_GATHER),
-        triton.cdiv(D_idx, BLOCK_D_GATHER),
-    )
-    _gather_kv_kernel[grid_gather_index](
-        ki_flat, sparse_flat, key_index_gathered,
-        actual_seq_qlen, actual_seq_klen,
-        S1, S2, topK, D_idx, s1_offset,
-        VALID_K=valid_k, BLOCK_K=BLOCK_K_GATHER, BLOCK_D=BLOCK_D_GATHER)
-    grid_gather_rope = (
-        B * S1,
-        triton.cdiv(valid_k, BLOCK_K_GATHER),
-        triton.cdiv(D_rope, BLOCK_D_GATHER),
-    )
-    _gather_kv_kernel[grid_gather_rope](
-        kr_flat, sparse_flat, key_rope_gathered,
-        actual_seq_qlen, actual_seq_klen,
-        S1, S2, topK, D_rope, s1_offset,
+        S1, S2, topK, D, D_IDX=D_idx, D_ROPE=D_rope, S1_OFFSET=s1_offset,
         VALID_K=valid_k, BLOCK_K=BLOCK_K_GATHER, BLOCK_D=BLOCK_D_GATHER)
 
+    grid_bs1 = (B * S1,)
     if _SLISYNC:
         runtime.synchronize()
 
