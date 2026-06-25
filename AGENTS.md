@@ -113,15 +113,16 @@ BLOCK_K_SCATTER = 128    (64→128: safe)
   between indexer_main → query_weight). Must keep.
 - **`mint.zeros` → `mint.empty`**: Causes incorrect results even with masked reads.
   MindSpore empty tensors may not have device memory backing.
-- **Merge 3 gather calls → 1 fused kernel**: Causes incorrect results. Root cause not fully
-  investigated (possibly grid dimension issues with multi-D gather).
+- **Merge 3 gather calls → 1 fused kernel**: ✅ Completed. Uses `D_IDX`/`D_ROPE` constexpr
+  guards with per-dimension `d_block * BLOCK_D < D_x` checks. Grid uses `max(D, D_idx, D_rope)`.
+  Eliminates 2 kernel launches per chunk. (commit `e8ea5e3`)
 - **Merge teacher_dist into indexer_main**: Not attempted (Oracle estimated modest gains).
 
 ### Future directions (per Oracle review)
-1. Fix fused gather kernel correctness bug → merge 3 gathers
-2. Inline teacher_dist into indexer_main (eliminate buf_p, reduce GM round-trips)
-3. Merge query_idx_weight + scatter_dkey (both read s_idx_buf/di; combine to avoid double-read)
-4. BLOCK parameter re-tuning after kernel fusion
+1. Inline teacher_dist into indexer_main (eliminate buf_p, reduce GM round-trips)
+2. Merge query_idx_weight + scatter_dkey (both read s_idx_buf/di; combine to avoid double-read)
+3. BLOCK parameter re-tuning after kernel fusion
+4. Persistent output buffer across chunks (eliminate concat/reduce overhead)
 
 ### 910B → 910C transition
 - 910C has larger UB (256KB+ vs 192KB) → larger BLOCK_K/BLOCK_D possible
