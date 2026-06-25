@@ -487,17 +487,17 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     topK = sparse_indices.shape[3]
     valid_k = min(topK, S2)
 
-    BLOCK_K_GATHER = 128
+    BLOCK_K_GATHER = 256
     BLOCK_K_MAIN = 128
     BLOCK_H_MAIN = 32
     BLOCK_H_TEACHER = 32
     BLOCK_G_MAIN = 16
     BLOCK_D_GATHER = 128
     BLOCK_D_MAIN = 64
-    BLOCK_K_QUERY_WEIGHT = 64
-    BLOCK_G_QUERY_WEIGHT = 2
+    BLOCK_K_QUERY_WEIGHT = 128
+    BLOCK_G_QUERY_WEIGHT = 4
     BLOCK_D_QUERY_WEIGHT = 64
-    BLOCK_K_SCATTER = 64
+    BLOCK_K_SCATTER = 128
     BLOCK_D_SCATTER = 64
 
     # Flatten N2=1, Nidx2=1 dimensions (MQA: single KV head)
