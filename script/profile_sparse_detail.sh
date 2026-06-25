@@ -45,7 +45,7 @@ echo ">>> Profiling 5 kernels in one pass ..."
 # --kernel-name 支持 | 拼接多个前缀，一次采集全部 5 个 kernel
 # --launch-count=50 采集每个 kernel 前 50 次 launch（10次slis × 4chunks = 40次 + 余量）
 msprof op --output="${OUT_DIR}" \
-    --kernel-name="_gather_kv_fused|_teacher_distribution|_indexer_grad_kl_loss|_query_index_weight_grad|_scatter_dkey_index" \
+    --kernel-name="_gather_kv_kernel|_teacher_distribution|_indexer_grad_kl_loss|_query_index_weight_grad|_scatter_dkey_index" \
     --launch-count=50 \
     python "${KERNEL_ONLY_SCRIPT}" --kernel-only
 
