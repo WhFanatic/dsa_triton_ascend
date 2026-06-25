@@ -17,7 +17,7 @@ def _cann_supports_config(D, topK):
     return D == 512 and topK % 1024 == 0
 
 
-def _do_bench(fn, warmup=10, rep=1):
+def _do_bench(fn, warmup=1, rep=1):
     """Simple benchmarking with manual timing (Ascend-compatible)."""
     for _ in range(warmup):
         out = fn()
