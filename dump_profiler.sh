@@ -7,6 +7,7 @@ DUMP_DIR="$SCRIPT_DIR/dump"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 DUMP_FILE="$DUMP_DIR/profiler_dump_${TIMESTAMP}.txt"
 OP_DUMP_FILE="$DUMP_DIR/msprof_op_${TIMESTAMP}.txt"
+INFO_FILE="$DUMP_DIR/info_${TIMESTAMP}.txt"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 
@@ -17,8 +18,26 @@ eval "$CMD" 2>&1 | tee "$LOG"
 EXIT_CODE=${PIPESTATUS[0]}
 
 if [ "$EXIT_CODE" -ne 0 ]; then
-    echo ">>> ERROR: Command failed with exit code $EXIT_CODE" >&2
-    exit 1
+    echo ">>> WARNING: Command exited with code $EXIT_CODE, collecting any produced data" >&2
+fi
+
+PERF_INFO=$(grep -E 'median=|speedup' "$LOG" || true)
+MSPROF_INFO=$(awk '/Performance Summary Report:/{f=1} /Profiling results saved in/{f=0} f{print}' "$LOG")
+
+if [ -n "$PERF_INFO" ] || [ -n "$MSPROF_INFO" ]; then
+    : > "$INFO_FILE"
+    if [ -n "$PERF_INFO" ]; then
+        echo "######## PERF SUMMARY ########" >> "$INFO_FILE"
+        echo "$PERF_INFO" >> "$INFO_FILE"
+        echo "" >> "$INFO_FILE"
+    fi
+    if [ -n "$MSPROF_INFO" ]; then
+        echo "######## MSPROF REPORT ########" >> "$INFO_FILE"
+        echo "$MSPROF_INFO" >> "$INFO_FILE"
+    fi
+    echo ">>> Saved info to $INFO_FILE" >&2
+else
+    echo ">>> WARNING: No key info found in output" >&2
 fi
 
 WORKDIR=$(pwd)
@@ -52,7 +71,7 @@ if [ -n "$DIRS1" ]; then
             echo ""
             echo "######## DUMP_FILE_END ########"
             COUNT1=$((COUNT1 + 1))
-        done < <(find "$dir" -name "*.csv" -type f | sort)
+        done < <(find "$dir" \( -name "*.csv" -o -name "*.json" \) -type f | sort)
     done <<< "$DIRS1" >> "$DUMP_FILE"
 fi
 
@@ -72,9 +91,10 @@ if [ -n "$DIRS2" ]; then
             echo ""
             echo "######## DUMP_FILE_END ########"
             COUNT2=$((COUNT2 + 1))
-        done < <(find "$dir" -name "*.csv" -type f | sort)
+        done < <(find "$dir" \( -name "*.csv" -o -name "*.json" \) -type f | sort)
     done <<< "$DIRS2" >> "$OP_DUMP_FILE"
 fi
 
-echo ">>> Dumped $COUNT1 CSV files to $DUMP_FILE" >&2
-echo ">>> Dumped $COUNT2 CSV files to $OP_DUMP_FILE" >&2
+echo ">>> Dumped $COUNT1 files to $DUMP_FILE" >&2
+echo ">>> Dumped $COUNT2 files to $OP_DUMP_FILE" >&2
+exit "$EXIT_CODE"
