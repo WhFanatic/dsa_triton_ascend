@@ -328,13 +328,14 @@ def _query_index_weight_grad_kernel(
 ):
     """Stage 5: dW and dQueryIndex from chain rule.
 
-    Grid: (B*S1, cdiv(Nidx1, BLOCK_G), cdiv(D_idx, BLOCK_D)).
-    Each program handles a small group of g values for one (b, s1, d-block),
-    keeping each output element single-writer while avoiding coreDim=65536.
+    Grid: (B*S1, cdiv(Nidx1, BLOCK_G)). Each program produces dW and
+    dQueryIndex for a whole [BLOCK_G, D_idx] tile. The K reduction is done
+    via tl.dot([BLOCK_G, BLOCK_K] x [BLOCK_K, BLOCK_D]) so the cube unit
+    carries the FMAs and BLOCK_G works as a vector dimension, not a scalar
+    static_range. BLOCK_D should cover D_idx in one shot to avoid splitting.
     """
     pid = tl.program_id(0)
     g_block = tl.program_id(1)
-    d_block = tl.program_id(2)
     b = pid // S1
     s1 = pid % S1
     s1_global = s1 + S1_OFFSET
@@ -352,47 +353,62 @@ def _query_index_weight_grad_kernel(
     qi_base = pid * Nidx1 * D_idx
     ki_g_base = pid * topK * D_idx
     w_base = pid * Nidx1
+    sidx_base = pid * Nidx1 * topK
     local_k = tl.arange(0, BLOCK_K)
-    d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    g_local = tl.arange(0, BLOCK_G)
+    g_offs = g_block * BLOCK_G + g_local
+    g_mask = g_offs < Nidx1
+    d_offs = tl.arange(0, BLOCK_D)
     d_valid = d_offs < D_idx
 
-    for g_local in tl.static_range(0, BLOCK_G):
-        g = g_block * BLOCK_G + g_local
-        g_valid = g < Nidx1
-        w_g = tl.load(weights_ptr + w_base + g,
-                      mask=g_valid, other=0.0).to(tl.float32)
-        dw_g = tl.zeros((), dtype=tl.float32)
-        dqi_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    w_g = tl.load(weights_ptr + w_base + g_offs,
+                  mask=g_mask, other=0.0).to(tl.float32)
 
-        for k_start in range(0, VALID_K, BLOCK_K):
-            if k_start < s2_bound:
-                k_offs = k_start + local_k
-                k_mask = k_offs < s2_bound
-                relu_tile = tl.load(
-                    s_idx_buf_ptr + pid * Nidx1 * topK + g * topK + k_offs,
-                    mask=g_valid & k_mask, other=0.0)
-                di_tile = tl.load(di_ptr + pid * topK + k_offs,
-                                  mask=k_mask, other=0.0)
-                if d_block == 0:
-                    dw_g += tl.sum(di_tile * relu_tile, axis=0)
-                relu_mask = (relu_tile > 0.0).to(tl.float32)
-                ds_idx = di_tile * w_g * relu_mask
-                ki_tile = tl.load(
-                    key_index_gathered_ptr + ki_g_base
-                    + k_offs[:, None] * D_idx + d_offs[None, :],
-                    mask=k_mask[:, None] & d_valid[None, :],
-                    other=0.0).to(tl.float32)
-                dqi_acc += tl.sum(ds_idx[:, None] * ki_tile, axis=0)
+    dw_acc = tl.zeros([BLOCK_G], dtype=tl.float32)
+    dqi_acc = tl.zeros([BLOCK_G, BLOCK_D], dtype=tl.float32)
 
-        dqi_offs = pid * Nidx1 * D_idx + g * D_idx + d_offs
-        tl.store(d_query_index_ptr + dqi_offs,
-                 dqi_acc.to(d_query_index_ptr.dtype.element_ty),
-                 mask=g_valid & d_valid)
+    for k_start in range(0, VALID_K, BLOCK_K):
+        k_offs = k_start + local_k
+        k_mask = k_offs < s2_bound
 
-        if d_block == 0:
-            tl.store(d_weights_ptr + pid * Nidx1 + g,
-                     dw_g.to(d_weights_ptr.dtype.element_ty),
-                     mask=g_valid)
+        # relu_tile: [BLOCK_G, BLOCK_K]
+        relu_tile = tl.load(
+            s_idx_buf_ptr + sidx_base
+            + g_offs[:, None] * topK + k_offs[None, :],
+            mask=g_mask[:, None] & k_mask[None, :], other=0.0)
+
+        # di_tile: [BLOCK_K], shared across all g in this block
+        di_tile = tl.load(di_ptr + pid * topK + k_offs,
+                          mask=k_mask, other=0.0)
+
+        # dW_g += sum_k(di_k * relu_gk)
+        dw_acc += tl.sum(di_tile[None, :] * relu_tile, axis=1)
+
+        # ds_idx: [BLOCK_G, BLOCK_K]
+        relu_mask = (relu_tile > 0.0).to(tl.float32)
+        ds_idx = di_tile[None, :] * w_g[:, None] * relu_mask
+
+        # ki_tile: [BLOCK_K, BLOCK_D], shared across all g
+        ki_tile = tl.load(
+            key_index_gathered_ptr + ki_g_base
+            + k_offs[:, None] * D_idx + d_offs[None, :],
+            mask=k_mask[:, None] & d_valid[None, :],
+            other=0.0).to(tl.float32)
+
+        # dqi_acc += [BLOCK_G, BLOCK_K] @ [BLOCK_K, BLOCK_D]
+        dqi_acc += tl.dot(ds_idx, ki_tile)
+
+    # Store dQueryIndex tile [BLOCK_G, BLOCK_D]
+    dqi_offs = (qi_base
+                + g_offs[:, None] * D_idx + d_offs[None, :])
+    tl.store(d_query_index_ptr + dqi_offs,
+             dqi_acc.to(d_query_index_ptr.dtype.element_ty),
+             mask=g_mask[:, None] & d_valid[None, :])
+
+    # Store dW tile [BLOCK_G]
+    tl.store(d_weights_ptr + w_base + g_offs,
+             dw_acc.to(d_weights_ptr.dtype.element_ty),
+             mask=g_mask)
 
 
 # scatter-add dKeyIndex kernel
@@ -517,8 +533,8 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     BLOCK_D_GATHER = 128
     BLOCK_D_MAIN = 64
     BLOCK_K_QUERY_WEIGHT = 128
-    BLOCK_G_QUERY_WEIGHT = 4
-    BLOCK_D_QUERY_WEIGHT = 64
+    BLOCK_G_QUERY_WEIGHT = 64
+    BLOCK_D_QUERY_WEIGHT = 128
     BLOCK_K_SCATTER = 128
     BLOCK_D_SCATTER = 64
 
@@ -610,8 +626,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
 
     runtime.synchronize()
     _query_index_weight_grad_kernel[
-        (B * S1, triton.cdiv(Nidx1, BLOCK_G_QUERY_WEIGHT),
-         triton.cdiv(D_idx, BLOCK_D_QUERY_WEIGHT))
+        (B * S1, triton.cdiv(Nidx1, BLOCK_G_QUERY_WEIGHT))
     ](
         qi_flat,
         key_index_gathered,

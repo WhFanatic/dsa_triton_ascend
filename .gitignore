@@ -11,3 +11,5 @@ profiler_data*/
 .omo/
 kernel_meta/
 sparse_profile_report.txt
+tmp_profilers*
+BASE*
