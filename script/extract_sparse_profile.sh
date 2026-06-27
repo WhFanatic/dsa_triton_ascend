@@ -4,17 +4,24 @@
 #
 # Usage: ./script/extract_sparse_profile.sh [triton_dir] [cann_dir] [msprof_dir] [output_file]
 #
-# Extracts from profile_sparse.sh and profile_sparse_detail.sh output:
-#   1. Per-kernel name, duration, call count (kernel_details.csv)
-#   2. API call statistics (api_statistic.csv)
-#   3. Operator-level timing ranking (step_trace / op_range)
-#   4. AICore hardware metrics (sqlite database)
-#   5. Triton vs CANN timing comparison (perf script output)
-#   6. msprof per-kernel sampling results
-#   7. Full log keywords (memory H2D/D2H tasks etc.)
+# Consumes the output of:
+#   - script/profile_sparse.sh         -> ${TRITON_DIR}, ${CANN_DIR}
+#       contains syn-*/ASCEND_PROFILER_OUTPUT/{kernel_details,api_statistic,
+#       step_trace_time}.csv
+#   - script/profile_sparse_detail.sh  -> ${MSPROF_DIR}
+#       contains <kernel>/OPPROF_*/{OpBasicInfo,PipeUtilization,
+#       ArithmeticUtilization,MemoryUB,L2Cache}.csv (one OPPROF dir per kernel)
 #
-# Output: single text file organized by sections
+# Produces a single plain-text report grouped into:
+#   Part 1 Triton kernel timing (aggregated by kernel name, top by total)
+#   Part 2 CANN  kernel timing
+#   Part 3 Triton vs CANN side-by-side (step / chunk / sum)
+#   Part 4 Host-side API statistics (acl* / aclnn* etc.)
+#   Part 5 msprof per-kernel hardware metrics (pipe / arithmetic / memory)
+#   Part 6 Final summary (per-chunk stage breakdown + total)
 # ============================================================================
+
+set -u
 
 TRITON_DIR="${1:-./profiler_data_sli_grad_kl_loss}"
 CANN_DIR="${2:-./profiler_data_sli_grad_kl_loss_cann}"
@@ -29,379 +36,434 @@ echo "msprof  detailed: ${MSPROF_DIR}"
 echo "Output file:      ${OUTPUT_FILE}"
 echo "================================================"
 
-> "${OUTPUT_FILE}"
+: > "${OUTPUT_FILE}"
 
 section() {
-    echo "" >> "${OUTPUT_FILE}"
-    echo "################################################################################" >> "${OUTPUT_FILE}"
-    echo "# $*" >> "${OUTPUT_FILE}"
-    echo "################################################################################" >> "${OUTPUT_FILE}"
+    {
+        echo ""
+        echo "################################################################################"
+        echo "# $*"
+        echo "################################################################################"
+    } >> "${OUTPUT_FILE}"
 }
 
+# Locate the latest ASCEND_PROFILER_OUTPUT dir under a profile_sparse.sh output root.
 latest_parse_dir() {
     local base="$1"
-    # triton profiler uses "syn-*", cann profiler uses "{hostname}_*_ascend_ms"
     local d
-    d=$(find "${base}" -maxdepth 1 -name "syn-*" -type d 2>/dev/null | sort -r | head -1 | tr -d '\n')
-    if [ -z "${d}" ]; then
-        d=$(find "${base}" -maxdepth 1 -name "*_ascend_ms" -type d 2>/dev/null | sort -r | head -1 | tr -d '\n')
-    fi
+    d=$(find "${base}" -maxdepth 1 -mindepth 1 -type d -name "syn-*"        2>/dev/null | sort -r | head -1)
+    [ -z "${d}" ] && d=$(find "${base}" -maxdepth 1 -mindepth 1 -type d -name "*_ascend_ms" 2>/dev/null | sort -r | head -1)
     echo "${d}"
 }
 
-extract_kernel_summary() {
+# Aggregate kernel_details.csv by kernel basename:
+#   - bare kernel name from "Name" column (strip 'Kernel::KernelLaunch::Default/.../')
+#   - sum / count / avg by name
+#   - sort desc by total
+extract_kernel_details() {
     local label="$1"
     local parse_dir="$2"
-    local csv_file="${parse_dir}/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
+    local csv="${parse_dir}/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
 
-    if [ ! -f "${csv_file}" ]; then
-        echo "[${label}] kernel_details.csv not found" >> "${OUTPUT_FILE}"
+    if [ ! -f "${csv}" ]; then
+        echo "[${label}] kernel_details.csv not found at ${csv}" >> "${OUTPUT_FILE}"
         return
     fi
 
-    echo "[${label}] Kernel execution details (kernel_details.csv)" >> "${OUTPUT_FILE}"
-    echo "" >> "${OUTPUT_FILE}"
-    echo "  Top 30 by duration:" >> "${OUTPUT_FILE}"
-    echo "  ---------------------------------------------------------------------------" >> "${OUTPUT_FILE}"
-
     {
-        head -1 "${csv_file}"
-        grep -iE "sparse|lightning|indexer|gather|scatter|teacher|kl_loss|grad" "${csv_file}" || true
-    } | awk -F',' '
+        echo "[${label}] Kernel timing (aggregated by kernel name)"
+        echo "  source: ${csv}"
+        echo "  ----------------------------------------------------------------------------------"
+        printf "  %-50s %4s %12s %12s\n" "Kernel" "N" "TotalDur(us)" "AvgDur(us)"
+    } >> "${OUTPUT_FILE}"
+
+    awk -F',' '
     NR==1 {
-        for(i=1;i<=NF;i++) {
-            gsub(/^[ \t]+|[ \t]+$/, "", $i)
-            col[$i]=i
+        for (i=1; i<=NF; i++) {
+            v=$i; gsub(/^[ \t\r]+|[ \t\r]+$/, "", v); col[v]=i
         }
-        printf "  %-70s %12s\n", "Name", "Duration(us)"
+        nameC = col["Name"]; durC = col["Duration(us)"]
         next
     }
     {
-        name=$col["Name"]
-        dur=$col["Duration(us)"]
-        gsub(/^[ \t]+|[ \t]+$/, "", name)
-        gsub(/^[ \t]+|[ \t]+$/, "", dur)
-        if (dur+0 > 0 && name != "") {
-            printf "  %-70s %12s\n", name, dur
-        }
-    }' | sort -t$'\t' -k2 -rn 2>/dev/null | head -30 >> "${OUTPUT_FILE}"
+        name=$nameC; dur=$durC
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", name)
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", dur)
+        # strip "Kernel::KernelLaunch::Default/.../" prefix to keep bare kernel name
+        sub(/.*\//, "", name)
+        d = dur + 0
+        if (name == "" || d <= 0) next
+        sum[name] += d
+        cnt[name]++
+    }
+    END {
+        # print as sortable lines: <total>\t<avg>\t<n>\t<name>
+        for (n in sum)
+            printf "%.3f\t%.3f\t%d\t%s\n", sum[n], sum[n]/cnt[n], cnt[n], n
+    }' "${csv}" \
+    | sort -t$'\t' -k1 -rn \
+    | awk -F'\t' '{ printf "  %-50s %4d %12.2f %12.2f\n", $4, $3, $1, $2 }' \
+    >> "${OUTPUT_FILE}"
 }
 
+# api_statistic.csv columns:
+#   Device_id,Level,API Name,Time(us),Count,Avg(us),Min(us),Max(us),Variance
 extract_api_stat() {
     local label="$1"
     local parse_dir="$2"
-    local csv_file="${parse_dir}/ASCEND_PROFILER_OUTPUT/api_statistic.csv"
+    local csv="${parse_dir}/ASCEND_PROFILER_OUTPUT/api_statistic.csv"
 
-    if [ ! -f "${csv_file}" ]; then
+    if [ ! -f "${csv}" ]; then
         echo "[${label}] api_statistic.csv not found" >> "${OUTPUT_FILE}"
         return
     fi
 
-    echo "" >> "${OUTPUT_FILE}"
-    echo "[${label}] API call statistics (by total time)" >> "${OUTPUT_FILE}"
-    echo "  ---------------------------------------------------------------------------" >> "${OUTPUT_FILE}"
     {
-        head -1 "${csv_file}"
-        tail -n +2 "${csv_file}"
-    } | awk -F',' '
+        echo ""
+        echo "[${label}] Host API statistics (top 15 by total time)"
+        echo "  source: ${csv}"
+        echo "  --------------------------------------------------------------------------"
+        printf "  %-45s %6s %14s %10s\n" "API Name" "Count" "Total(us)" "Avg(us)"
+    } >> "${OUTPUT_FILE}"
+
+    awk -F',' '
     NR==1 {
-        for(i=1;i<=NF;i++) { col[$i]=i }
-        printf "  %-50s %8s %10s %10s\n", "API Name", "Count", "Total(us)", "Avg(us)"
+        for (i=1; i<=NF; i++) {
+            v=$i; gsub(/^[ \t\r]+|[ \t\r]+$/, "", v); col[v]=i
+        }
+        nameC=col["API Name"]; totC=col["Time(us)"]; cntC=col["Count"]; avgC=col["Avg(us)"]
         next
     }
     {
-        name=$col["API Name"]; cnt=$col["Count"]; total=$col["Time(us)"]; avg=$col["Avg(us)"]
-        gsub(/^[ \t]+|[ \t]+$/, "", name)
-        if (total+0 > 0) printf "  %-50s %8s %10s %10s\n", name, cnt, total, avg
-    }' 2>/dev/null | sort -t$'\t' -k3 -rn | head -20 >> "${OUTPUT_FILE}"
+        name=$nameC; tot=$totC; cnt=$cntC; avg=$avgC
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", name)
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", tot)
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", cnt)
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", avg)
+        if (name == "" || (tot + 0) <= 0) next
+        printf "%.3f\t%d\t%.3f\t%s\n", tot+0, cnt+0, avg+0, name
+    }' "${csv}" \
+    | sort -t$'\t' -k1 -rn \
+    | head -15 \
+    | awk -F'\t' '{ printf "  %-45s %6d %14.2f %10.2f\n", $4, $2, $1, $3 }' \
+    >> "${OUTPUT_FILE}"
 }
 
-extract_aicore_summary() {
+# step_trace_time.csv columns:
+#   Step,Computing,Communication(Not Overlapped),Overlapped,Communication,Free,...
+extract_step_trace() {
     local label="$1"
     local parse_dir="$2"
-    local db_file
+    local csv="${parse_dir}/ASCEND_PROFILER_OUTPUT/step_trace_time.csv"
 
-    db_file=$(find "${parse_dir}" -name "time.db" -path "*/sqlite/*" 2>/dev/null | head -1)
-    if [ -z "${db_file}" ]; then
-        echo "[${label}] time.db not found" >> "${OUTPUT_FILE}"
-        return
-    fi
+    if [ ! -f "${csv}" ]; then return; fi
 
-    echo "" >> "${OUTPUT_FILE}"
-    echo "[${label}] AICore hardware metrics (time.db)" >> "${OUTPUT_FILE}"
+    {
+        echo ""
+        echo "[${label}] Step-level timing (step_trace_time.csv)"
+        echo "  --------------------------------------------------------------------------"
+    } >> "${OUTPUT_FILE}"
 
-    sqlite3 "${db_file}" "
-        SELECT '  Model ID: ' || model_id, '  Task count: ' || count(*), '  Total time(us): ' || sum(task_time)
-        FROM task_time_info
-        GROUP BY model_id;
-    " 2>/dev/null >> "${OUTPUT_FILE}" || echo "  (sqlite query failed)" >> "${OUTPUT_FILE}"
+    awk -F',' 'NR>1 {
+        c=$2; f=$6
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", c)
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", f)
+        if ((c + 0) > 0) {
+            cnt++
+            csum += c
+            fsum += f
+        }
+    }
+    END {
+        if (cnt > 0)
+            printf "  Active steps: %d   avg computing=%.2f ms/step   avg free=%.2f ms/step\n",
+                   cnt, csum/cnt/1000, fsum/cnt/1000
+    }' "${csv}" >> "${OUTPUT_FILE}"
 }
 
-extract_op_range() {
-    local label="$1"
-    local parse_dir="$2"
-    local op_file="${parse_dir}/FRAMEWORK/mindspore.op_range"
+# msprof per-kernel: ${MSPROF_DIR}/<kernel>/OPPROF_*/{OpBasicInfo,PipeUtilization,...}.csv
+# Returns list of "kernel_subdir<TAB>opprof_dir" pairs on stdout.
+list_msprof_runs() {
+    local base="$1"
+    [ -d "${base}" ] || return
 
-    if [ ! -f "${op_file}" ]; then
-        echo "[${label}] mindspore.op_range not found" >> "${OUTPUT_FILE}"
-        return
-    fi
-
-    echo "" >> "${OUTPUT_FILE}"
-    echo "[${label}] MindSpore operator timing range (op_range)" >> "${OUTPUT_FILE}"
-    echo "  ---------------------------------------------------------------------------" >> "${OUTPUT_FILE}"
-    { grep -iE "sparse|lightning|indexer|gather|scatter|teacher|kl_loss|grad|loss" "${op_file}" 2>/dev/null || true; } | head -30 >> "${OUTPUT_FILE}"
-}
-
-extract_logs() {
-    local label="$1"
-    local parse_dir="$2"
-
-    echo "" >> "${OUTPUT_FILE}"
-    echo "[${label}] Key log messages" >> "${OUTPUT_FILE}"
-    echo "  ---------------------------------------------------------------------------" >> "${OUTPUT_FILE}"
-
-    for f in "${parse_dir}"/logs/profiler_*.log; do
-        [ -f "${f}" ] || continue
-        echo "  --- ${f} ---" >> "${OUTPUT_FILE}"
-        grep -iE "error|warning|sparse|lightning|indexer|OOM|memory|allocat" "${f}" 2>/dev/null | head -20 >> "${OUTPUT_FILE}" || true
+    find "${base}" -mindepth 2 -maxdepth 2 -type d -name "OPPROF_*" 2>/dev/null | sort \
+    | while read -r d; do
+        # parent of OPPROF_* is the kernel subdir
+        printf "%s\t%s\n" "$(basename "$(dirname "${d}")")" "${d}"
     done
 }
 
-section "Sparse operator (sparse_lightning_indexer_grad_kl_loss) profiling full text report"
-echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')" >> "${OUTPUT_FILE}"
+# OpBasicInfo.csv columns:
+#   Op Name,Op Type,Task Duration(us),Block Dim,Mix Block Dim,Device Id,...
+extract_msprof_basic() {
+    local opprof="$1"
+    local csv="${opprof}/OpBasicInfo.csv"
+    [ -f "${csv}" ] || return
 
-# ---- Part 1: Triton full profiling ----
-section "Part 1: Triton full profiling (perf script)"
+    awk -F',' 'NR>1 {
+        name=$1; type=$2; dur=$3; blk=$4; mix=$5
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", name)
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", type)
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", dur)
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", blk)
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", mix)
+        if (name == "" || (dur + 0) <= 0) next
+        printf "%s\t%s\t%.3f\t%s\t%s\n", name, type, dur+0, blk, mix
+    }' "${csv}"
+}
+
+# Average a column (by header name) across all data rows of a CSV.
+# Empty / NA / non-numeric cells are skipped. Optional `scale` multiplier
+# (defaults to 1.0) is applied to the final mean — pass 100 to render
+# 0-1 ratios as percentages.
+csv_avg_col() {
+    local csv="$1"
+    local colname="$2"
+    local scale="${3:-1}"
+    [ -f "${csv}" ] || { echo "-"; return; }
+    awk -F',' -v want="${colname}" -v scale="${scale}" '
+    NR==1 {
+        for (i=1; i<=NF; i++) {
+            v=$i; gsub(/^[ \t\r]+|[ \t\r]+$/, "", v)
+            if (v == want) { ci = i; break }
+        }
+        if (!ci) { print "-"; exit }
+        next
+    }
+    {
+        v=$ci; gsub(/^[ \t\r]+|[ \t\r]+$/, "", v)
+        if (v == "" || v == "NA") next
+        if (v ~ /^-?[0-9.]+([eE][+-]?[0-9]+)?$/) { s += v + 0; n++ }
+    }
+    END {
+        if (n > 0) printf "%.2f", (s/n) * scale
+        else        print "-"
+    }' "${csv}"
+}
+
+
+########################################################################
+# Body
+########################################################################
+
+section "Sparse operator profiling report"
+echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')" >> "${OUTPUT_FILE}"
+echo "TRITON_DIR=${TRITON_DIR}"  >> "${OUTPUT_FILE}"
+echo "CANN_DIR=${CANN_DIR}"      >> "${OUTPUT_FILE}"
+echo "MSPROF_DIR=${MSPROF_DIR}"  >> "${OUTPUT_FILE}"
+
+# --- Part 1: Triton (perf script) -------------------------------------
+section "Part 1: Triton end-to-end profiling (profile_sparse.sh triton)"
 TRITON_PARSE=$(latest_parse_dir "${TRITON_DIR}")
 if [ -n "${TRITON_PARSE}" ]; then
-    extract_kernel_summary "triton_full" "${TRITON_PARSE}"
-    extract_api_stat "triton_full" "${TRITON_PARSE}"
-    extract_aicore_summary "triton_full" "${TRITON_PARSE}"
-    extract_op_range "triton_full" "${TRITON_PARSE}"
-    extract_logs "triton_full" "${TRITON_PARSE}"
-
-    st_csv="${TRITON_PARSE}/ASCEND_PROFILER_OUTPUT/step_trace_time.csv"
-    if [ -f "${st_csv}" ]; then
-        echo "" >> "${OUTPUT_FILE}"
-        echo "[triton_full] Step-level timing (step_trace_time.csv)" >> "${OUTPUT_FILE}"
-        echo "  ---------------------------------------------------------------------------" >> "${OUTPUT_FILE}"
-        tail -n +2 "${st_csv}" | awk -F',' '{
-            computing=$2
-            gsub(/^[ \t\r]+|[ \t\r]+$/, "", computing)
-            if (computing+0 > 0) { cnt++; sum += computing }
-        }
-        END {
-            if (cnt > 0) printf "  Active steps: %d, avg computing=%.1f ms/step\n", cnt, sum/cnt/1000
-        }' >> "${OUTPUT_FILE}"
-    fi
+    extract_kernel_details "triton" "${TRITON_PARSE}"
+    extract_step_trace     "triton" "${TRITON_PARSE}"
 else
     echo "(no triton profiling data in ${TRITON_DIR})" >> "${OUTPUT_FILE}"
 fi
 
-# ---- Part 2: CANN full profiling ----
-section "Part 2: CANN full profiling (perf script)"
+# --- Part 2: CANN (perf script) ---------------------------------------
+section "Part 2: CANN end-to-end profiling (profile_sparse.sh cann)"
 CANN_PARSE=$(latest_parse_dir "${CANN_DIR}")
 if [ -n "${CANN_PARSE}" ]; then
-    extract_kernel_summary "cann_full" "${CANN_PARSE}"
-    extract_api_stat "cann_full" "${CANN_PARSE}"
-    extract_aicore_summary "cann_full" "${CANN_PARSE}"
-    extract_op_range "cann_full" "${CANN_PARSE}"
-    extract_logs "cann_full" "${CANN_PARSE}"
-
-    st_csv="${CANN_PARSE}/ASCEND_PROFILER_OUTPUT/step_trace_time.csv"
-    if [ -f "${st_csv}" ]; then
-        echo "" >> "${OUTPUT_FILE}"
-        echo "[cann_full] Step-level timing (step_trace_time.csv)" >> "${OUTPUT_FILE}"
-        echo "  ---------------------------------------------------------------------------" >> "${OUTPUT_FILE}"
-        tail -n +2 "${st_csv}" | awk -F',' '{
-            computing=$2
-            gsub(/^[ \t\r]+|[ \t\r]+$/, "", computing)
-            if (computing+0 > 0) { cnt++; sum += computing }
-        }
-        END {
-            if (cnt > 0) printf "  Active steps: %d, avg computing=%.1f ms/step\n", cnt, sum/cnt/1000
-        }' >> "${OUTPUT_FILE}"
-    fi
+    extract_kernel_details "cann" "${CANN_PARSE}"
+    extract_step_trace     "cann" "${CANN_PARSE}"
 else
     echo "(no CANN profiling data in ${CANN_DIR})" >> "${OUTPUT_FILE}"
 fi
 
-# ---- Part 3: msprof per-kernel detailed profiling ----
-section "Part 3: msprof per-kernel profiling (msprof op, 5 kernels)"
-MSPROF_OPPROF_DIR=$(find "${MSPROF_DIR}" -maxdepth 2 -type d -name "OPPROF_*" 2>/dev/null | head -1)
-if [ -n "${MSPROF_OPPROF_DIR}" ]; then
-    echo "[msprof] Data directory: ${MSPROF_OPPROF_DIR}" >> "${OUTPUT_FILE}"
+# --- Part 3: side-by-side timing --------------------------------------
+section "Part 3: Triton vs CANN side-by-side"
+{
+    echo "  Production shape: B=1, S1/S2=4096, N1=64, D=512, Nidx1=64, D_idx=128, topK=2048"
+    echo "  (active steps from step_trace_time.csv; chunk = SPARSE_GRAD_S1_CHUNK split of S1)"
+    echo "  -------------------------------------------------------------------------------"
+    printf "  %-10s %16s %16s %16s\n" "side" "active steps" "avg comp(ms)" "avg free(ms)"
+} >> "${OUTPUT_FILE}"
 
-    # 收集所有 kernel 的 OpBasicInfo
-    echo "" >> "${OUTPUT_FILE}"
-    echo "[msprof] Per-kernel timing (OpBasicInfo, avg over all instances)" >> "${OUTPUT_FILE}"
-    echo "  ---------------------------------------------------------------" >> "${OUTPUT_FILE}"
-    printf "  %-45s %12s %10s %8s %6s\n" "Kernel Name" "AvgDur(us)" "Block Dim" "Type" "N" >> "${OUTPUT_FILE}"
-
-    {
-        for csv in $(find "${MSPROF_OPPROF_DIR}" -name "OpBasicInfo_*.csv" -type f 2>/dev/null | sort); do
-            tail -1 "${csv}"
-        done
-    } | awk -F',' '
-    {
-        name=$1; type=$2; dur=$3; blk=$4
-        gsub(/^[ \t]+|[ \t]+$/, "", name)
-        gsub(/^[ \t]+|[ \t]+$/, "", dur)
-        gsub(/^[ \t]+|[ \t]+$/, "", blk)
-        gsub(/^[ \t]+|[ \t]+$/, "", type)
-        dur_num = dur + 0
-        if (dur_num <= 0) next
-        sum[name] += dur_num
-        cnt[name]++
-        blkdim[name] = blk
-        typeinfo[name] = type
+print_step_row() {
+    local label="$1"
+    local parse_dir="$2"
+    local csv="${parse_dir}/ASCEND_PROFILER_OUTPUT/step_trace_time.csv"
+    [ -f "${csv}" ] || { printf "  %-10s %16s %16s %16s\n" "${label}" "-" "-" "-" >> "${OUTPUT_FILE}"; return; }
+    awk -F',' -v lab="${label}" 'NR>1 {
+        c=$2; f=$6
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", c)
+        gsub(/^[ \t\r]+|[ \t\r]+$/, "", f)
+        if ((c + 0) > 0) { cnt++; csum += c; fsum += f }
     }
     END {
-        for (name in sum) {
-            avg = sum[name] / cnt[name]
-            printf "  %-45s %12.2f %10s %8s %6d\n", name, avg, blkdim[name], typeinfo[name], cnt[name]
-        }
-    }' >> "${OUTPUT_FILE}"
+        if (cnt > 0)
+            printf "  %-10s %16d %16.2f %16.2f\n", lab, cnt, csum/cnt/1000, fsum/cnt/1000
+        else
+            printf "  %-10s %16s %16s %16s\n", lab, "-", "-", "-"
+    }' "${csv}" >> "${OUTPUT_FILE}"
+}
+[ -n "${TRITON_PARSE}" ] && print_step_row "triton" "${TRITON_PARSE}"
+[ -n "${CANN_PARSE}"   ] && print_step_row "cann"   "${CANN_PARSE}"
 
-    # 汇总
-    echo "" >> "${OUTPUT_FILE}"
-    echo "[msprof] Kernel stage breakdown (single launch, per-chunk)" >> "${OUTPUT_FILE}"
-    echo "  ---------------------------------------------------------------" >> "${OUTPUT_FILE}"
+# --- Part 4: host-side API statistics ---------------------------------
+section "Part 4: Host-side API statistics"
+[ -n "${TRITON_PARSE}" ] && extract_api_stat "triton" "${TRITON_PARSE}"
+[ -n "${CANN_PARSE}"   ] && extract_api_stat "cann"   "${CANN_PARSE}"
+
+# --- Part 5: msprof per-kernel ----------------------------------------
+section "Part 5: msprof per-kernel profiling (profile_sparse_detail.sh)"
+
+MSPROF_RUNS=$(list_msprof_runs "${MSPROF_DIR}")
+if [ -z "${MSPROF_RUNS}" ]; then
+    echo "(no msprof op data under ${MSPROF_DIR})" >> "${OUTPUT_FILE}"
+else
     {
-        for csv in $(find "${MSPROF_OPPROF_DIR}" -name "OpBasicInfo_*.csv" -type f 2>/dev/null | sort); do
-            tail -1 "${csv}"
-        done
-    } | awk -F',' '
-    {
-        name=$1; dur=$3
-        gsub(/^[ \t]+|[ \t]+$/, "", name)
-        gsub(/^[ \t]+|[ \t]+$/, "", dur)
-        dur_num = dur + 0
-        if (dur_num <= 0) next
-        if (name ~ /gather_kv/)       { gs += dur_num; gc++ }
-        else if (name ~ /teacher/)    { ts += dur_num; tc++ }
-        else if (name ~ /indexer/)    { is += dur_num; ic++ }
-        else if (name ~ /query_index/){ qs += dur_num; qc++ }
-        else if (name ~ /scatter/)    { ss += dur_num; sc++ }
-    }
-    END {
-        if (gc > 0) ga = gs / gc; if (tc > 0) ta = ts / tc
-        if (ic > 0) ia = is / ic; if (qc > 0) qa = qs / qc
-        if (sc > 0) sa = ss / sc
-        sum_avg = ga + ta + ia + qa + sa
-        if (sum_avg <= 0) exit
-        printf "  %-35s %8.1f us  (%5.1f%%)\n", "gather_kv", ga, ga*100/sum_avg
-        if (tc > 0) printf "  %-35s %8.1f us  (%5.1f%%)\n", "teacher_dist", ta, ta*100/sum_avg
-        else         printf "  %-35s %8s  (not captured)\n", "teacher_dist", "-"
-        printf "  %-35s %8.1f us  (%5.1f%%)\n", "indexer_grad_kl", ia, ia*100/sum_avg
-        printf "  %-35s %8.1f us  (%5.1f%%)\n", "query_index_weight", qa, qa*100/sum_avg
-        printf "  %-35s %8.1f us  (%5.1f%%)\n", "scatter_dkey", sa, sa*100/sum_avg
-        printf "  %-35s %8.1f us\n", "--- per-chunk avg ---", sum_avg
-    }' >> "${OUTPUT_FILE}"
+        echo "[msprof] Per-kernel basic info (one msprof op run per kernel)"
+        echo "  ------------------------------------------------------------------------------------------"
+        printf "  %-45s %8s %12s %10s %10s\n" "Op Name" "Type" "Dur(us)" "BlockDim" "MixBlk"
+    } >> "${OUTPUT_FILE}"
 
-    # 硬件指标（每个 kernel 的 PipeUtilization / ArithmeticUtilization）
-    for csv in $(find "${MSPROF_OPPROF_DIR}" -name "OpBasicInfo_*.csv" -type f 2>/dev/null | sort); do
-        kdir=$(dirname "${csv}")
-        kname=$(basename "${kdir}")
-        echo "" >> "${OUTPUT_FILE}"
-        echo "[msprof] ${kname} hardware metrics" >> "${OUTPUT_FILE}"
-
-        for metric in PipeUtilization ArithmeticUtilization MemoryUB Memory L2Cache; do
-            mfile="${kdir}/${metric}_*.csv"
-            mfile=$(ls ${mfile} 2>/dev/null | head -1)
-            if [ -f "${mfile}" ]; then
-                echo "  --- ${metric} (first 2 rows) ---" >> "${OUTPUT_FILE}"
-                head -2 "${mfile}" | awk -F',' '{printf "    "; for(i=1;i<=NF;i++) printf "%s%s", $i, (i==NF?"\n":" | ")}' >> "${OUTPUT_FILE}" 2>/dev/null || true
-            fi
+    # collect basic rows so we can also use them for the summary section
+    BASIC_TSV=$(mktemp)
+    printf "%s\n" "${MSPROF_RUNS}" | while IFS=$'\t' read -r sub opprof; do
+        extract_msprof_basic "${opprof}" | while IFS=$'\t' read -r name type dur blk mix; do
+            printf "%s\t%s\t%s\t%s\t%s\n" "${name}" "${type}" "${dur}" "${blk}" "${mix}" >> "${BASIC_TSV}"
+            printf "  %-45s %8s %12.2f %10s %10s\n" "${name}" "${type}" "${dur}" "${blk}" "${mix}" >> "${OUTPUT_FILE}"
         done
     done
-else
-    echo "(no msprof op data in ${MSPROF_DIR})" >> "${OUTPUT_FILE}"
-fi
 
-# ---- Part 4: triton vs CANN time comparison ----
-section "Part 4: Triton vs CANN timing comparison"
-echo "  (from perf_sli_grad_kl_loss_triton.py standard output)" >> "${OUTPUT_FILE}"
-echo "  Production shape: B=1, S1/S2=4096, N1=64, D=512, Nidx1=64, D_idx=128, topK=2048" >> "${OUTPUT_FILE}"
-
-# ---- Part 5: summary statistics ----
-section "Part 5: Summary statistics"
-echo "  Triton kernel stage breakdown:" >> "${OUTPUT_FILE}"
-
-if [ -n "${MSPROF_OPPROF_DIR}" ]; then
-    echo "  (from msprof op per-kernel profiling, avg over all instances)" >> "${OUTPUT_FILE}"
-    echo "" >> "${OUTPUT_FILE}"
-    find "${MSPROF_OPPROF_DIR}" -name "OpBasicInfo_*.csv" -type f 2>/dev/null | sort | while read -r csv; do
-        tail -1 "${csv}"
-    done | awk -F',' '
+    # per-kernel hardware metrics (avg ratios across all blocks)
     {
-        name=$1; dur=$3
-        gsub(/^[ \t]+|[ \t]+$/, "", name)
-        gsub(/^[ \t]+|[ \t]+$/, "", dur)
-        dur_num = dur + 0
-        if (dur_num <= 0) next
+        echo ""
+        echo "[msprof] Per-kernel hardware utilization (avg over all blocks)"
+        echo "  ------------------------------------------------------------------------------------------"
+        printf "  %-42s %8s %8s %8s %8s %8s %8s %8s\n" \
+            "Op Name" "cube%" "aic_sca%" "aic_mte2%" "vec%" "aiv_sca%" "aiv_mte2%" "aiv_mte3%"
+    } >> "${OUTPUT_FILE}"
 
-        if (name ~ /gather_kv/)            { gs += dur_num; gc++ }
-        else if (name ~ /teacher/)         { ts += dur_num; tc++ }
-        else if (name ~ /indexer/)         { is += dur_num; ic++ }
-        else if (name ~ /query_index/)     { qs += dur_num; qc++ }
-        else if (name ~ /scatter/)         { ss += dur_num; sc++ }
-        total_instances++
+    printf "%s\n" "${MSPROF_RUNS}" | while IFS=$'\t' read -r sub opprof; do
+        pipe="${opprof}/PipeUtilization.csv"
+        [ -f "${pipe}" ] || continue
+        # bare kernel name from OpBasicInfo
+        kname=$(awk -F',' 'NR==2 {gsub(/^[ \t\r]+|[ \t\r]+$/, "", $1); print $1}' "${opprof}/OpBasicInfo.csv")
+        [ -z "${kname}" ] && kname="${sub}"
+        # ratios are stored as 0-1 fractions, multiply by 100 for percent display
+        cube=$(csv_avg_col   "${pipe}" "aic_cube_ratio"    100)
+        ascal=$(csv_avg_col  "${pipe}" "aic_scalar_ratio"  100)
+        amte2=$(csv_avg_col  "${pipe}" "aic_mte2_ratio"    100)
+        vec=$(csv_avg_col    "${pipe}" "aiv_vec_ratio"     100)
+        vscal=$(csv_avg_col  "${pipe}" "aiv_scalar_ratio"  100)
+        vmte2=$(csv_avg_col  "${pipe}" "aiv_mte2_ratio"    100)
+        vmte3=$(csv_avg_col  "${pipe}" "aiv_mte3_ratio"    100)
+        printf "  %-42s %8s %8s %8s %8s %8s %8s %8s\n" \
+            "${kname}" "${cube}" "${ascal}" "${amte2}" \
+            "${vec}" "${vscal}" "${vmte2}" "${vmte3}" >> "${OUTPUT_FILE}"
+    done
+
+    # arithmetic / memory snapshots
+    {
+        echo ""
+        echo "[msprof] Per-kernel memory / arithmetic snapshots (avg over data rows)"
+        echo "  ------------------------------------------------------------------------------------------"
+        printf "  %-42s %14s %14s %14s\n" "Op Name" "aiv_fops/blk" "ub_read_bw" "l2_read_hit%"
+    } >> "${OUTPUT_FILE}"
+
+    printf "%s\n" "${MSPROF_RUNS}" | while IFS=$'\t' read -r sub opprof; do
+        arith="${opprof}/ArithmeticUtilization.csv"
+        ub="${opprof}/MemoryUB.csv"
+        l2="${opprof}/L2Cache.csv"
+        kname=$(awk -F',' 'NR==2 {gsub(/^[ \t\r]+|[ \t\r]+$/, "", $1); print $1}' "${opprof}/OpBasicInfo.csv")
+        [ -z "${kname}" ] && kname="${sub}"
+        fops=$(csv_avg_col "${arith}" "aiv_vec_fops")
+        ubbw=$(csv_avg_col "${ub}"    "aiv_ub_read_bw_vector(GB/s)")
+        if [ "${ubbw}" = "-" ]; then
+            ubbw=$(csv_avg_col "${ub}" "aiv_ub_read_bw(GB/s)")
+        fi
+        l2hit=$(csv_avg_col "${l2}"   "aiv_read_hit_rate(%)")
+        printf "  %-42s %14s %14s %14s\n" "${kname}" "${fops}" "${ubbw}" "${l2hit}" >> "${OUTPUT_FILE}"
+    done
+
+    # --- Part 6: summary ----------------------------------------------
+    section "Part 6: Summary"
+    {
+        echo "  Per-chunk stage breakdown (msprof single-launch duration per kernel)"
+        echo "  -------------------------------------------------------------------"
+    } >> "${OUTPUT_FILE}"
+
+    # categorise kernels into 5 logical stages by name substring match
+    awk -F'\t' '
+    function tag(n) {
+        if (n ~ /gather_kv/)        return "gather_kv"
+        if (n ~ /teacher/)          return "teacher_dist"
+        if (n ~ /indexer_grad_kl/)  return "indexer_grad_kl"
+        if (n ~ /query_index/)      return "query_idx_weight"
+        if (n ~ /scatter_dkey/)     return "scatter_dkey"
+        return ""
+    }
+    {
+        t = tag($1)
+        if (t == "") next
+        sum[t] += $3
+        cnt[t]++
+        name[t] = $1
     }
     END {
-        if (gc > 0) ga = gs / gc; if (tc > 0) ta = ts / tc
-        if (ic > 0) ia = is / ic; if (qc > 0) qa = qs / qc
-        if (sc > 0) sa = ss / sc
-        sum_avg = ga + ta + ia + qa + sa
-        if (sum_avg <= 0) exit
-        if (gc > 0) printf "  gather_kv:          %8.1f us  (%5.1f%%)  n=%d\n", ga, ga*100/sum_avg, gc
-        if (tc > 0) printf "  teacher_dist:       %8.1f us  (%5.1f%%)  n=%d\n", ta, ta*100/sum_avg, tc
-        else         printf "  teacher_dist:       (not captured)\n"
-        if (ic > 0) printf "  indexer_grad_kl:    %8.1f us  (%5.1f%%)  n=%d\n", ia, ia*100/sum_avg, ic
-        if (qc > 0) printf "  query_idx_weight:   %8.1f us  (%5.1f%%)  n=%d\n", qa, qa*100/sum_avg, qc
-        if (sc > 0) printf "  scatter_dkey:       %8.1f us  (%5.1f%%)  n=%d\n", sa, sa*100/sum_avg, sc
-        printf "  --- per-chunk avg:  %8.1f us  (single launch)\n", sum_avg
-        printf "  --- 4 chunks est:   %8.1f ms  (NPU-only, per-chunk avg × 4)\n", sum_avg*4/1000
-        printf "  instances: %d  (1 row per kernel launch)\n", total_instances
-    }' >> "${OUTPUT_FILE}"
-
-else
-    echo "  (from kernel_details.csv, no msprof data)" >> "${OUTPUT_FILE}"
-    kd="${TRITON_PARSE}/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
-    if [ -f "${kd}" ]; then
-        echo "" >> "${OUTPUT_FILE}"
-        { grep -iE "sparse|lightning|indexer|gather|scatter|teacher|kl_loss|grad|loss" "${kd}" 2>/dev/null || true; } | \
-        awk -F',' '{
-            name=$5; dur=$10
-            gsub(/^[ \t\r]+|[ \t\r]+$/, "", name)
-            gsub(/^[ \t\r]+|[ \t\r]+$/, "", dur)
-            dur_num = dur + 0
-            name_lower = tolower(name)
-            if (dur_num > 0) {
-                if (name_lower ~ /gather_kv/) total_gather += dur_num
-                else if (name_lower ~ /teacher/) total_teacher += dur_num
-                else if (name_lower ~ /scatter_dkey/) total_scatter += dur_num
-                else if (name_lower ~ /query_index_weight/) total_qw += dur_num
-                else if (name_lower ~ /indexer_grad_kl/) total_main += dur_num
-                else if (name_lower ~ /cast_dkey/) total_cast += dur_num
-                else total_other += dur_num
-                total_all += dur_num
+        order[1]="gather_kv"; order[2]="teacher_dist"; order[3]="indexer_grad_kl"
+        order[4]="query_idx_weight"; order[5]="scatter_dkey"
+        total = 0
+        for (i=1; i<=5; i++) if (cnt[order[i]] > 0) total += sum[order[i]]/cnt[order[i]]
+        if (total <= 0) { print "  (no kernels matched)"; exit }
+        for (i=1; i<=5; i++) {
+            t = order[i]
+            if (cnt[t] > 0) {
+                avg = sum[t]/cnt[t]
+                printf "  %-22s %10.2f us  (%5.1f%%)  n=%d  name=%s\n",
+                       t, avg, avg*100/total, cnt[t], name[t]
+            } else {
+                printf "  %-22s %10s  (not captured)\n", t, "-"
             }
         }
-        END {
-            if (total_all > 0) {
-                printf "  gather_kv:          %10.1f ms  (%5.1f%%)\n", total_gather/1000, total_gather*100/total_all
-                printf "  teacher_dist:       %10.1f ms  (%5.1f%%)\n", total_teacher/1000, total_teacher*100/total_all
-                printf "  indexer_grad:       %10.1f ms  (%5.1f%%)\n", total_main/1000, total_main*100/total_all
-                printf "  scatter_dkey:       %10.1f ms  (%5.1f%%)\n", total_scatter/1000, total_scatter*100/total_all
-                printf "  query_idx_weight:   %10.1f ms  (%5.1f%%)\n", total_qw/1000, total_qw*100/total_all
-                printf "  cast_dkey:          %10.1f ms  (%5.1f%%)\n", total_cast/1000, total_cast*100/total_all
-                printf "  other:              %10.1f ms  (%5.1f%%)\n", total_other/1000, total_other*100/total_all
-                printf "  TOTAL:              %10.1f ms\n", total_all/1000
+        printf "  %-22s %10.2f us\n", "PER-CHUNK SUM", total
+        printf "  %-22s %10.2f ms  (per-chunk sum x 4 chunks @ S1=4096)\n",
+               "EST 4-CHUNK NPU-TIME", total*4/1000
+    }' "${BASIC_TSV}" >> "${OUTPUT_FILE}"
+
+    # End-to-end comparison (using kernel_details totals from Part 1/2)
+    if [ -n "${TRITON_PARSE}" ] && [ -n "${CANN_PARSE}" ]; then
+        {
+            echo ""
+            echo "  End-to-end NPU time (sum of kernel Duration(us) per active step)"
+            echo "  -------------------------------------------------------------------"
+        } >> "${OUTPUT_FILE}"
+
+        for label in triton cann; do
+            if [ "${label}" = "triton" ]; then csv="${TRITON_PARSE}/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
+            else                                csv="${CANN_PARSE}/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
+            fi
+            [ -f "${csv}" ] || continue
+            awk -F',' -v lab="${label}" '
+            NR==1 {
+                for (i=1; i<=NF; i++) { v=$i; gsub(/^[ \t\r]+|[ \t\r]+$/, "", v); col[v]=i }
+                durC=col["Duration(us)"]; stepC=col["Step ID"]
+                next
             }
-        }' >> "${OUTPUT_FILE}"
+            {
+                d=$durC; s=$stepC
+                gsub(/^[ \t\r]+|[ \t\r]+$/, "", d)
+                gsub(/^[ \t\r]+|[ \t\r]+$/, "", s)
+                if ((d + 0) > 0) {
+                    total += d + 0
+                    if (s != "") { steps[s]=1; per_step[s] += d + 0 }
+                }
+            }
+            END {
+                sn = 0; for (k in steps) sn++
+                if (sn == 0) sn = 1
+                printf "  %-10s sum=%10.2f ms   steps=%d   avg/step=%10.2f ms\n",
+                       lab, total/1000, sn, total/sn/1000
+            }' "${csv}" >> "${OUTPUT_FILE}"
+        done
     fi
+
+    rm -f "${BASIC_TSV}"
 fi
 
 echo "" >> "${OUTPUT_FILE}"

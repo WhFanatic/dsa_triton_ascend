@@ -1,13 +1,14 @@
 #!/bin/bash
 # ============================================================================
-# Sparse operator Triton detailed profiling (msprof op) - all-kernel mode
+# Sparse operator Triton detailed profiling (msprof op) - per-kernel mode
 #
 # Usage: ./script/profile_sparse_detail.sh [device_id] [output_dir]
 #
-# Uses --kernel-name="prefix1|prefix2|..." to capture all 5 triton computation
-# kernels in a single msprof op run.
+# 每个 kernel 单独跑一次 msprof op，结果落到 ${OUT_DIR}/<kernel>/ 子目录，
+# 避免共享 OPPROF 输出时的合并语义影响（不同 kernel 的 PipeUtilization 等
+# CSV 不会再被混在同一份里）。
 #
-# Output: ${OUT_DIR}/OPPROF_*/
+# Output: ${OUT_DIR}/<kernel>/OPPROF_*/
 #   OpBasicInfo.csv           -- kernel name / duration / block dim
 #   PipeUtilization.csv       -- pipeline utilization
 #   ArithmeticUtilization.csv -- arithmetic utilization
@@ -30,38 +31,38 @@ export SPARSE_GRAD_PROFILE_MARKERS=1
 
 KERNEL_ONLY_SCRIPT="perf_sli_grad_kl_loss_triton.py"
 
+# 要分别采集的 kernel 前缀（msprof op --kernel-name 接受 |，但这里每个独立跑）
+KERNELS=(
+    "_gather_kv_kernel"
+    "_teacher_distribution"
+    "_indexer_grad_kl_loss"
+    "_query_index_weight_grad"
+    "_scatter_dkey_index"
+)
+
 echo "================================================"
-echo "Sparse Operator All-Kernel Profiling"
+echo "Sparse Operator Per-Kernel Profiling"
 echo "NPU device: ${DEVICE_ID}"
 echo "Output dir: ${OUT_DIR}"
+echo "Kernels   : ${#KERNELS[@]}"
 echo "================================================"
 
 rm -rf "${OUT_DIR}" ./my_triton_cache
 mkdir -p "${OUT_DIR}"
 
-echo ""
-echo ">>> Profiling 5 kernels in one pass ..."
+for kernel in "${KERNELS[@]}"; do
+    SUB_OUT="${OUT_DIR}/${kernel}"
+    mkdir -p "${SUB_OUT}"
 
-# --kernel-name 支持 | 拼接多个前缀，一次采集全部 5 个 kernel
-# --launch-count=50 采集每个 kernel 前 50 次 launch（10次slis × 4chunks = 40次 + 余量）
-msprof op --output="${OUT_DIR}" \
-    --kernel-name="_gather_kv_kernel|_teacher_distribution|_indexer_grad_kl_loss|_query_index_weight_grad|_scatter_dkey_index" \
-    --launch-count=50 \
-    python "${KERNEL_ONLY_SCRIPT}" --kernel-only
+    echo ""
+    echo ">>> [${kernel}] profiling ..."
 
-# 解析结果
-OPPROF_DIR=$(find "${OUT_DIR}" -maxdepth 1 -type d -name "OPPROF_*" 2>/dev/null | head -1)
-if [ -z "${OPPROF_DIR}" ]; then
-    echo "FAILED: no OPPROF data"
-    exit 1
-fi
+    msprof op --output="${SUB_OUT}" \
+        --kernel-name="${kernel}" \
+        python "${KERNEL_ONLY_SCRIPT}" --kernel-only
+done
 
-CSV="${OPPROF_DIR}/OpBasicInfo.csv"
-if [ ! -f "${CSV}" ]; then
-    echo "FAILED: no OpBasicInfo.csv"
-    exit 1
-fi
-
+# 解析结果：遍历每个 kernel 子目录下的 OPPROF_*/OpBasicInfo.csv
 echo ""
 echo "================================================"
 echo "  Per-Kernel Profiling Summary"
@@ -69,34 +70,57 @@ echo "================================================"
 printf "  %-40s %10s %10s\n" "kernel" "duration(us)" "block_dim"
 printf "  %-40s %10s %10s\n" "----------------------------------------" "----------" "----------"
 
-# 解析 csv：跳过 marker/framework kernel，聚合同名 kernel 取平均
-awk -F',' '
-NR>1 {
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3)
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $4)
+TOTAL_AVG_FILE=$(mktemp)
 
-    name = $1
-    dur  = $3 + 0
-    blk  = $4
+for kernel in "${KERNELS[@]}"; do
+    SUB_OUT="${OUT_DIR}/${kernel}"
+    OPPROF_DIR=$(find "${SUB_OUT}" -maxdepth 1 -type d -name "OPPROF_*" 2>/dev/null | head -1)
+    if [ -z "${OPPROF_DIR}" ]; then
+        printf "  %-40s %10s %10s\n" "${kernel}" "MISSING" "-"
+        continue
+    fi
 
-    if (name ~ /profile_marker|Cast_|Add_|StridedSlice|ZerosLike|ReduceSum|ConcatD/)
-        next
+    CSV="${OPPROF_DIR}/OpBasicInfo.csv"
+    if [ ! -f "${CSV}" ]; then
+        printf "  %-40s %10s %10s\n" "${kernel}" "NO_CSV" "-"
+        continue
+    fi
 
-    sum[name] += dur
-    cnt[name]++
-    blkdim[name] = blk
-    total += dur
-}
-END {
-    for (name in sum) {
-        avg = sum[name] / cnt[name]
-        printf "  %-40s %10.2f %10s\n", name, avg, blkdim[name]
+    # 每个子目录内可能包含多次 launch / mix 后缀变体（如 _mix_aic），
+    # 同名聚合取平均，并把每行作为一行单独打印
+    awk -F',' -v out="${TOTAL_AVG_FILE}" '
+    NR>1 {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $4)
+
+        name = $1
+        dur  = $3 + 0
+        blk  = $4
+
+        if (name ~ /profile_marker|Cast_|Add_|StridedSlice|ZerosLike|ReduceSum|ConcatD/)
+            next
+
+        sum[name] += dur
+        cnt[name]++
+        blkdim[name] = blk
     }
-    if (total > 0)
-        printf "  %-40s %10.2f\n", "--- per-chunk sum ---", total
-}' "${CSV}"
+    END {
+        for (name in sum) {
+            avg = sum[name] / cnt[name]
+            printf "  %-40s %10.2f %10s\n", name, avg, blkdim[name]
+            printf "%.6f\n", avg >> out
+        }
+    }' "${CSV}"
+done
+
+# 汇总每个 kernel 平均时长之和（用于 per-chunk 总耗时估算）
+TOTAL=$(awk '{s+=$1} END {printf "%.2f", s}' "${TOTAL_AVG_FILE}")
+rm -f "${TOTAL_AVG_FILE}"
+
+printf "  %-40s %10s\n" "----------------------------------------" "----------"
+printf "  %-40s %10s us\n" "--- per-chunk sum (avg) ---" "${TOTAL}"
 
 echo "================================================"
-echo "Per-kernel csv files under: ${OPPROF_DIR}/"
+echo "Per-kernel csv directories under: ${OUT_DIR}/<kernel>/OPPROF_*/"
 echo "================================================"
