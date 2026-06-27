@@ -358,27 +358,38 @@ else
             "${vec}" "${vscal}" "${vmte2}" "${vmte3}" >> "${OUTPUT_FILE}"
     done
 
-    # arithmetic / memory snapshots
+    # raw per-kernel CSVs (no aggregation): for each kernel dump every CSV
+    # verbatim into the report so optimization analysis can reach the
+    # block-level numbers without re-opening the profiling tree.
     {
         echo ""
-        echo "[msprof] Per-kernel memory / arithmetic snapshots (avg over data rows)"
+        echo "[msprof] Per-kernel raw CSV dumps"
         echo "  ------------------------------------------------------------------------------------------"
-        printf "  %-42s %14s %14s %14s\n" "Op Name" "aiv_fops/blk" "ub_read_bw" "l2_read_hit%"
     } >> "${OUTPUT_FILE}"
 
     printf "%s\n" "${MSPROF_RUNS}" | while IFS=$'\t' read -r sub opprof; do
-        arith="${opprof}/ArithmeticUtilization.csv"
-        ub="${opprof}/MemoryUB.csv"
-        l2="${opprof}/L2Cache.csv"
         kname=$(awk -F',' 'NR==2 {gsub(/^[ \t\r]+|[ \t\r]+$/, "", $1); print $1}' "${opprof}/OpBasicInfo.csv")
         [ -z "${kname}" ] && kname="${sub}"
-        fops=$(csv_avg_col "${arith}" "aiv_vec_fops")
-        ubbw=$(csv_avg_col "${ub}"    "aiv_ub_read_bw_vector(GB/s)")
-        if [ "${ubbw}" = "-" ]; then
-            ubbw=$(csv_avg_col "${ub}" "aiv_ub_read_bw(GB/s)")
-        fi
-        l2hit=$(csv_avg_col "${l2}"   "aiv_read_hit_rate(%)")
-        printf "  %-42s %14s %14s %14s\n" "${kname}" "${fops}" "${ubbw}" "${l2hit}" >> "${OUTPUT_FILE}"
+        {
+            echo ""
+            echo "  =========================================================================="
+            echo "  kernel: ${kname}"
+            echo "  opprof: ${opprof}"
+            echo "  =========================================================================="
+        } >> "${OUTPUT_FILE}"
+        for csv in OpBasicInfo PipeUtilization ArithmeticUtilization \
+                   MemoryUB Memory MemoryL0 L2Cache ResourceConflictRatio; do
+            f="${opprof}/${csv}.csv"
+            if [ -f "${f}" ]; then
+                {
+                    echo ""
+                    echo "  --- ${csv}.csv ---"
+                    cat "${f}"
+                } >> "${OUTPUT_FILE}"
+            else
+                echo "  --- ${csv}.csv (missing) ---" >> "${OUTPUT_FILE}"
+            fi
+        done
     done
 
     # --- Part 6: summary ----------------------------------------------
