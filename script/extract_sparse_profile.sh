@@ -358,39 +358,9 @@ else
             "${vec}" "${vscal}" "${vmte2}" "${vmte3}" >> "${OUTPUT_FILE}"
     done
 
-    # raw per-kernel CSVs (no aggregation): for each kernel dump every CSV
-    # verbatim into the report so optimization analysis can reach the
-    # block-level numbers without re-opening the profiling tree.
-    {
-        echo ""
-        echo "[msprof] Per-kernel raw CSV dumps"
-        echo "  ------------------------------------------------------------------------------------------"
-    } >> "${OUTPUT_FILE}"
-
-    printf "%s\n" "${MSPROF_RUNS}" | while IFS=$'\t' read -r sub opprof; do
-        kname=$(awk -F',' 'NR==2 {gsub(/^[ \t\r]+|[ \t\r]+$/, "", $1); print $1}' "${opprof}/OpBasicInfo.csv")
-        [ -z "${kname}" ] && kname="${sub}"
-        {
-            echo ""
-            echo "  =========================================================================="
-            echo "  kernel: ${kname}"
-            echo "  opprof: ${opprof}"
-            echo "  =========================================================================="
-        } >> "${OUTPUT_FILE}"
-        for csv in OpBasicInfo PipeUtilization ArithmeticUtilization \
-                   MemoryUB Memory MemoryL0 L2Cache ResourceConflictRatio; do
-            f="${opprof}/${csv}.csv"
-            if [ -f "${f}" ]; then
-                {
-                    echo ""
-                    echo "  --- ${csv}.csv ---"
-                    cat "${f}"
-                } >> "${OUTPUT_FILE}"
-            else
-                echo "  --- ${csv}.csv (missing) ---" >> "${OUTPUT_FILE}"
-            fi
-        done
-    done
+    # NOTE: 更细粒度的全 CSV 采集（ArithmeticUtilization / Memory* / L2Cache /
+    # ResourceConflictRatio 等）由 script/extract_one_kernel_profile.sh 提供，
+    # 针对单一 kernel 输出完整原始数据。Part 5 只给所有 kernel 的概览。
 
     # --- Part 6: summary ----------------------------------------------
     section "Part 6: Summary"
