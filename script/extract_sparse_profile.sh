@@ -149,37 +149,94 @@ extract_api_stat() {
     >> "${OUTPUT_FILE}"
 }
 
-# step_trace_time.csv columns:
+# step_trace_time.csv columns (looked up by header):
 #   Step,Computing,Communication(Not Overlapped),Overlapped,Communication,Free,...
-extract_step_trace() {
+# Aggregate "Computing > 0" rows.
+#
+# Output mode (selected by $3):
+#   "block"  -> indented multi-line, used for Part 1/2 detail blocks
+#   "row"    -> single fixed-width table row, used for Part 3 side-by-side
+#
+# Note on `avg free`: profiler reports Free of the last active step as the
+# residual gap until profile stop, which is often much shorter than the true
+# inter-step idle time. We compute two means: one over all active steps (raw),
+# one excluding the last active step when there are >=2 active steps (stable).
+# When only 1 active step exists we report the raw value with a note.
+aggregate_step_trace() {
     local label="$1"
     local parse_dir="$2"
+    local mode="${3:-block}"
     local csv="${parse_dir}/ASCEND_PROFILER_OUTPUT/step_trace_time.csv"
 
-    if [ ! -f "${csv}" ]; then return; fi
+    if [ ! -f "${csv}" ]; then
+        if [ "${mode}" = "row" ]; then
+            printf "  %-10s %16s %16s %16s\n" "${label}" "-" "-" "-" >> "${OUTPUT_FILE}"
+        fi
+        return
+    fi
 
+    awk -F',' -v lab="${label}" -v mode="${mode}" '
+    NR==1 {
+        for (i=1; i<=NF; i++) {
+            v=$i; gsub(/^[ \t\r]+|[ \t\r]+$/, "", v); col[v]=i
+        }
+        cC = col["Computing"]; fC = col["Free"]
+        if (!cC || !fC) {
+            printf "  %-10s (Computing/Free columns missing in step_trace_time.csv)\n", lab
+            exit
+        }
+        next
+    }
     {
-        echo ""
-        echo "[${label}] Step-level timing (step_trace_time.csv)"
-        echo "  --------------------------------------------------------------------------"
-    } >> "${OUTPUT_FILE}"
-
-    awk -F',' 'NR>1 {
-        c=$2; f=$6
+        c=$cC; f=$fC
         gsub(/^[ \t\r]+|[ \t\r]+$/, "", c)
         gsub(/^[ \t\r]+|[ \t\r]+$/, "", f)
         if ((c + 0) > 0) {
             cnt++
-            csum += c
-            fsum += f
+            comp[cnt] = c + 0
+            freev[cnt] = f + 0
+            csum += c + 0
+            fsum += f + 0
         }
     }
     END {
-        if (cnt > 0)
-            printf "  Active steps: %d   avg computing=%.2f ms/step   avg free=%.2f ms/step\n",
-                   cnt, csum/cnt/1000, fsum/cnt/1000
+        if (cnt == 0) {
+            if (mode == "row")
+                printf "  %-10s %16s %16s %16s\n", lab, "-", "-", "-"
+            else
+                printf "  Active steps: 0\n"
+            exit
+        }
+
+        avg_c = csum / cnt / 1000     # ms
+        avg_f = fsum / cnt / 1000
+
+        # Stable mean of Free: drop last active step when we have >=2 steps,
+        # because the last steps Free is typically truncated by profile stop.
+        if (cnt >= 2) {
+            fsum_stable = fsum - freev[cnt]
+            avg_f_stable = fsum_stable / (cnt - 1) / 1000
+            free_note = sprintf("avg free=%.2f ms/step (stable, last step %.2f ms dropped)",
+                                avg_f_stable, freev[cnt]/1000)
+        } else {
+            avg_f_stable = avg_f
+            free_note = sprintf("avg free=%.2f ms/step (1 step only; may be truncated)", avg_f)
+        }
+
+        if (mode == "row") {
+            printf "  %-10s %16d %16.2f %16.2f\n",
+                   lab, cnt, avg_c, avg_f_stable
+        } else {
+            printf "\n[%s] Step-level timing (step_trace_time.csv)\n", lab
+            printf "  --------------------------------------------------------------------------\n"
+            printf "  Active steps: %d   avg computing=%.2f ms/step   %s\n",
+                   cnt, avg_c, free_note
+        }
     }' "${csv}" >> "${OUTPUT_FILE}"
 }
+
+extract_step_trace() { aggregate_step_trace "$1" "$2" "block"; }
+print_step_row()     { aggregate_step_trace "$1" "$2" "row"; }
 
 # msprof per-kernel: ${MSPROF_DIR}/<kernel>/OPPROF_*/{OpBasicInfo,PipeUtilization,...}.csv
 # Returns list of "kernel_subdir<TAB>opprof_dir" pairs on stdout.
@@ -253,6 +310,33 @@ echo "TRITON_DIR=${TRITON_DIR}"  >> "${OUTPUT_FILE}"
 echo "CANN_DIR=${CANN_DIR}"      >> "${OUTPUT_FILE}"
 echo "MSPROF_DIR=${MSPROF_DIR}"  >> "${OUTPUT_FILE}"
 
+# Detect the number of S1 chunks per backward call. This drives the EST
+# multiplier in Part 6 (one msprof per-kernel Duration covers one chunk;
+# a full backward issues N chunks worth of kernel launches).
+#
+# Priority:
+#   1. env SPARSE_GRAD_S1_CHUNK_OVERRIDE  -> trust user
+#   2. source .py SPARSE_GRAD_S1_CHUNK    -> ceil(S1 / chunk)
+#   3. Part 1 kernel_details: most-frequent N among 5 SLI grad kernels
+#   4. fallback: 1
+SLI_PY="$(dirname "$0")/../sparse_lightning_indexer_grad_kl_loss_triton.py"
+PRODUCTION_S1="${PRODUCTION_S1:-4096}"
+
+NUM_CHUNKS=""
+if [ -n "${SPARSE_GRAD_S1_CHUNK_OVERRIDE:-}" ]; then
+    NUM_CHUNKS="${SPARSE_GRAD_S1_CHUNK_OVERRIDE}"
+    CHUNK_SRC="env override"
+elif [ -f "${SLI_PY}" ]; then
+    CHUNK_SIZE=$(awk -F'=' '/^SPARSE_GRAD_S1_CHUNK[[:space:]]*=/ {
+        gsub(/[[:space:]]/, "", $2); print $2; exit
+    }' "${SLI_PY}")
+    if [ -n "${CHUNK_SIZE}" ] && [ "${CHUNK_SIZE}" -gt 0 ] 2>/dev/null; then
+        NUM_CHUNKS=$(( (PRODUCTION_S1 + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+        CHUNK_SRC="SPARSE_GRAD_S1_CHUNK=${CHUNK_SIZE} from ${SLI_PY}, S1=${PRODUCTION_S1}"
+    fi
+fi
+echo "EST chunk factor: NUM_CHUNKS=${NUM_CHUNKS:-(deferred to Part 1)}  source=${CHUNK_SRC:-(none yet)}" >> "${OUTPUT_FILE}"
+
 # --- Part 1: Triton (perf script) -------------------------------------
 section "Part 1: Triton end-to-end profiling (profile_sparse.sh triton)"
 TRITON_PARSE=$(latest_parse_dir "${TRITON_DIR}")
@@ -262,6 +346,37 @@ if [ -n "${TRITON_PARSE}" ]; then
 else
     echo "(no triton profiling data in ${TRITON_DIR})" >> "${OUTPUT_FILE}"
 fi
+
+# Fallback chunk detection: if .py probe failed, count how many times any of
+# the 5 SLI grad kernels was launched in kernel_details (one launch per chunk).
+if [ -z "${NUM_CHUNKS}" ] && [ -n "${TRITON_PARSE}" ]; then
+    KCSV="${TRITON_PARSE}/ASCEND_PROFILER_OUTPUT/kernel_details.csv"
+    if [ -f "${KCSV}" ]; then
+        NUM_CHUNKS=$(awk -F',' '
+        NR==1 { for (i=1; i<=NF; i++) { v=$i; gsub(/^[ \t\r]+|[ \t\r]+$/, "", v); col[v]=i }
+                nameC=col["Name"]; next }
+        {
+            name=$nameC; sub(/.*\//, "", name)
+            if (name ~ /_gather_kv_kernel/)                  cnt["gather_kv"]++
+            else if (name ~ /_teacher_distribution_kernel/)  cnt["teacher"]++
+            else if (name ~ /_indexer_grad_kl_loss_kernel/)  cnt["indexer"]++
+            else if (name ~ /_query_index_weight_grad_kernel/) cnt["query"]++
+            else if (name ~ /_scatter_dkey_index_kernel/)    cnt["scatter"]++
+        }
+        END {
+            n = 0
+            for (k in cnt) if (cnt[k] > n) n = cnt[k]   # most frequent
+            print n+0
+        }' "${KCSV}")
+        if [ -n "${NUM_CHUNKS}" ] && [ "${NUM_CHUNKS}" -gt 0 ] 2>/dev/null; then
+            CHUNK_SRC="kernel_details.csv max(launches per SLI grad kernel)"
+        else
+            NUM_CHUNKS=1
+            CHUNK_SRC="fallback (no SLI grad kernel launches found)"
+        fi
+    fi
+fi
+[ -z "${NUM_CHUNKS}" ] && { NUM_CHUNKS=1; CHUNK_SRC="fallback (no source)"; }
 
 # --- Part 2: CANN (perf script) ---------------------------------------
 section "Part 2: CANN end-to-end profiling (profile_sparse.sh cann)"
@@ -282,24 +397,7 @@ section "Part 3: Triton vs CANN side-by-side"
     printf "  %-10s %16s %16s %16s\n" "side" "active steps" "avg comp(ms)" "avg free(ms)"
 } >> "${OUTPUT_FILE}"
 
-print_step_row() {
-    local label="$1"
-    local parse_dir="$2"
-    local csv="${parse_dir}/ASCEND_PROFILER_OUTPUT/step_trace_time.csv"
-    [ -f "${csv}" ] || { printf "  %-10s %16s %16s %16s\n" "${label}" "-" "-" "-" >> "${OUTPUT_FILE}"; return; }
-    awk -F',' -v lab="${label}" 'NR>1 {
-        c=$2; f=$6
-        gsub(/^[ \t\r]+|[ \t\r]+$/, "", c)
-        gsub(/^[ \t\r]+|[ \t\r]+$/, "", f)
-        if ((c + 0) > 0) { cnt++; csum += c; fsum += f }
-    }
-    END {
-        if (cnt > 0)
-            printf "  %-10s %16d %16.2f %16.2f\n", lab, cnt, csum/cnt/1000, fsum/cnt/1000
-        else
-            printf "  %-10s %16s %16s %16s\n", lab, "-", "-", "-"
-    }' "${csv}" >> "${OUTPUT_FILE}"
-}
+print_step_row() { aggregate_step_trace "$1" "$2" "row"; }
 [ -n "${TRITON_PARSE}" ] && print_step_row "triton" "${TRITON_PARSE}"
 [ -n "${CANN_PARSE}"   ] && print_step_row "cann"   "${CANN_PARSE}"
 
@@ -370,7 +468,7 @@ else
     } >> "${OUTPUT_FILE}"
 
     # categorise kernels into 5 logical stages by name substring match
-    awk -F'\t' '
+    awk -F'\t' -v num_chunks="${NUM_CHUNKS}" -v chunk_src="${CHUNK_SRC}" '
     function tag(n) {
         if (n ~ /gather_kv/)        return "gather_kv"
         if (n ~ /teacher/)          return "teacher_dist"
@@ -402,9 +500,12 @@ else
                 printf "  %-22s %10s  (not captured)\n", t, "-"
             }
         }
+        nc = num_chunks + 0; if (nc < 1) nc = 1
         printf "  %-22s %10.2f us\n", "PER-CHUNK SUM", total
-        printf "  %-22s %10.2f ms  (per-chunk sum x 4 chunks @ S1=4096)\n",
-               "EST 4-CHUNK NPU-TIME", total*4/1000
+        printf "  %-22s %10.2f ms  (per-chunk sum x %d chunks; source: %s)\n",
+               "EST " nc "-CHUNK NPU-TIME", total*nc/1000, nc, chunk_src
+        printf "  note: EST excludes inter-kernel launch gaps and host sync;\n"
+        printf "        compare with step_trace avg/step below for the true device-busy time per backward.\n"
     }' "${BASIC_TSV}" >> "${OUTPUT_FILE}"
 
     # End-to-end comparison (using kernel_details totals from Part 1/2)
@@ -432,14 +533,23 @@ else
                 gsub(/^[ \t\r]+|[ \t\r]+$/, "", s)
                 if ((d + 0) > 0) {
                     total += d + 0
-                    if (s != "") { steps[s]=1; per_step[s] += d + 0 }
+                    if (s != "") {
+                        if (!(s in steps)) { steps[s]=1; sn++ }
+                        per_step[s] += d + 0
+                    }
                 }
             }
             END {
-                sn = 0; for (k in steps) sn++
                 if (sn == 0) sn = 1
-                printf "  %-10s sum=%10.2f ms   steps=%d   avg/step=%10.2f ms\n",
-                       lab, total/1000, sn, total/sn/1000
+                pmin = -1; pmax = -1
+                for (k in per_step) {
+                    v = per_step[k]
+                    if (pmin < 0 || v < pmin) pmin = v
+                    if (pmax < 0 || v > pmax) pmax = v
+                }
+                printf "  %-10s sum=%10.2f ms   steps=%d   avg/step=%10.2f ms   min/max per step=%.2f / %.2f ms\n",
+                       lab, total/1000, sn, total/sn/1000,
+                       (pmin<0?0:pmin/1000), (pmax<0?0:pmax/1000)
             }' "${csv}" >> "${OUTPUT_FILE}"
         done
     fi
