@@ -187,10 +187,8 @@ def _dense_indexer_stats_kernel(
 
 @triton.jit
 def _dense_main_grad_kernel(
-    query_ptr, key_ptr, query_rope_ptr, key_rope_ptr,
     query_index_ptr, key_index_ptr, weights_ptr,
-    softmax_max_ptr, softmax_sum_ptr,
-    max_index_ptr, sum_index_ptr,
+    di_ptr,
     d_query_index_ptr, d_weights_ptr,
     act_q_ptr, act_k_ptr,
     B, S1, S2, N1, N2, G, Nidx1, D, D_idx, D_rope,
@@ -209,11 +207,6 @@ def _dense_main_grad_kernel(
     visible = tl.minimum(tl.maximum(act_k - act_q + s1 + 1, 0), S2)
     valid_q = s1 < act_q
 
-    i_max = tl.load(max_index_ptr + bs1_idx).to(tl.float32)
-    i_sum = tl.load(sum_index_ptr + bs1_idx).to(tl.float32)
-    has_valid = valid_q & (i_sum > 0.0)
-    i_sum_safe = tl.maximum(i_sum, 1.0e-8)
-
     d_offsets = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
     d_mask = d_offsets < D_idx
     local_k = tl.arange(0, BLOCK_K)
@@ -225,24 +218,7 @@ def _dense_main_grad_kernel(
     for k_start in range(0, S2, BLOCK_K):
         s2_offsets = k_start + local_k
         k_mask = valid_q & (s2_offsets < visible)
-        i_tile = _dense_indexer_i_tile(
-            query_index_ptr, key_index_ptr, weights_ptr,
-            B, S1, S2, Nidx1, D_idx,
-            bs1_idx, b, s2_offsets, k_mask,
-            BLOCK_K, BLOCK_D,
-        )
-        student = tl.exp(i_tile - i_max) / i_sum_safe
-        student = tl.where(k_mask & has_valid, student, 0.0)
-        teacher = _dense_teacher_p_tile(
-            query_ptr, key_ptr, query_rope_ptr, key_rope_ptr,
-            softmax_max_ptr, softmax_sum_ptr,
-            B, S1, S2, N1, N2, G, D, D_rope,
-            bs1_idx, b, s1, s2_offsets, k_mask,
-            scale_value,
-            BLOCK_K, BLOCK_D, HAS_ROPE,
-        )
-        teacher = tl.where(k_mask & has_valid, teacher, 0.0)
-        di = student - teacher
+        di = tl.load(di_ptr + bs1_idx * S2 + s2_offsets, mask=k_mask, other=0.0).to(tl.float32)
 
         dot_g = _dense_indexer_dot_g_tile(
             query_index_ptr, key_index_ptr,
@@ -272,7 +248,7 @@ def _dense_loss_kernel(
     query_index_ptr, key_index_ptr, weights_ptr,
     softmax_max_ptr, softmax_sum_ptr,
     max_index_ptr, sum_index_ptr,
-    loss_ptr,
+    loss_ptr, di_ptr,
     act_q_ptr, act_k_ptr,
     B, S1, S2, N1, N2, G, Nidx1, D, D_idx, D_rope,
     scale_value,
@@ -316,6 +292,10 @@ def _dense_loss_kernel(
         )
         teacher = tl.where(k_mask & has_valid, teacher, 0.0)
 
+        di = student - teacher
+        di_offs = bs1_idx * S2 + s2_offsets
+        tl.store(di_ptr + di_offs, di.to(di_ptr.dtype.element_ty), mask=k_mask)
+
         p_clamped = tl.maximum(teacher, 1.0e-8)
         q_clamped = tl.maximum(student, 1.0e-8)
         kl = p_clamped * (tl.log(p_clamped) - tl.log(q_clamped))
@@ -328,10 +308,8 @@ def _dense_loss_kernel(
 
 @triton.jit
 def _dense_dkey_index_kernel(
-    query_ptr, key_ptr, query_rope_ptr, key_rope_ptr,
     query_index_ptr, key_index_ptr, weights_ptr,
-    softmax_max_ptr, softmax_sum_ptr,
-    max_index_ptr, sum_index_ptr,
+    di_ptr,
     d_key_index_ptr,
     act_q_ptr, act_k_ptr,
     B, S1, S2, N1, N2, G, Nidx1, D, D_idx, D_rope,
@@ -353,33 +331,11 @@ def _dense_dkey_index_kernel(
     visible = tl.minimum(tl.maximum(act_k - act_q + s1 + 1, 0), S2)
     valid_q = s1 < act_q
 
-    i_max = tl.load(max_index_ptr + bs1_idx).to(tl.float32)
-    i_sum = tl.load(sum_index_ptr + bs1_idx).to(tl.float32)
-    has_valid = valid_q & (i_sum > 0.0)
-    i_sum_safe = tl.maximum(i_sum, 1.0e-8)
-
     local_k = tl.arange(0, BLOCK_K)
     s2_offsets = k_block * BLOCK_K + local_k
     k_mask = valid_q & (s2_offsets < visible)
 
-    i_tile = _dense_indexer_i_tile(
-        query_index_ptr, key_index_ptr, weights_ptr,
-        B, S1, S2, Nidx1, D_idx,
-        bs1_idx, b, s2_offsets, k_mask,
-        BLOCK_K, BLOCK_D,
-    )
-    student = tl.exp(i_tile - i_max) / i_sum_safe
-    student = tl.where(k_mask & has_valid, student, 0.0)
-    teacher = _dense_teacher_p_tile(
-        query_ptr, key_ptr, query_rope_ptr, key_rope_ptr,
-        softmax_max_ptr, softmax_sum_ptr,
-        B, S1, S2, N1, N2, G, D, D_rope,
-        bs1_idx, b, s1, s2_offsets, k_mask,
-        scale_value,
-        BLOCK_K, BLOCK_D, HAS_ROPE,
-    )
-    teacher = tl.where(k_mask & has_valid, teacher, 0.0)
-    di = student - teacher
+    di = tl.load(di_ptr + bs1_idx * S2 + s2_offsets, mask=k_mask, other=0.0).to(tl.float32)
 
     dot_g = _dense_indexer_dot_g_tile(
         query_index_ptr, key_index_ptr,
@@ -400,7 +356,7 @@ def _dense_dkey_index_kernel(
     ).to(tl.float32)
     dki = coeff[:, None] * qi[None, :]
     dki_offsets = b * S2 * D_idx + s2_offsets[:, None] * D_idx + d_offsets[None, :]
-    tl.atomic_add(d_key_index_ptr + dki_offsets, dki, mask=k_mask[:, None] & has_valid & d_mask[None, :])
+    tl.atomic_add(d_key_index_ptr + dki_offsets, dki, mask=k_mask[:, None] & d_mask[None, :])
 
 
 def _infer_dense_index_stats(query_index, key_index, weights,
@@ -492,6 +448,7 @@ def _dense_loss_backward_core(
     d_key_index_acc = ms.mint.zeros((B * S2, D_idx), dtype=ms.float32)
     d_weights = ms.mint.zeros((B * S1, Nidx1), dtype=weights.dtype)
     loss = ms.mint.zeros((1,), dtype=ms.float32)
+    di_ws = ms.mint.empty((B * S1, S2), dtype=ms.float32)
 
     BLOCK_K = 64
     BLOCK_D = 64
@@ -508,7 +465,7 @@ def _dense_loss_backward_core(
         qi_flat, ki_flat, w_flat,
         sm_max_flat, sm_sum_flat,
         max_index, sum_index,
-        loss,
+        loss, di_ws,
         actual_seq_q, actual_seq_k,
         B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
         scale_value,
@@ -521,10 +478,8 @@ def _dense_loss_backward_core(
     for bs1_start in range(0, total_bs1, main_bs1_chunk):
         bs1_chunk = min(main_bs1_chunk, total_bs1 - bs1_start)
         _dense_main_grad_kernel[(bs1_chunk, Nidx1, num_d_blocks)](
-            q_flat, k_flat, qr_flat, kr_flat,
             qi_flat, ki_flat, w_flat,
-            sm_max_flat, sm_sum_flat,
-            max_index, sum_index,
+            di_ws,
             d_query_index, d_weights,
             actual_seq_q, actual_seq_k,
             B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
@@ -544,10 +499,8 @@ def _dense_loss_backward_core(
         for kd_start in range(0, total_kd_blocks, kd_chunk):
             kd_block_chunk = min(kd_chunk, total_kd_blocks - kd_start)
             _dense_dkey_index_kernel[(bs1_chunk, Nidx1, kd_block_chunk)](
-                q_flat, k_flat, qr_flat, kr_flat,
                 qi_flat, ki_flat, w_flat,
-                sm_max_flat, sm_sum_flat,
-                max_index, sum_index,
+                di_ws,
                 d_key_index_acc,
                 actual_seq_q, actual_seq_k,
                 B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
@@ -619,6 +572,7 @@ def _dense_loss_backward_with_index_core(
     d_key_index_acc = ms.mint.zeros((B * S2, D_idx), dtype=ms.float32)
     d_weights = ms.mint.zeros((B * S1, Nidx1), dtype=weights.dtype)
     loss = ms.mint.zeros((1,), dtype=ms.float32)
+    di_ws = ms.mint.empty((B * S1, S2), dtype=ms.float32)
 
     BLOCK_K = 64
     BLOCK_D = 64
@@ -627,7 +581,7 @@ def _dense_loss_backward_with_index_core(
         qi_flat, ki_flat, w_flat,
         sm_max_flat, sm_sum_flat,
         max_index, sum_index,
-        loss,
+        loss, di_ws,
         actual_seq_q, actual_seq_k,
         B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
         scale_value,
@@ -640,10 +594,8 @@ def _dense_loss_backward_with_index_core(
     for bs1_start in range(0, total_bs1, main_bs1_chunk):
         bs1_chunk = min(main_bs1_chunk, total_bs1 - bs1_start)
         _dense_main_grad_kernel[(bs1_chunk, Nidx1, num_d_blocks)](
-            q_flat, k_flat, qr_flat, kr_flat,
             qi_flat, ki_flat, w_flat,
-            sm_max_flat, sm_sum_flat,
-            max_index, sum_index,
+            di_ws,
             d_query_index, d_weights,
             actual_seq_q, actual_seq_k,
             B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
@@ -663,10 +615,8 @@ def _dense_loss_backward_with_index_core(
         for kd_start in range(0, total_kd_blocks, kd_chunk):
             kd_block_chunk = min(kd_chunk, total_kd_blocks - kd_start)
             _dense_dkey_index_kernel[(bs1_chunk, Nidx1, kd_block_chunk)](
-                q_flat, k_flat, qr_flat, kr_flat,
                 qi_flat, ki_flat, w_flat,
-                sm_max_flat, sm_sum_flat,
-                max_index, sum_index,
+                di_ws,
                 d_key_index_acc,
                 actual_seq_q, actual_seq_k,
                 B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
