@@ -568,9 +568,9 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     BLOCK_K_QUERY_WEIGHT = 128
     BLOCK_G_QUERY_WEIGHT = 32
     BLOCK_D_QUERY_WEIGHT = 128
-    BLOCK_K_SCATTER = 128
+    BLOCK_K_SCATTER = 256
     BLOCK_D_SCATTER = 128
-    BLOCK_G_SCATTER = 64
+    BLOCK_G_SCATTER = 32
 
     # Flatten N2=1, Nidx2=1 dimensions (MQA: single KV head)
     q_flat = query.reshape(B * S1, N1, D).contiguous()
