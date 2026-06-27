@@ -425,10 +425,17 @@ def _scatter_dkey_index_kernel(
     B, S1, S2, Nidx1, D_idx, topK,
     valid_k, S1_OFFSET,
     BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
+    BLOCK_G: tl.constexpr,
 ):
     """Scatter-add dKeyIndex. Grid: (B*S1, cdiv(valid_k, BLOCK_K), D-blocks).
 
     dki[b, target_k] += dI[k] * w[g] * 1_{relu>0} * qi[g]
+
+    Vectorized over g: instead of a scalar for-loop over Nidx1, we tile g into
+    BLOCK_G chunks and fuse the (di * w * mask) construction with a
+    [BLOCK_K, BLOCK_G] @ [BLOCK_G, BLOCK_D] tl.dot. This moves the FMAs to
+    the cube unit (matching the dQueryIndex kernel's strategy) and replaces
+    the serial broadcast-add with a single cube call per g-tile.
     """
     bs1_idx = tl.program_id(0)
     k_block = tl.program_id(1)
@@ -452,6 +459,7 @@ def _scatter_dkey_index_kernel(
 
     qi_base = bs1_idx * Nidx1 * D_idx
     w_base = bs1_idx * Nidx1
+    sidx_base = bs1_idx * Nidx1 * topK
     di_k = tl.load(di_ptr + bs1_idx * topK + k_offsets,
                    mask=k_mask, other=0.0).to(tl.float32)
     target_k = tl.load(sparse_indices_ptr + bs1_idx * topK + k_offsets,
@@ -460,18 +468,40 @@ def _scatter_dkey_index_kernel(
 
     d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
     d_valid = d_offs < D_idx
+    g_local = tl.arange(0, BLOCK_G)
+
     dki_acc = tl.zeros([BLOCK_K, BLOCK_D], dtype=tl.float32)
 
-    for g in range(Nidx1):
-        w_g = tl.load(weights_ptr + w_base + g).to(tl.float32)
-        relu_gk = tl.load(s_idx_buf_ptr + bs1_idx * Nidx1 * topK
-                          + g * topK + k_offsets,
-                          mask=k_mask, other=0.0).to(tl.float32)
+    for g_start in range(0, Nidx1, BLOCK_G):
+        g_offs = g_start + g_local
+        g_mask = g_offs < Nidx1
+
+        # w_g: [BLOCK_G]
+        w_g = tl.load(weights_ptr + w_base + g_offs,
+                      mask=g_mask, other=0.0).to(tl.float32)
+
+        # relu_gk: [BLOCK_G, BLOCK_K]
+        relu_gk = tl.load(
+            s_idx_buf_ptr + sidx_base
+            + g_offs[:, None] * topK + k_offsets[None, :],
+            mask=g_mask[:, None] & k_mask[None, :], other=0.0)
         relu_mask = (relu_gk > 0.0).to(tl.float32)
-        dki_contrib = di_k * w_g * relu_mask
-        qi_g = tl.load(query_index_ptr + qi_base + g * D_idx + d_offs,
-                       mask=d_valid, other=0.0).to(tl.float32)
-        dki_acc += dki_contrib[:, None] * qi_g[None, :]
+
+        # ds_idx[g, k] = di_k * w_g * mask -> [BLOCK_G, BLOCK_K]
+        ds_idx_gk = di_k[None, :] * w_g[:, None] * relu_mask
+
+        # qi tile: [BLOCK_G, BLOCK_D]
+        # Cast to fp16 to halve UB pressure (matches dQueryIndex path,
+        # tl.dot accepts fp16 x fp16 -> fp32 accumulator).
+        qi_tile = tl.load(
+            query_index_ptr + qi_base
+            + g_offs[:, None] * D_idx + d_offs[None, :],
+            mask=g_mask[:, None] & d_valid[None, :], other=0.0)
+
+        # dki_acc[k, d] += sum_g ds_idx[g,k] * qi[g,d]
+        #              = trans(ds_idx)[k,g] @ qi[g,d]
+        ds_idx_kg = tl.trans(ds_idx_gk).to(qi_tile.dtype)
+        dki_acc += tl.dot(ds_idx_kg, qi_tile)
 
     dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs[None, :]
     tl.atomic_add(d_key_index_ptr + dki_offs,
@@ -539,7 +569,8 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     BLOCK_G_QUERY_WEIGHT = 32
     BLOCK_D_QUERY_WEIGHT = 128
     BLOCK_K_SCATTER = 128
-    BLOCK_D_SCATTER = 64
+    BLOCK_D_SCATTER = 128
+    BLOCK_G_SCATTER = 32
 
     # Flatten N2=1, Nidx2=1 dimensions (MQA: single KV head)
     q_flat = query.reshape(B * S1, N1, D).contiguous()
@@ -657,6 +688,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         B, S1, S2, Nidx1, D_idx, topK,
         valid_k, s1_offset,
         BLOCK_K=BLOCK_K_SCATTER, BLOCK_D=BLOCK_D_SCATTER,
+        BLOCK_G=BLOCK_G_SCATTER,
     )
 
     if os.getenv("SLI_DUMP"):
