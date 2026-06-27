@@ -533,7 +533,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     BLOCK_D_GATHER = 128
     BLOCK_D_MAIN = 64
     BLOCK_K_QUERY_WEIGHT = 128
-    BLOCK_G_QUERY_WEIGHT = 64
+    BLOCK_G_QUERY_WEIGHT = 32
     BLOCK_D_QUERY_WEIGHT = 128
     BLOCK_K_SCATTER = 128
     BLOCK_D_SCATTER = 64
