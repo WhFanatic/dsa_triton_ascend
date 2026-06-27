@@ -133,10 +133,13 @@ def _teacher_distribution_kernel(
     qr_base = pid * N1 * D_rope
     kr_g_base = pid * topK * D_rope
     sm_base = pid * N1
-    p_acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+    inv_n1 = 1.0 / N1
 
-    for h_start in range(0, N1, BLOCK_H):
-        h_offs = h_start + h_local
+    # Fast path when BLOCK_H >= N1 (typical: N1=64, BLOCK_H=64).
+    # Eliminates outer h-loop overhead and lets the cube + softmax stages
+    # overlap better.
+    if BLOCK_H >= N1:
+        h_offs = h_local
         h_mask = h_offs < N1
         scores = tl.zeros([BLOCK_H, BLOCK_K], dtype=tl.float32)
 
@@ -152,7 +155,7 @@ def _teacher_distribution_kernel(
                 + k_offs[:, None] * D + d_offs[None, :],
                 mask=k_mask[:, None] & d_valid[None, :],
                 other=0.0)
-            scores += tl.dot(q_tile.to(tl.float32), tl.trans(k_tile.to(tl.float32)))
+            scores += tl.dot(q_tile, tl.trans(k_tile))
 
         for d_start in range(0, D_rope, BLOCK_D):
             d_offs = d_start + d_local
@@ -167,19 +170,64 @@ def _teacher_distribution_kernel(
                 + k_offs[:, None] * D_rope + d_offs[None, :],
                 mask=k_mask[:, None] & d_valid[None, :],
                 other=0.0)
-            scores += tl.dot(qr_tile.to(tl.float32), tl.trans(kr_tile.to(tl.float32)))
+            scores += tl.dot(qr_tile, tl.trans(kr_tile))
 
         sm_max = tl.load(softmax_max_ptr + sm_base + h_offs,
                          mask=h_mask, other=0.0).to(tl.float32)
         sm_sum = tl.load(softmax_sum_ptr + sm_base + h_offs,
                          mask=h_mask, other=1.0).to(tl.float32)
-        probs = tl.exp(scores * scale_value - sm_max[:, None]) / (
-            sm_sum[:, None] + 1e-8)
+        inv_sum = 1.0 / (sm_sum + 1e-8)
+        # combined scale: probs = exp(scores * scale - sm_max) * inv_sum
+        probs = tl.exp(scores * scale_value - sm_max[:, None]) * inv_sum[:, None]
         probs = tl.where(h_mask[:, None] & k_mask[None, :], probs, 0.0)
-        p_acc += tl.sum(probs, axis=0)
+        p_acc = tl.sum(probs, axis=0)
+    else:
+        p_acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+        for h_start in range(0, N1, BLOCK_H):
+            h_offs = h_start + h_local
+            h_mask = h_offs < N1
+            scores = tl.zeros([BLOCK_H, BLOCK_K], dtype=tl.float32)
+
+            for d_start in range(0, D, BLOCK_D):
+                d_offs = d_start + d_local
+                d_valid = d_offs < D
+                q_tile = tl.load(
+                    query_ptr + q_base + h_offs[:, None] * D + d_offs[None, :],
+                    mask=h_mask[:, None] & d_valid[None, :],
+                    other=0.0)
+                k_tile = tl.load(
+                    key_gathered_ptr + kg_base
+                    + k_offs[:, None] * D + d_offs[None, :],
+                    mask=k_mask[:, None] & d_valid[None, :],
+                    other=0.0)
+                scores += tl.dot(q_tile, tl.trans(k_tile))
+
+            for d_start in range(0, D_rope, BLOCK_D):
+                d_offs = d_start + d_local
+                d_valid = d_offs < D_rope
+                qr_tile = tl.load(
+                    query_rope_ptr + qr_base
+                    + h_offs[:, None] * D_rope + d_offs[None, :],
+                    mask=h_mask[:, None] & d_valid[None, :],
+                    other=0.0)
+                kr_tile = tl.load(
+                    key_rope_gathered_ptr + kr_g_base
+                    + k_offs[:, None] * D_rope + d_offs[None, :],
+                    mask=k_mask[:, None] & d_valid[None, :],
+                    other=0.0)
+                scores += tl.dot(qr_tile, tl.trans(kr_tile))
+
+            sm_max = tl.load(softmax_max_ptr + sm_base + h_offs,
+                             mask=h_mask, other=0.0).to(tl.float32)
+            sm_sum = tl.load(softmax_sum_ptr + sm_base + h_offs,
+                             mask=h_mask, other=1.0).to(tl.float32)
+            probs = tl.exp(scores * scale_value - sm_max[:, None]) / (
+                sm_sum[:, None] + 1e-8)
+            probs = tl.where(h_mask[:, None] & k_mask[None, :], probs, 0.0)
+            p_acc += tl.sum(probs, axis=0)
 
     tl.store(buf_p_ptr + pid * topK + k_offs,
-             p_acc * (1.0 / N1), mask=k_mask)
+             p_acc * inv_n1, mask=k_mask)
 
 
 @triton.jit
@@ -560,11 +608,13 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
 
     BLOCK_K_GATHER = 256
     BLOCK_K_MAIN = 128
+    BLOCK_K_TEACHER = 128
     BLOCK_H_MAIN = 32
-    BLOCK_H_TEACHER = 32
+    BLOCK_H_TEACHER = 64
     BLOCK_G_MAIN = 16
     BLOCK_D_GATHER = 128
     BLOCK_D_MAIN = 64
+    BLOCK_D_TEACHER = 128
     BLOCK_K_QUERY_WEIGHT = 128
     BLOCK_G_QUERY_WEIGHT = 32
     BLOCK_D_QUERY_WEIGHT = 128
@@ -623,7 +673,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         runtime.synchronize()
 
     _teacher_distribution_kernel[
-        (B * S1, triton.cdiv(valid_k, BLOCK_K_MAIN))
+        (B * S1, triton.cdiv(valid_k, BLOCK_K_TEACHER))
     ](
         q_flat, key_gathered,
         qr_flat, key_rope_gathered,
@@ -632,7 +682,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         B, S1, N1, D, D_rope, topK,
         scale_value, s1_offset,
         actual_seq_qlen, actual_seq_klen,
-        VALID_K=valid_k, BLOCK_K=BLOCK_K_MAIN, BLOCK_D=BLOCK_D_MAIN,
+        VALID_K=valid_k, BLOCK_K=BLOCK_K_TEACHER, BLOCK_D=BLOCK_D_TEACHER,
         BLOCK_H=BLOCK_H_TEACHER,
     )
 
