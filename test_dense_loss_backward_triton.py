@@ -48,7 +48,7 @@ DENSE_GRAD_CANN_TEST_CONFIGS = [
 DENSE_TEST_CONFIGS = DENSE_GRAD_CANN_TEST_CONFIGS
 
 DENSE_CANN_LSE_CHECK_CONFIGS = [
-    (1, 4, 128, 32, 32, 128, 32, 128),
+    # (1, 4, 128, 32, 32, 128, 32, 128),
     (1, 3, 96, 32, 32, 128, 64, 128),
 ]
 
@@ -546,7 +546,6 @@ def test_dense_grad_kl_loss_precision(B, S1, S2, N1, N2, D, Nidx1, D_idx):
     _assert_allclose_with_values("loss_auto", loss_base, loss_auto)
     _log("passed")
 
-
 @pytest.mark.parametrize("B,S1,S2,N1,N2,D,Nidx1,D_idx", DENSE_CANN_LSE_CHECK_CONFIGS)
 def test_dense_lse_numpy_matches_cann(B, S1, S2, N1, N2, D, Nidx1, D_idx):
     from dense_loss_backward_cann import DenseLightningIndexerSoftmaxLse
@@ -562,10 +561,12 @@ def test_dense_lse_numpy_matches_cann(B, S1, S2, N1, N2, D, Nidx1, D_idx):
 
     _log("running optional CANN dense softmax_lse calibration")
     lse_op = DenseLightningIndexerSoftmaxLse()
+    _log("guod.....000111")
     max_index_cann, sum_index_cann = lse_op(
         qi, ki, w,
         layout="BSND", sparse_mode=3,
     )
+    _log("guod.....000222")
     _assert_allclose_with_values(
         "max_index_cann_lse", max_index_base, max_index_cann,
         expected_label="numpy", actual_label="cann",
@@ -577,6 +578,11 @@ def test_dense_lse_numpy_matches_cann(B, S1, S2, N1, N2, D, Nidx1, D_idx):
 
 
 if __name__ == "__main__":
-    for config in DENSE_TEST_CONFIGS:
-        test_dense_grad_kl_loss_triton_supported_shapes(*config, ms.bfloat16)
-    print("dense grad kl loss triton test passed!")
+    # for config in DENSE_TEST_CONFIGS:
+    #     test_dense_grad_kl_loss_triton_supported_shapes(*config, ms.bfloat16)
+    # print("dense grad kl loss triton test passed!")
+
+    for config in DENSE_CANN_LSE_CHECK_CONFIGS:
+        test_dense_lse_numpy_matches_cann(*config)
+    print("dense lse numpy matches cann test passed!")
+

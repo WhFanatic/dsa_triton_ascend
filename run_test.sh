@@ -60,7 +60,7 @@
 # pytest test_dense_loss_backward_triton.py -v -k test_dense_softmax_lse_precision "$@"
 
 # ---- LSE 接口守卫（不支持参数须 raise，不跑算子、不依赖 NPU，本机可跑）----
-# pytest --forked test_dense_loss_backward_triton.py -v -k test_dense_softmax_lse_guards "$@"
+# pytest test_dense_loss_backward_triton.py -v -k test_dense_softmax_lse_guards "$@"
 
 # ---- grad 功能+精度（分流：CANN 范围 vs CANN grad，其余 vs NumPy golden；两段式 LSE→grad；bf16 全 29 配置 + fp16 smoke 4，共 33）----
 # pytest test_dense_loss_backward_triton.py -v -k test_dense_grad_kl_loss_triton_supported_shapes "$@"

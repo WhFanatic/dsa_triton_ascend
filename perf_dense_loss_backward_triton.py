@@ -147,14 +147,79 @@ def _call_official_grad(grad_op, q, k, qi, ki, w,
     )
 
 
+def run_timing_lse(qi, ki, w):
+    official_lse, official_grad, official_source = _resolve_official_dense_ops()
+    print(f"official dense DLI source: {official_source}")
+
+    stats_cell = DenseLightningIndexerSoftmaxLseTriton()
+    max_index, sum_index = stats_cell(qi, ki, w)
+
+    t_med, t_p20, t_p80 = _do_bench(lambda: stats_cell(qi, ki, w))
+    print(f"triton softmax_lse:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
+    triton_lse_med = t_med
+
+    official_max_index = None
+    official_sum_index = None
+    if official_lse is None:
+        print(f"official softmax_lse: skipped ({official_source})")
+    else:
+        official_lse_call = lambda: _call_official_lse(official_lse, qi, ki, w)
+        official_max_index, official_sum_index = official_lse_call()
+        o_med, o_p20, o_p80 = _do_bench(official_lse_call)
+        speedup = o_med / triton_lse_med if triton_lse_med > 0 else float("inf")
+        print(
+            f"official softmax_lse: median={o_med:.2f}ms, "
+            f"p20={o_p20:.2f}ms, p80={o_p80:.2f}ms, speedup={speedup:.2f}x"
+        )
+
+    return (
+        stats_cell, max_index, sum_index,
+        official_lse, official_grad,
+        official_max_index, official_sum_index,
+    )
+
+
+def run_timing_grad(q, k, qi, ki, w, qr, kr,
+                    softmax_max, softmax_sum, scale_value,
+                    max_index, sum_index,
+                    official_lse, official_grad,
+                    official_max_index, official_sum_index):
+    grad_cell = DenseLightningIndexerGradKLLossTriton()
+    print(f"official dense grad ")
+    def _triton_grad():
+        return _force_grad_outputs(grad_cell(
+            q, k, qi, ki, w, softmax_max, softmax_sum, max_index, sum_index,
+            scale_value=scale_value, query_rope=qr, key_rope=kr,
+        ))
+
+    t_med, t_p20, t_p80 = _do_bench(_triton_grad, warmup=3, rep=10)
+    print(f"triton grad_kl_loss: median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
+    triton_grad_med = t_med
+
+    official_grad_call = None
+    if official_grad is None or official_max_index is None:
+        print("official grad_kl_loss: skipped (official softmax_lse baseline unavailable)")
+    else:
+        def official_grad_call():
+            return _force_grad_outputs(_call_official_grad(
+                official_grad, q, k, qi, ki, w, softmax_max, softmax_sum,
+                official_max_index, official_sum_index, scale_value, qr, kr,
+            ))
+        o_med, o_p20, o_p80 = _do_bench(official_grad_call, warmup=3, rep=10)
+        speedup = o_med / triton_grad_med if triton_grad_med > 0 else float("inf")
+        print(
+            f"official grad_kl_loss: median={o_med:.2f}ms, "
+            f"p20={o_p20:.2f}ms, p80={o_p80:.2f}ms, speedup={speedup:.2f}x"
+        )
+
+    return grad_cell, official_grad_call
+
+
 def run_timing():
     configs = [
         # B, S1, S2, N1, N2, D, Nidx1, D_idx
         DENSE_PROFILE_CONFIG,
     ]
-    official_lse, official_grad, official_source = _resolve_official_dense_ops()
-    print(f"official dense DLI source: {official_source}")
-
     for B, S1, S2, N1, N2, D, Nidx1, D_idx in configs:
         print(
             f"\nB={B}, S1={S1}, S2={S2}, N1={N1}, N2={N2}, "
@@ -164,94 +229,21 @@ def run_timing():
         q, k, qi, ki, w, qr, kr, softmax_max, softmax_sum = _make_inputs(
             B, S1, S2, N1, N2, D, Nidx1, D_idx)
 
-        stats_cell = DenseLightningIndexerSoftmaxLseTriton()
-        grad_cell = DenseLightningIndexerGradKLLossTriton()
-        max_index, sum_index = stats_cell(qi, ki, w)
+        (
+            stats_cell, max_index, sum_index,
+            official_lse, official_grad,
+            official_max_index, official_sum_index,
+        ) = run_timing_lse(qi, ki, w)
 
-        t_med, t_p20, t_p80 = _do_bench(lambda stats_cell=stats_cell: stats_cell(qi, ki, w))
-        print(f"triton softmax_lse:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
-        triton_lse_med = t_med
-        official_max_index = None
-        official_sum_index = None
-        if official_lse is None:
-            print(f"official softmax_lse: skipped ({official_source})")
-        else:
-            official_lse_call = lambda: _call_official_lse(official_lse, qi, ki, w)
-            official_max_index, official_sum_index = official_lse_call()
-            o_med, o_p20, o_p80 = _do_bench(official_lse_call)
-            speedup = o_med / triton_lse_med if triton_lse_med > 0 else float("inf")
-            print(
-                f"official softmax_lse: median={o_med:.2f}ms, "
-                f"p20={o_p20:.2f}ms, p80={o_p80:.2f}ms, speedup={speedup:.2f}x"
-            )
-
-        def _triton_grad():
-            return _force_grad_outputs(grad_cell(
-                q, k, qi, ki, w, softmax_max, softmax_sum, max_index, sum_index,
-                scale_value=scale_value, query_rope=qr, key_rope=kr,
-            ))
-
-        t_med, t_p20, t_p80 = _do_bench(_triton_grad)
-        print(f"triton grad_kl_loss: median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
-        triton_grad_med = t_med
-        if official_grad is None or official_max_index is None:
-            print("official grad_kl_loss: skipped (official softmax_lse baseline unavailable)")
-            official_grad_call = None
-        else:
-            def official_grad_call():
-                return _force_grad_outputs(_call_official_grad(
-                    official_grad, q, k, qi, ki, w, softmax_max, softmax_sum,
-                    official_max_index, official_sum_index, scale_value, qr, kr,
-                ))
-            o_med, o_p20, o_p80 = _do_bench(official_grad_call)
-            speedup = o_med / triton_grad_med if triton_grad_med > 0 else float("inf")
-            print(
-                f"official grad_kl_loss: median={o_med:.2f}ms, "
-                f"p20={o_p20:.2f}ms, p80={o_p80:.2f}ms, speedup={speedup:.2f}x"
-            )
-
-        def _combined():
-            mi, si = stats_cell(qi, ki, w)
-            return _force_grad_outputs(grad_cell(
-                q, k, qi, ki, w, softmax_max, softmax_sum, mi, si,
-                scale_value=scale_value, query_rope=qr, key_rope=kr,
-            ))
-
-        t_med, t_p20, t_p80 = _do_bench(_combined)
-        print(f"triton combined:     median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
-        triton_combined_med = t_med
-
-        if official_lse is None or official_grad is None:
-            print("official combined:   skipped (official dense baseline unavailable)")
-        elif official_grad_call is None:
-            print("official combined:   skipped (official grad_kl_loss baseline unavailable)")
-        else:
-            def _official_combined():
-                mi, si = _call_official_lse(official_lse, qi, ki, w)
-                return _force_grad_outputs(_call_official_grad(
-                    official_grad, q, k, qi, ki, w, softmax_max, softmax_sum,
-                    mi, si, scale_value, qr, kr,
-                ))
-
-            o_med, o_p20, o_p80 = _do_bench(_official_combined)
-            speedup = o_med / triton_combined_med if triton_combined_med > 0 else float("inf")
-            print(
-                f"official combined:   median={o_med:.2f}ms, "
-                f"p20={o_p20:.2f}ms, p80={o_p80:.2f}ms, speedup={speedup:.2f}x"
-            )
+        run_timing_grad(
+            q, k, qi, ki, w, qr, kr, softmax_max, softmax_sum, scale_value,
+            max_index, sum_index,
+            official_lse, official_grad,
+            official_max_index, official_sum_index,
+        )
 
 
-def run_profiling():
-    total_steps = 10
-    out_dir = "./profiler_data_dense_loss_backward"
-    B, S1, S2, N1, N2, D, Nidx1, D_idx = DENSE_PROFILE_CONFIG
-    scale_value = 1.0 / np.sqrt(D + DROPE)
-    q, k, qi, ki, w, qr, kr, softmax_max, softmax_sum = _make_inputs(
-        B, S1, S2, N1, N2, D, Nidx1, D_idx)
-
-    stats_cell = DenseLightningIndexerSoftmaxLseTriton()
-    grad_cell = DenseLightningIndexerGradKLLossTriton()
-
+def _make_profiler_config(out_dir):
     experimental_config = ms.profiler._ExperimentalConfig(
         profiler_level=ProfilerLevel.Level0,
         aic_metrics=AicoreMetrics.AiCoreNone,
@@ -259,17 +251,86 @@ def run_profiling():
         mstx=False,
         data_simplification=False,
     )
+    return experimental_config, ms.profiler.schedule(
+        wait=2, warmup=2, active=4, repeat=1, skip_first=2
+    ), ms.profiler.tensorboard_trace_handler(out_dir)
 
+
+def run_profiling_lse():
+    total_steps = 10
+    out_dir = "./profiler_data_dense_lse"
+    B, S1, S2, N1, N2, D, Nidx1, D_idx = DENSE_PROFILE_CONFIG
+    _, _, qi, ki, w, _, _, _, _ = _make_inputs(B, S1, S2, N1, N2, D, Nidx1, D_idx)
+    stats_cell = DenseLightningIndexerSoftmaxLseTriton()
+
+    experimental_config, schedule, trace_handler = _make_profiler_config(out_dir)
     with ms.profiler.profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
         with_stack=True,
-        schedule=ms.profiler.schedule(wait=2, warmup=2, active=4, repeat=1, skip_first=2),
-        on_trace_ready=ms.profiler.tensorboard_trace_handler(out_dir),
+        schedule=schedule,
+        on_trace_ready=trace_handler,
         profile_memory=False,
         experimental_config=experimental_config,
     ) as prof:
         for _ in range(total_steps):
             max_index, sum_index = stats_cell(qi, ki, w)
+            runtime.synchronize()
+            prof.step()
+            del max_index, sum_index
+
+    print(f"Profiler data saved to {out_dir}")
+
+
+def run_profiling_lse_cann():
+    total_steps = 10
+    out_dir = "./profiler_data_dense_lse_cann"
+    B, S1, S2, N1, N2, D, Nidx1, D_idx = DENSE_PROFILE_CONFIG
+    _, _, qi, ki, w, _, _, _, _ = _make_inputs(B, S1, S2, N1, N2, D, Nidx1, D_idx)
+    official_lse, official_grad, official_source = _resolve_official_dense_ops()
+    if official_lse is None:
+        print(f"CANN dense LSE profiling skipped: {official_source}")
+        return
+    print(f"CANN dense DLI source: {official_source}")
+
+    experimental_config, schedule, trace_handler = _make_profiler_config(out_dir)
+    with ms.profiler.profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
+        with_stack=True,
+        schedule=schedule,
+        on_trace_ready=trace_handler,
+        profile_memory=False,
+        experimental_config=experimental_config,
+    ) as prof:
+        for _ in range(total_steps):
+            max_index, sum_index = _call_official_lse(official_lse, qi, ki, w)
+            runtime.synchronize()
+            prof.step()
+            del max_index, sum_index
+
+    print(f"Profiler data saved to {out_dir}")
+
+
+def run_profiling_grad():
+    total_steps = 10
+    out_dir = "./profiler_data_dense_grad"
+    B, S1, S2, N1, N2, D, Nidx1, D_idx = DENSE_PROFILE_CONFIG
+    scale_value = 1.0 / np.sqrt(D + DROPE)
+    q, k, qi, ki, w, qr, kr, softmax_max, softmax_sum = _make_inputs(
+        B, S1, S2, N1, N2, D, Nidx1, D_idx)
+    stats_cell = DenseLightningIndexerSoftmaxLseTriton()
+    grad_cell = DenseLightningIndexerGradKLLossTriton()
+    max_index, sum_index = stats_cell(qi, ki, w)
+
+    experimental_config, schedule, trace_handler = _make_profiler_config(out_dir)
+    with ms.profiler.profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
+        with_stack=True,
+        schedule=schedule,
+        on_trace_ready=trace_handler,
+        profile_memory=False,
+        experimental_config=experimental_config,
+    ) as prof:
+        for _ in range(total_steps):
             out = grad_cell(
                 q, k, qi, ki, w, softmax_max, softmax_sum, max_index, sum_index,
                 scale_value=scale_value, query_rope=qr, key_rope=kr,
@@ -277,51 +338,43 @@ def run_profiling():
             _materialize_grad_outputs(out)
             runtime.synchronize()
             prof.step()
-            del max_index, sum_index, out
+            del out
 
     print(f"Profiler data saved to {out_dir}")
 
 
-def run_profiling_cann():
+def run_profiling_grad_cann():
     total_steps = 10
-    out_dir = "./profiler_data_dense_loss_backward_cann"
+    out_dir = "./profiler_data_dense_grad_cann"
     B, S1, S2, N1, N2, D, Nidx1, D_idx = DENSE_PROFILE_CONFIG
     scale_value = 1.0 / np.sqrt(D + DROPE)
     q, k, qi, ki, w, qr, kr, softmax_max, softmax_sum = _make_inputs(
         B, S1, S2, N1, N2, D, Nidx1, D_idx)
-
     official_lse, official_grad, official_source = _resolve_official_dense_ops()
     if official_lse is None or official_grad is None:
-        print(f"CANN dense profiling skipped: {official_source}")
+        print(f"CANN dense grad profiling skipped: {official_source}")
         return
     print(f"CANN dense DLI source: {official_source}")
+    official_max_index, official_sum_index = _call_official_lse(official_lse, qi, ki, w)
 
-    experimental_config = ms.profiler._ExperimentalConfig(
-        profiler_level=ProfilerLevel.Level0,
-        aic_metrics=AicoreMetrics.AiCoreNone,
-        l2_cache=False,
-        mstx=False,
-        data_simplification=False,
-    )
-
+    experimental_config, schedule, trace_handler = _make_profiler_config(out_dir)
     with ms.profiler.profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
         with_stack=True,
-        schedule=ms.profiler.schedule(wait=2, warmup=2, active=4, repeat=1, skip_first=2),
-        on_trace_ready=ms.profiler.tensorboard_trace_handler(out_dir),
+        schedule=schedule,
+        on_trace_ready=trace_handler,
         profile_memory=False,
         experimental_config=experimental_config,
     ) as prof:
         for _ in range(total_steps):
-            max_index, sum_index = _call_official_lse(official_lse, qi, ki, w)
             out = _call_official_grad(
                 official_grad, q, k, qi, ki, w, softmax_max, softmax_sum,
-                max_index, sum_index, scale_value, qr, kr,
+                official_max_index, official_sum_index, scale_value, qr, kr,
             )
             _materialize_grad_outputs(out)
             runtime.synchronize()
             prof.step()
-            del max_index, sum_index, out
+            del out
 
     print(f"Profiler data saved to {out_dir}")
 
@@ -331,9 +384,13 @@ def run_kernel_only():
     scale_value = 1.0 / np.sqrt(D + DROPE)
     q, k, qi, ki, w, qr, kr, softmax_max, softmax_sum = _make_inputs(
         B, S1, S2, N1, N2, D, Nidx1, D_idx)
-
     stats_cell = DenseLightningIndexerSoftmaxLseTriton()
     grad_cell = DenseLightningIndexerGradKLLossTriton()
+
+    for _ in range(10):
+        max_index, sum_index = stats_cell(qi, ki, w)
+        runtime.synchronize()
+        del max_index, sum_index
 
     for _ in range(10):
         max_index, sum_index = stats_cell(qi, ki, w)
@@ -358,5 +415,7 @@ if __name__ == "__main__":
         run_kernel_only()
     else:
         run_timing()
-        run_profiling()
-        run_profiling_cann()
+        run_profiling_lse()
+        run_profiling_lse_cann()
+        run_profiling_grad()
+        run_profiling_grad_cann()
