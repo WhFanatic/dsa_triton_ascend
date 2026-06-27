@@ -147,7 +147,8 @@ def _select_block_config(D, N1):
     block_g = min(16, max(8, N1))
     # BLOCK_K_A (Pass A: gather + 3 dots + dS/P store) and BLOCK_K_B (Pass B:
     # dk/dv acc) split so each pass can tune independently. BK_A capped at 32:
-    # at 64 the tl.trans(k_cat) tile ([D_TOT,BK]=72KB) overflows UB. BK_B capped
+    # at 64 k_cat must exist in BOTH dot orientations (scores contracts D_TOT,
+    # acc_dq contracts BK) = 144KB, + acc_dq + q/do → UB overflow. BK_B capped
     # at 32: the [BK_B, D_TOT] fp32 accumulator overflows at 64.
     return {"BLOCK_G": block_g, "BLOCK_K_A": 32, "BLOCK_K_B": 32, "BLOCK_D": 128}
 
@@ -249,8 +250,25 @@ def _sfa_grad_kernel(
         HC_LOOP: tl.constexpr = 2
     else:
         HC_LOOP: tl.constexpr = NUM_HC
-    for hc in range(HC_LOOP):
-        g_offs = hc * BLOCK_G + tl.arange(0, BLOCK_G)
+
+    # Stage A merges GROUP_HC head chunks into one dot's M-dim. Two wins:
+    # (1) cube micro-tiles are 16x16 — M=BLOCK_G=8 alone half-fills them
+    #     (cube_ratio 0.14%); MG=16 fills them fully.
+    # (2) dot invocation count drops by GROUP_HC× (k_cat shared across the
+    #     merged heads — same tokens). Dots here are issue/sync-bound, not
+    #     compute-bound, so fewer-larger dots cut the dominant cube↔vector
+    #     sync cost. MG capped at 2*BLOCK_G by UB: acc_dqcat[MG,D_TOT] fp32 +
+    #     q_cat/do_pad[MG,D_TOT] bf16 + cube-internal fp32 upcast copies must
+    #     coexist with k_cat[blk,D_TOT] + trans under 192KB.
+    if NUM_HC >= 2:
+        GROUP_HC: tl.constexpr = 2
+        N_GROUPS: tl.constexpr = NUM_HC // 2
+    else:
+        GROUP_HC: tl.constexpr = 1
+        N_GROUPS: tl.constexpr = 2
+    MG: tl.constexpr = GROUP_HC * BLOCK_G
+    for hg in range(N_GROUPS):
+        g_offs = hg * MG + tl.arange(0, MG)
         g_valid = g_offs < N1
         if NEED_CLAMP:
             g_offs_s = tl.where(g_valid, g_offs, 0)
@@ -265,7 +283,7 @@ def _sfa_grad_kernel(
         sm_sum = tl.where(sm_sum > 0.0, sm_sum, 1.0)
         inv_sm_sum = 1.0 / sm_sum
         delta = tl.load(delta_ptr + pid_bs1 * N1 + g_offs_s, mask=g_valid, other=0.0)
-        acc_dqcat = tl.zeros([BLOCK_G, D_TOT], dtype=tl.float32)
+        acc_dqcat = tl.zeros([MG, D_TOT], dtype=tl.float32)
 
         for blk_start in range(0, topK, BLOCK_K_A):
             blk_offs = blk_start + blk_k_offs_a
@@ -284,15 +302,16 @@ def _sfa_grad_kernel(
                 kcat_ptr + kcat_base + tok_clamped[:, None] * D_TOT + dt_offs[None, :],
                 mask=tok_valid[:, None], other=0.0)
 
-            scores = tl.dot(q_cat, tl.trans(k_cat)).to(tl.float32)
-            scores = scores * scale_value
+            # Compute scores and dPv back-to-back on cube BEFORE any vector op so
+            # the cube->vector sync happens once for both (vs interleaving P between
+            # them, which forces cube->vector->cube->vector = 2 extra syncs).
+            scores = tl.dot(q_cat, tl.trans(k_cat)).to(tl.float32) * scale_value
+            dPv = tl.dot(do_pad, tl.trans(k_cat)).to(tl.float32)
 
             P = tl.exp(scores - sm_max[:, None]) * inv_sm_sum[:, None]
-
-            dPv = tl.dot(do_pad, tl.trans(k_cat)).to(tl.float32)
             dS = P * (dPv - delta[:, None]) * scale_value
 
-            acc_dqcat += tl.dot(dS.to(k_cat.dtype), k_cat).to(tl.float32)
+            acc_dqcat = tl.dot(dS.to(k_cat.dtype), k_cat, acc=acc_dqcat)
 
             # Materialize dS/P to GM workspace (bf16 — same precision as the dots
             # below which downcast to bf16 anyway). Pass B reads these back to
@@ -315,9 +334,10 @@ def _sfa_grad_kernel(
     # ──────────────────────────────────────────────────────────────
     # Stage B1: Accumulate dk/dkr across head chunks.
     # blk_start-outer, hc-inner loop. Reads dS from workspace (written in A) —
-    # NO k_cat gather, NO scores/P/dS recompute. dk = dS^T · q_cat.
-    # dk_acc persists across hc iterations within one blk_start; single
-    # atomic_add per output after all hc.
+    # NO k_cat gather, NO scores/P/dS recompute. dk = dS^T · q_cat. Kept in-kernel
+    # (not a separate kernel) so each program's 512KB dS/P workspace stays L2-hot
+    # between A's write and B's read — a 2-kernel split forced a cold GM re-read
+    # and regressed to ~77ms. dk_acc persists across hc via tl.dot(acc=).
     # ──────────────────────────────────────────────────────────────
     for blk_start in range(0, topK, BLOCK_K_B):
         blk_offs = blk_start + blk_k_offs_b
@@ -348,7 +368,7 @@ def _sfa_grad_kernel(
                 ws_mask = g_valid[:, None]
             dS = tl.load(ds_ptr + ws_offs, mask=ws_mask, other=0.0)
 
-            dkcat_acc += tl.dot(tl.trans(dS).to(q_cat.dtype), q_cat).to(tl.float32)
+            dkcat_acc = tl.dot(tl.trans(dS).to(q_cat.dtype), q_cat, acc=dkcat_acc)
 
         # Single atomic_add for dkcat (accumulated across all head chunks). Host
         # splits nope|rope columns back into dk/dkr.
@@ -358,8 +378,8 @@ def _sfa_grad_kernel(
     # ──────────────────────────────────────────────────────────────
     # Stage B2: Accumulate dv across head chunks.
     # Reads P from workspace (written in A) — NO k_cat gather, NO scores/P
-    # recompute. dv = P^T · do. Separate from B1 to reduce peak UB (dk_acc and
-    # dv_acc coexist would overflow).
+    # recompute. dv = P^T · do. Separate from B1: dk_acc and dv_acc coexist would
+    # overflow UB + L0C (two concurrent cube dots). dv_acc via tl.dot(acc=).
     # ──────────────────────────────────────────────────────────────
     for blk_start in range(0, topK, BLOCK_K_B):
         blk_offs = blk_start + blk_k_offs_b
@@ -390,7 +410,7 @@ def _sfa_grad_kernel(
                 ws_mask = g_valid[:, None]
             P = tl.load(p_ptr + ws_offs, mask=ws_mask, other=0.0)
 
-            dv_acc += tl.dot(tl.trans(P).to(do_tile.dtype), do_tile).to(tl.float32)
+            dv_acc = tl.dot(tl.trans(P).to(do_tile.dtype), do_tile, acc=dv_acc)
 
         # Single atomic_add for dv
         dv_offs = v_base + tok_clamped[:, None] * D + d_offs[None, :]
