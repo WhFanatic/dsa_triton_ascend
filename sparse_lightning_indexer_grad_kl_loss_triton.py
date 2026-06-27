@@ -389,14 +389,17 @@ def _query_index_weight_grad_kernel(
         ds_idx = di_tile[None, :] * w_g[:, None] * relu_mask
 
         # ki_tile: [BLOCK_K, BLOCK_D], shared across all g
+        # Keep ki_tile in fp16 to halve UB pressure on tight backends
+        # (e.g. CANN 9.0 + Ascend910_9382 multi-buffer pass). tl.dot
+        # accepts fp16 x fp16 -> fp32 accumulator.
         ki_tile = tl.load(
             key_index_gathered_ptr + ki_g_base
             + k_offs[:, None] * D_idx + d_offs[None, :],
             mask=k_mask[:, None] & d_valid[None, :],
-            other=0.0).to(tl.float32)
+            other=0.0)
 
         # dqi_acc += [BLOCK_G, BLOCK_K] @ [BLOCK_K, BLOCK_D]
-        dqi_acc += tl.dot(ds_idx, ki_tile)
+        dqi_acc += tl.dot(ds_idx.to(ki_tile.dtype), ki_tile)
 
     # Store dQueryIndex tile [BLOCK_G, BLOCK_D]
     dqi_offs = (qi_base
