@@ -124,6 +124,10 @@ class DenseLightningIndexerSoftmaxLse(Cell):
                   layout="BSND", sparse_mode=3,
                   pre_tokens=INT64_MAX, next_tokens=INT64_MAX):
         """Forward pass. See class docstring for argument details."""
+        if actual_seq_qlen is None and len(query_index.shape) == 4:
+            actual_seq_qlen = [query_index.shape[1]] * query_index.shape[0]
+        if actual_seq_klen is None and len(key_index.shape) == 4:
+            actual_seq_klen = [key_index.shape[1]] * key_index.shape[0]
         return self._custom_op(
             query_index, key_index, weight,
             actual_seq_qlen, actual_seq_klen,
@@ -222,6 +226,10 @@ class DenseLightningIndexerGradKLLoss(Cell):
             raise ValueError(
                 "query_rope and key_rope are required and cannot be None. "
                 "MindSpore ops.Custom does not support None tensor inputs.")
+        if actual_seq_qlen is None and len(query_index.shape) == 4:
+            actual_seq_qlen = [query_index.shape[1]] * query_index.shape[0]
+        if actual_seq_klen is None and len(key_index.shape) == 4:
+            actual_seq_klen = [key_index.shape[1]] * key_index.shape[0]
         return self._custom_op(
             query, key, query_index, key_index, weights,
             softmax_max, softmax_sum,

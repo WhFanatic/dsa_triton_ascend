@@ -967,24 +967,21 @@ def npu_dense_lightning_indexer_grad_kl_loss_triton(
 
 
 class DenseLightningIndexerSoftmaxLseTriton(ms.nn.Cell):
-    def __init__(self, layout="BSND", sparse_mode=3,
-                 pre_tokens=INT64_MAX, next_tokens=INT64_MAX):
+    def __init__(self):
         super().__init__()
-        self.layout = layout
-        self.sparse_mode = sparse_mode
-        self.pre_tokens = pre_tokens
-        self.next_tokens = next_tokens
 
-    def construct(self, query_index, key_index, weights,
-                  actual_seq_qlen=None, actual_seq_klen=None):
+    def construct(self, query_index, key_index, weight,
+                  actual_seq_qlen=None, actual_seq_klen=None,
+                  layout="BSND", sparse_mode=3,
+                  pre_tokens=INT64_MAX, next_tokens=INT64_MAX):
         return npu_dense_lightning_indexer_softmax_lse_triton(
-            query_index, key_index, weights,
+            query_index, key_index, weight,
             actual_seq_qlen=actual_seq_qlen,
             actual_seq_klen=actual_seq_klen,
-            layout=self.layout,
-            sparse_mode=self.sparse_mode,
-            pre_tokens=self.pre_tokens,
-            next_tokens=self.next_tokens,
+            layout=layout,
+            sparse_mode=sparse_mode,
+            pre_tokens=pre_tokens,
+            next_tokens=next_tokens,
         )
 
 
@@ -1020,5 +1017,28 @@ class DenseLossBackwardTriton(ms.nn.Cell):
         )
 
 
-class DenseLightningIndexerGradKLLossTriton(DenseLossBackwardTriton):
-    pass
+class DenseLightningIndexerGradKLLossTriton(ms.nn.Cell):
+    def __init__(self):
+        super().__init__()
+
+    def construct(self, query, key, query_index, key_index, weights,
+                  softmax_max, softmax_sum,
+                  softmax_max_index, softmax_sum_index,
+                  scale_value=1.0,
+                  query_rope=None, key_rope=None,
+                  actual_seq_qlen=None, actual_seq_klen=None,
+                  layout="BSND", sparse_mode=3,
+                  pre_tokens=INT64_MAX, next_tokens=INT64_MAX):
+        return dense_loss_backward_triton(
+            query, key, query_index, key_index, weights,
+            softmax_max, softmax_sum,
+            softmax_max_index, softmax_sum_index,
+            scale_value,
+            query_rope=query_rope, key_rope=key_rope,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_klen=actual_seq_klen,
+            layout=layout,
+            sparse_mode=sparse_mode,
+            pre_tokens=pre_tokens,
+            next_tokens=next_tokens,
+        )

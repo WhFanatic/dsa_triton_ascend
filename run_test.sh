@@ -1,9 +1,9 @@
 #!/bin/bash
-export ASCEND_RT_VISIBLE_DEVICES=8
-export TRITON_END=mindspore
-export TRITON_BACKEND=mindspore
-export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-export TRITON_CACHE_DIR=./my_triton_cache
+# export ASCEND_RT_VISIBLE_DEVICES=4
+# export TRITON_END=mindspore
+# export TRITON_BACKEND=mindspore
+# export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+# export TRITON_CACHE_DIR=./my_triton_cache
 
 # ####################
 # LightningIndexer 算子测试
@@ -28,9 +28,9 @@ export TRITON_CACHE_DIR=./my_triton_cache
 
 # ---- 性能 / profiling ----
 # 计时 + speedup（triton vs CANN）
-TRITON_PRINT_AUTOTUNING=1 python perf_li_triton.py
+# TRITON_PRINT_AUTOTUNING=1 python perf_li_triton.py
 # 内核性能测试（msprof op 指定 kernel，避免全量采集与 triton driver 冲突导致 segfault）
-msprof op --kernel-name="_lightning_indexer_score_kernel" --output=./profilers python perf_li_triton.py --kernel-only
+# msprof op --kernel-name="_lightning_indexer_score_kernel" --output=./profilers python perf_li_triton.py --kernel-only
 
 # ####################
 # SparseLightningIndexerGradKLLoss 算子测试----脚本待调试
@@ -50,13 +50,32 @@ msprof op --kernel-name="_lightning_indexer_score_kernel" --output=./profilers p
 
 
 # ####################
-# Dense 算子测试
+# Dense 算子测试（DenseLightningIndexerSoftmaxLse / GradKLLoss）
 # ####################
-# 基础调试
-# 
-# 全量测试
-# pytest --forked test_dense_loss_backward_triton.py -v "$@"
-# 性能测试（triton vs CANN 计时 + speedup）
+
+# ---- 基础调试（__main__，跑 DENSE_TEST_CONFIGS 4 个 CANN 范围配置 × bf16，不依赖 CANN import）----
+# python test_dense_loss_backward_triton.py
+
+# ---- LSE 精度（分流：D_idx=128/Nidx1∈{32,64} vs CANN，其余 vs NumPy；bf16 全 29 配置 + fp16 smoke 4，共 33）----
+# pytest test_dense_loss_backward_triton.py -v -k test_dense_softmax_lse_precision "$@"
+
+# ---- LSE 接口守卫（不支持参数须 raise，不跑算子、不依赖 NPU，本机可跑）----
+# pytest --forked test_dense_loss_backward_triton.py -v -k test_dense_softmax_lse_guards "$@"
+
+# ---- grad 功能+精度（分流：CANN 范围 vs CANN grad，其余 vs NumPy golden；两段式 LSE→grad；bf16 全 29 配置 + fp16 smoke 4，共 33）----
+# pytest test_dense_loss_backward_triton.py -v -k test_dense_grad_kl_loss_triton_supported_shapes "$@"
+
+# ---- grad 严格 CANN golden 对比（纯 CANN baseline，4 配置，需 CANN 环境）----
+# pytest test_dense_loss_backward_triton.py -v -k test_dense_grad_kl_loss_precision "$@"
+
+# ---- NumPy LSE 与 CANN LSE 校准（默认跑，确认 NumPy golden 可信，需 CANN 环境）----
+# pytest test_dense_loss_backward_triton.py -v -k test_dense_lse_numpy_matches_cann "$@"
+
+# ---- 全量回归（LSE + grad 分流 + CANN golden，所有配置）----
+# pytest test_dense_loss_backward_triton.py -v "$@"
+
+# ---- 性能 / profiling ----
+# 计时 + speedup（triton vs CANN）
 # TRITON_PRINT_AUTOTUNING=1 python perf_dense_loss_backward_triton.py
 
 
@@ -102,9 +121,9 @@ msprof op --kernel-name="_lightning_indexer_score_kernel" --output=./profilers p
 
 # ---- 性能 / profiling ----
 # 计时 + speedup（triton vs CANN）
-# TRITON_PRINT_AUTOTUNING=1 python perf_sfa_triton.py
+TRITON_PRINT_AUTOTUNING=1 python perf_sfa_triton.py
 # 内核性能测试（msprof op 指定 kernel，避免全量采集与 triton driver 冲突导致 segfault）
-# msprof op --kernel-name="_sfa_kernel" --output=./profilers python perf_sfa_triton.py --kernel-only
+msprof op --kernel-name="_sfa_kernel" --output=./profilers python perf_sfa_triton.py --kernel-only
 
 # 计时 + speedup（triton vs CANN）
 # TRITON_PRINT_AUTOTUNING=1 python perf_sfa_grad_triton.py

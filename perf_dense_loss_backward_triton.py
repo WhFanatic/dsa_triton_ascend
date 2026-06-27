@@ -164,8 +164,8 @@ def run_timing():
         q, k, qi, ki, w, qr, kr, softmax_max, softmax_sum = _make_inputs(
             B, S1, S2, N1, N2, D, Nidx1, D_idx)
 
-        stats_cell = DenseLightningIndexerSoftmaxLseTriton(layout="BSND", sparse_mode=3)
-        grad_cell = DenseLightningIndexerGradKLLossTriton(scale_value=scale_value, layout="BSND", sparse_mode=3)
+        stats_cell = DenseLightningIndexerSoftmaxLseTriton()
+        grad_cell = DenseLightningIndexerGradKLLossTriton()
         max_index, sum_index = stats_cell(qi, ki, w)
 
         t_med, t_p20, t_p80 = _do_bench(lambda stats_cell=stats_cell: stats_cell(qi, ki, w))
@@ -188,7 +188,7 @@ def run_timing():
         def _triton_grad():
             return _force_grad_outputs(grad_cell(
                 q, k, qi, ki, w, softmax_max, softmax_sum, max_index, sum_index,
-                query_rope=qr, key_rope=kr,
+                scale_value=scale_value, query_rope=qr, key_rope=kr,
             ))
 
         t_med, t_p20, t_p80 = _do_bench(_triton_grad)
@@ -214,7 +214,7 @@ def run_timing():
             mi, si = stats_cell(qi, ki, w)
             return _force_grad_outputs(grad_cell(
                 q, k, qi, ki, w, softmax_max, softmax_sum, mi, si,
-                query_rope=qr, key_rope=kr,
+                scale_value=scale_value, query_rope=qr, key_rope=kr,
             ))
 
         t_med, t_p20, t_p80 = _do_bench(_combined)
@@ -249,8 +249,8 @@ def run_profiling():
     q, k, qi, ki, w, qr, kr, softmax_max, softmax_sum = _make_inputs(
         B, S1, S2, N1, N2, D, Nidx1, D_idx)
 
-    stats_cell = DenseLightningIndexerSoftmaxLseTriton(layout="BSND", sparse_mode=3)
-    grad_cell = DenseLightningIndexerGradKLLossTriton(scale_value=scale_value, layout="BSND", sparse_mode=3)
+    stats_cell = DenseLightningIndexerSoftmaxLseTriton()
+    grad_cell = DenseLightningIndexerGradKLLossTriton()
 
     experimental_config = ms.profiler._ExperimentalConfig(
         profiler_level=ProfilerLevel.Level0,
@@ -272,7 +272,7 @@ def run_profiling():
             max_index, sum_index = stats_cell(qi, ki, w)
             out = grad_cell(
                 q, k, qi, ki, w, softmax_max, softmax_sum, max_index, sum_index,
-                query_rope=qr, key_rope=kr,
+                scale_value=scale_value, query_rope=qr, key_rope=kr,
             )
             _materialize_grad_outputs(out)
             runtime.synchronize()
@@ -332,15 +332,14 @@ def run_kernel_only():
     q, k, qi, ki, w, qr, kr, softmax_max, softmax_sum = _make_inputs(
         B, S1, S2, N1, N2, D, Nidx1, D_idx)
 
-    stats_cell = DenseLightningIndexerSoftmaxLseTriton(layout="BSND", sparse_mode=3)
-    grad_cell = DenseLightningIndexerGradKLLossTriton(
-        scale_value=scale_value, layout="BSND", sparse_mode=3)
+    stats_cell = DenseLightningIndexerSoftmaxLseTriton()
+    grad_cell = DenseLightningIndexerGradKLLossTriton()
 
     for _ in range(10):
         max_index, sum_index = stats_cell(qi, ki, w)
         out = grad_cell(
             q, k, qi, ki, w, softmax_max, softmax_sum, max_index, sum_index,
-            query_rope=qr, key_rope=kr,
+            scale_value=scale_value, query_rope=qr, key_rope=kr,
         )
         _materialize_grad_outputs(out)
         runtime.synchronize()
