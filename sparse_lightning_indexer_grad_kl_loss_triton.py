@@ -232,27 +232,21 @@ def _teacher_distribution_kernel(
 
 @triton.jit
 def _indexer_grad_kl_loss_kernel(
-    query_ptr, key_gathered_ptr,
-    query_rope_ptr, key_rope_gathered_ptr,
     query_index_ptr, key_index_gathered_ptr,
     weights_ptr,
-    softmax_max_ptr, softmax_sum_ptr,              # from forward pass
     di_ptr,
-    d_query_index_ptr, d_weights_ptr, loss_ptr,
+    loss_ptr,
     s_idx_buf_ptr, buf_i_ptr, buf_p_ptr,
-    B, S1, N1, Nidx1, D, D_rope, D_idx, topK,
-    scale_value, S1_OFFSET,
+    S1, Nidx1, D_idx, topK,
+    S1_OFFSET,
     act_q_ptr, act_k_ptr,
     VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
-    BLOCK_H: tl.constexpr, BLOCK_G: tl.constexpr,
+    BLOCK_G: tl.constexpr,
 ):
     """Indexer score, teacher KL, and dI. Grid: (B*S1,).
 
-    dQueryIndex/dWeights and dKeyIndex are computed by follow-up kernels.
-    s_idx_buf: ReLU(dot) per (g,k), reused in gradient kernels.
-    buf_i:     I[k] weighted index-level scores.
-    buf_p:     p[k] averaged teacher distribution.
-    di:        softmax(I) - p, gradient signal back to I.
+    Stage 1: I[k]=sum_g W_g*ReLU(qi_g @ ki_gathered[k]^T), saves s_idx_buf.
+    Stage 3+4: softmax(I) -> KL(p || softmax(I)), dI = softmax(I) - p.
     """
     pid = tl.program_id(0)
     b = pid // S1
@@ -264,17 +258,16 @@ def _indexer_grad_kl_loss_kernel(
         return
 
     act_k = tl.load(act_k_ptr + b)
-    # s2_real: number of valid key positions within causal window (s1 + right context)
     s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1_global + 1, 0))
 
     qi_base = pid * Nidx1 * D_idx
     ki_g_base = pid * topK * D_idx
     w_base = pid * Nidx1
     local_k = tl.arange(0, BLOCK_K)
-
-    # Stage 1: I[k] = sum_g W_g * ReLU(qi_g @ ki_gathered[k]^T)
     g_local = tl.arange(0, BLOCK_G)
     d_idx_local = tl.arange(0, BLOCK_D)
+
+    # Stage 1: I[k] = sum_g W_g * ReLU(qi_g @ ki_gathered[k]^T)
     for k_start in range(0, VALID_K, BLOCK_K):
         if k_start < s2_real:
             k_offs = k_start + local_k
@@ -298,7 +291,7 @@ def _indexer_grad_kl_loss_kernel(
                         + k_offs[:, None] * D_idx + d_offs[None, :],
                         mask=k_mask[:, None] & d_valid[None, :],
                         other=0.0)
-                    idx_scores += tl.dot(qi_tile.to(tl.float32), tl.trans(ki_tile.to(tl.float32)))
+                    idx_scores += tl.dot(qi_tile, tl.trans(ki_tile))
 
                 relu = tl.maximum(idx_scores, 0.0)
                 relu = tl.where(g_mask[:, None] & k_mask[None, :], relu, 0.0)
@@ -312,51 +305,30 @@ def _indexer_grad_kl_loss_kernel(
                     mask=g_mask[:, None] & k_mask[None, :])
             tl.store(buf_i_ptr + pid * topK + k_offs, i_tile, mask=k_mask)
 
-    # Stage 2 teacher p[k] is computed by _teacher_distribution_kernel.
-
     # Stage 3+4: softmax(I) -> KL(p || softmax(I)) loss, dI = softmax(I) - p
-    i_max = tl.full([1], float('-inf'), dtype=tl.float32)
-    for k_start in range(0, VALID_K, BLOCK_K):
-        if k_start < s2_real:
-            k_offs = k_start + local_k
-            k_mask = k_offs < s2_real
-            i_tile = tl.load(buf_i_ptr + pid * topK + k_offs,
-                             mask=k_mask, other=float('-inf'))
-            i_max = tl.maximum(i_max, tl.max(i_tile, axis=0))
-
-    i_sum = tl.zeros([1], dtype=tl.float32)
-    for k_start in range(0, VALID_K, BLOCK_K):
-        if k_start < s2_real:
-            k_offs = k_start + local_k
-            k_mask = k_offs < s2_real
-            i_tile = tl.load(buf_i_ptr + pid * topK + k_offs,
-                             mask=k_mask, other=float('-inf'))
-            exp_i = tl.exp(i_tile - i_max)
-            exp_i = tl.where(k_mask, exp_i, 0.0)
-            i_sum += tl.sum(exp_i, axis=0)
-
-    kl_total = tl.zeros([1], dtype=tl.float32)
+    # Load full I[0:VALID_K] into UB once (fp32, ~8KB at VALID_K=2048) and
+    # share across max/sum/softmax stages to avoid re-reading buf_i 3x.
+    valid_k_offs = tl.arange(0, VALID_K)
+    valid_k_mask = valid_k_offs < s2_real
+    i_full = tl.load(buf_i_ptr + pid * topK + valid_k_offs,
+                     mask=valid_k_mask, other=float('-inf'))
+    i_max = tl.max(i_full, axis=0)
+    exp_i_full = tl.where(valid_k_mask, tl.exp(i_full - i_max), 0.0)
+    i_sum = tl.sum(exp_i_full, axis=0)
+    inv_i_sum = 1.0 / (i_sum + 1e-8)
     log_i_sum = tl.log(i_sum + 1e-8)
-    for k_start in range(0, VALID_K, BLOCK_K):
-        if k_start < s2_real:
-            k_offs = k_start + local_k
-            k_mask = k_offs < s2_real
-            i_tile = tl.load(buf_i_ptr + pid * topK + k_offs,
-                             mask=k_mask, other=float('-inf'))
-            softmax_i = tl.exp(i_tile - i_max) / (i_sum + 1e-8)
-            softmax_i = tl.where(k_mask, softmax_i, 0.0)
-            p_tile = tl.load(buf_p_ptr + pid * topK + k_offs,
-                             mask=k_mask, other=0.0)
-            di_tile = softmax_i - p_tile
-            tl.store(di_ptr + pid * topK + k_offs, di_tile, mask=k_mask)
-            p_clamped = tl.maximum(p_tile, 1e-8)
-            log_softmax_i = i_tile - i_max - log_i_sum
-            log_si_clamped = tl.maximum(log_softmax_i, -18.420680743952367)
-            kl = p_clamped * (tl.log(p_clamped) - log_si_clamped)
-            kl = tl.where(k_mask, kl, 0.0)
-            kl_total += tl.sum(kl, axis=0)
-
-    tl.store(loss_ptr + pid, tl.sum(kl_total))
+    softmax_i_full = exp_i_full * inv_i_sum
+    p_full = tl.load(buf_p_ptr + pid * topK + valid_k_offs,
+                     mask=valid_k_mask, other=0.0)
+    di_full = tl.where(valid_k_mask, softmax_i_full - p_full, 0.0)
+    tl.store(di_ptr + pid * topK + valid_k_offs, di_full, mask=valid_k_mask)
+    p_clamped = tl.maximum(p_full, 1e-8)
+    log_softmax_i = i_full - i_max - log_i_sum
+    log_si_clamped = tl.maximum(log_softmax_i, -18.420680743952367)
+    kl_full = tl.where(valid_k_mask,
+                       p_clamped * (tl.log(p_clamped) - log_si_clamped),
+                       0.0)
+    tl.store(loss_ptr + pid, tl.sum(kl_full, axis=0))
 
 
 @triton.jit
@@ -690,19 +662,16 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         runtime.synchronize()
 
     _indexer_grad_kl_loss_kernel[grid_bs1](
-        q_flat, key_gathered,
-        qr_flat, key_rope_gathered,
         qi_flat, key_index_gathered,
         w_flat,
-        sm_max_flat, sm_sum_flat,
         di,
-        d_query_index, d_weights, loss_parts,
+        loss_parts,
         s_idx_buf, buf_i, buf_p,
-        B, S1, N1, Nidx1, D, D_rope, D_idx, topK,
-        scale_value, s1_offset,
+        S1, Nidx1, D_idx, topK,
+        s1_offset,
         actual_seq_qlen, actual_seq_klen,
         VALID_K=valid_k, BLOCK_K=BLOCK_K_MAIN, BLOCK_D=BLOCK_D_MAIN,
-        BLOCK_H=BLOCK_H_MAIN, BLOCK_G=BLOCK_G_MAIN,
+        BLOCK_G=BLOCK_G_MAIN,
     )
 
     if _SLISYNC:
