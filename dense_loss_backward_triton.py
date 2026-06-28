@@ -313,16 +313,13 @@ def _dense_dkey_index_kernel(
     d_key_index_ptr,
     act_q_ptr, act_k_ptr,
     B, S1, S2, N1, N2, G, Nidx1, D, D_idx, D_rope,
-    scale_value, BS1_OFFSET, KD_OFFSET,
-    NUM_D_BLOCKS: tl.constexpr,
+    scale_value, BS1_OFFSET,
     BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
     HAS_ROPE: tl.constexpr,
 ):
     bs1_idx = BS1_OFFSET + tl.program_id(0)
-    g = tl.program_id(1)
-    kd_block = KD_OFFSET + tl.program_id(2)
-    k_block = kd_block // NUM_D_BLOCKS
-    d_block = kd_block % NUM_D_BLOCKS
+    k_block = tl.program_id(1)
+    d_block = tl.program_id(2)
     b = bs1_idx // S1
     s1 = bs1_idx % S1
 
@@ -337,26 +334,31 @@ def _dense_dkey_index_kernel(
 
     di = tl.load(di_ptr + bs1_idx * S2 + s2_offsets, mask=k_mask, other=0.0).to(tl.float32)
 
-    dot_g = _dense_indexer_dot_g_tile(
-        query_index_ptr, key_index_ptr,
-        B, S1, S2, Nidx1, D_idx,
-        bs1_idx, b, g, s2_offsets, k_mask,
-        BLOCK_K, BLOCK_D,
-    )
-    relu_mask = (dot_g > 0.0).to(tl.float32)
-    w_g = tl.load(weights_ptr + bs1_idx * Nidx1 + g).to(tl.float32)
-    coeff = di * w_g * relu_mask
-
     d_offsets = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
     d_mask = d_offsets < D_idx
-    qi = tl.load(
-        query_index_ptr + bs1_idx * Nidx1 * D_idx + g * D_idx + d_offsets,
-        mask=d_mask,
-        other=0.0,
-    ).to(tl.float32)
-    dki = coeff[:, None] * qi[None, :]
+    qi_base = bs1_idx * Nidx1 * D_idx
+    w_base = bs1_idx * Nidx1
+
+    dki_acc = tl.zeros([BLOCK_K, BLOCK_D], dtype=tl.float32)
+    for g in range(Nidx1):
+        dot_g = _dense_indexer_dot_g_tile(
+            query_index_ptr, key_index_ptr,
+            B, S1, S2, Nidx1, D_idx,
+            bs1_idx, b, g, s2_offsets, k_mask,
+            BLOCK_K, BLOCK_D,
+        )
+        relu_mask = (dot_g > 0.0).to(tl.float32)
+        w_g = tl.load(weights_ptr + w_base + g).to(tl.float32)
+        coeff = di * w_g * relu_mask
+        qi = tl.load(
+            query_index_ptr + qi_base + g * D_idx + d_offsets,
+            mask=d_mask,
+            other=0.0,
+        ).to(tl.float32)
+        dki_acc += coeff[:, None] * qi[None, :]
+
     dki_offsets = b * S2 * D_idx + s2_offsets[:, None] * D_idx + d_offsets[None, :]
-    tl.atomic_add(d_key_index_ptr + dki_offsets, dki, mask=k_mask[:, None] & d_mask[None, :])
+    tl.atomic_add(d_key_index_ptr + dki_offsets, dki_acc, mask=k_mask[:, None] & d_mask[None, :])
 
 
 def _infer_dense_index_stats(query_index, key_index, weights,
@@ -488,25 +490,18 @@ def _dense_loss_backward_core(
         )
 
     num_k_blocks = (S2 + BLOCK_K - 1) // BLOCK_K
-    total_kd_blocks = num_k_blocks * num_d_blocks
-    kd_chunk = min(
-        total_kd_blocks,
-        max(1, MAX_TRITON_ASCEND_COREDIM // max(1, Nidx1)),
-    )
-    dkey_bs1_chunk = _bs1_chunk_for_core_dim(total_bs1, Nidx1 * kd_chunk)
+    dkey_bs1_chunk = _bs1_chunk_for_core_dim(total_bs1, num_k_blocks * num_d_blocks)
     for bs1_start in range(0, total_bs1, dkey_bs1_chunk):
         bs1_chunk = min(dkey_bs1_chunk, total_bs1 - bs1_start)
-        for kd_start in range(0, total_kd_blocks, kd_chunk):
-            kd_block_chunk = min(kd_chunk, total_kd_blocks - kd_start)
-            _dense_dkey_index_kernel[(bs1_chunk, Nidx1, kd_block_chunk)](
-                qi_flat, ki_flat, w_flat,
-                di_ws,
-                d_key_index_acc,
-                actual_seq_q, actual_seq_k,
-                B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
-                scale_value, bs1_start, kd_start, num_d_blocks,
-                BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
-            )
+        _dense_dkey_index_kernel[(bs1_chunk, num_k_blocks, num_d_blocks)](
+            qi_flat, ki_flat, w_flat,
+            di_ws,
+            d_key_index_acc,
+            actual_seq_q, actual_seq_k,
+            B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
+            scale_value, bs1_start,
+            BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
+        )
 
     return (
         d_query_index.reshape(query_index.shape),
@@ -604,25 +599,18 @@ def _dense_loss_backward_with_index_core(
         )
 
     num_k_blocks = (S2 + BLOCK_K - 1) // BLOCK_K
-    total_kd_blocks = num_k_blocks * num_d_blocks
-    kd_chunk = min(
-        total_kd_blocks,
-        max(1, MAX_TRITON_ASCEND_COREDIM // max(1, Nidx1)),
-    )
-    dkey_bs1_chunk = _bs1_chunk_for_core_dim(total_bs1, Nidx1 * kd_chunk)
+    dkey_bs1_chunk = _bs1_chunk_for_core_dim(total_bs1, num_k_blocks * num_d_blocks)
     for bs1_start in range(0, total_bs1, dkey_bs1_chunk):
         bs1_chunk = min(dkey_bs1_chunk, total_bs1 - bs1_start)
-        for kd_start in range(0, total_kd_blocks, kd_chunk):
-            kd_block_chunk = min(kd_chunk, total_kd_blocks - kd_start)
-            _dense_dkey_index_kernel[(bs1_chunk, Nidx1, kd_block_chunk)](
-                qi_flat, ki_flat, w_flat,
-                di_ws,
-                d_key_index_acc,
-                actual_seq_q, actual_seq_k,
-                B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
-                scale_value, bs1_start, kd_start, num_d_blocks,
-                BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
-            )
+        _dense_dkey_index_kernel[(bs1_chunk, num_k_blocks, num_d_blocks)](
+            qi_flat, ki_flat, w_flat,
+            di_ws,
+            d_key_index_acc,
+            actual_seq_q, actual_seq_k,
+            B, S1, S2, N1, N2, G, Nidx1, D, D_idx, d_rope,
+            scale_value, bs1_start,
+            BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, HAS_ROPE=(d_rope > 0),
+        )
 
     return (
         d_query_index.reshape(query_index.shape),
