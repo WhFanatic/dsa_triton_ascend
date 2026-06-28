@@ -150,22 +150,6 @@ def _dense_indexer_stats_kernel(
 
     local_k = tl.arange(0, BLOCK_K)
     i_max = tl.full([1], float("-inf"), dtype=tl.float32)
-    valid_count = tl.zeros([1], dtype=tl.float32)
-    for k_start in range(0, S2, BLOCK_K):
-        s2_offsets = k_start + local_k
-        k_mask = valid_q & (s2_offsets < visible)
-        i_tile = _dense_indexer_i_tile(
-            query_index_ptr, key_index_ptr, weights_ptr,
-            B, S1, S2, Nidx1, D_idx,
-            bs1_idx, b, s2_offsets, k_mask,
-            BLOCK_K, BLOCK_D,
-        )
-        i_tile = tl.where(k_mask, i_tile, float("-inf"))
-        i_max = tl.maximum(i_max, tl.max(i_tile, axis=0))
-        valid_count += tl.sum(k_mask.to(tl.float32), axis=0)
-
-    has_valid = valid_count > 0.0
-    i_max_safe = tl.where(has_valid, i_max, 0.0)
     i_sum = tl.zeros([1], dtype=tl.float32)
     for k_start in range(0, S2, BLOCK_K):
         s2_offsets = k_start + local_k
@@ -176,13 +160,17 @@ def _dense_indexer_stats_kernel(
             bs1_idx, b, s2_offsets, k_mask,
             BLOCK_K, BLOCK_D,
         )
-        exp_i = tl.exp(i_tile - i_max_safe)
-        exp_i = tl.where(k_mask, exp_i, 0.0)
-        i_sum += tl.sum(exp_i, axis=0)
+        i_masked = tl.where(k_mask, i_tile, float("-inf"))
+        m_new = tl.maximum(i_max, tl.max(i_masked, axis=0))
+        m_new_safe = tl.where(m_new > float("-inf"), m_new, 0.0)
+        alpha = tl.where(i_max > float("-inf"), tl.exp(i_max - m_new_safe), 1.0)
+        exp_i = tl.where(k_mask, tl.exp(i_tile - m_new_safe), 0.0)
+        i_sum = i_sum * alpha + tl.sum(exp_i, axis=0)
+        i_max = m_new
 
     stat_lane = tl.arange(0, 1)
-    tl.store(max_index_ptr + bs1_idx + stat_lane, tl.where(has_valid, i_max, float("-inf")), mask=stat_lane == 0)
-    tl.store(sum_index_ptr + bs1_idx + stat_lane, tl.where(has_valid, i_sum, 0.0), mask=stat_lane == 0)
+    tl.store(max_index_ptr + bs1_idx + stat_lane, i_max, mask=stat_lane == 0)
+    tl.store(sum_index_ptr + bs1_idx + stat_lane, i_sum, mask=stat_lane == 0)
 
 
 @triton.jit
