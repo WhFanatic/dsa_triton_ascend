@@ -25,17 +25,18 @@ _DEBUG_DUMP = {}
 # gather kernel
 @triton.jit
 def _gather_kv_kernel(
-    src_ptr, indices_ptr, dst_ptr,
-    src_idx_ptr, dst_idx_ptr,
-    src_rope_ptr, dst_rope_ptr,
+    src_idx_ptr, indices_ptr, dst_idx_ptr,
     act_q_ptr, act_k_ptr,
-    S1, S2, topK, D, D_IDX: tl.constexpr, D_ROPE: tl.constexpr, S1_OFFSET,
+    S1, S2, topK, S1_OFFSET,
+    D_IDX: tl.constexpr,
     VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    """Fused gather of key, key_index, key_rope at sparse positions.
+    """Gather key_index at sparse positions (K1, post K1+K2 fusion).
 
-    Grid: (B * S1, cdiv(valid_k, BLOCK_K), cdiv(max(D,D_IDX,D_ROPE), BLOCK_D)).
-    src: [B, S2, D_x]   dst: [B*S1, topK, D_x]
+    Grid: (B * S1, cdiv(valid_k, BLOCK_K), cdiv(D_IDX, BLOCK_D)).
+    Only key_index is materialized — K3/K4 still read key_index_gathered
+    from HBM. K2 (_teacher_distribution_kernel) inlines key/key_rope
+    gather to avoid the original 9GB HBM round-trip.
     """
     pid = tl.program_id(0)
     k_block = tl.program_id(1)
@@ -56,54 +57,34 @@ def _gather_kv_kernel(
     idx = tl.load(indices_ptr + pid * topK + k_offs, mask=k_mask, other=0)
     idx = tl.maximum(tl.minimum(idx, S2 - 1), 0)
 
-    # Key gather (D=512)
-    if d_block * BLOCK_D < D:
-        d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
-        d_mask = d_offs < D
-        mask_2d = k_mask[:, None] & d_mask[None, :]
-        src_offs = b * S2 * D + idx[:, None] * D + d_offs[None, :]
-        vals = tl.load(src_ptr + src_offs, mask=mask_2d, other=0.0)
-        dst_offs = pid * topK * D + k_offs[:, None] * D + d_offs[None, :]
-        tl.store(dst_ptr + dst_offs, vals, mask=mask_2d)
-
-    # Key index gather (D_idx=128)
-    if d_block * BLOCK_D < D_IDX:
-        d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
-        d_mask = d_offs < D_IDX
-        mask_2d = k_mask[:, None] & d_mask[None, :]
-        src_offs = b * S2 * D_IDX + idx[:, None] * D_IDX + d_offs[None, :]
-        vals = tl.load(src_idx_ptr + src_offs, mask=mask_2d, other=0.0)
-        dst_offs = pid * topK * D_IDX + k_offs[:, None] * D_IDX + d_offs[None, :]
-        tl.store(dst_idx_ptr + dst_offs, vals, mask=mask_2d)
-
-    # Key rope gather (D_rope=64)
-    if d_block * BLOCK_D < D_ROPE:
-        d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
-        d_mask = d_offs < D_ROPE
-        mask_2d = k_mask[:, None] & d_mask[None, :]
-        src_offs = b * S2 * D_ROPE + idx[:, None] * D_ROPE + d_offs[None, :]
-        vals = tl.load(src_rope_ptr + src_offs, mask=mask_2d, other=0.0)
-        dst_offs = pid * topK * D_ROPE + k_offs[:, None] * D_ROPE + d_offs[None, :]
-        tl.store(dst_rope_ptr + dst_offs, vals, mask=mask_2d)
+    d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D_IDX
+    mask_2d = k_mask[:, None] & d_mask[None, :]
+    src_offs = b * S2 * D_IDX + idx[:, None] * D_IDX + d_offs[None, :]
+    vals = tl.load(src_idx_ptr + src_offs, mask=mask_2d, other=0.0)
+    dst_offs = pid * topK * D_IDX + k_offs[:, None] * D_IDX + d_offs[None, :]
+    tl.store(dst_idx_ptr + dst_offs, vals, mask=mask_2d)
 
 
 @triton.jit
 def _teacher_distribution_kernel(
-    query_ptr, key_gathered_ptr,
-    query_rope_ptr, key_rope_gathered_ptr,
+    query_ptr, key_ptr,
+    query_rope_ptr, key_rope_ptr,
+    sparse_indices_ptr,
     softmax_max_ptr, softmax_sum_ptr,
     buf_p_ptr,
-    B, S1, N1, D, D_rope, topK,
+    B, S1, S2, N1, D, D_rope, topK,
     scale_value, S1_OFFSET,
     act_q_ptr, act_k_ptr,
     VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    """Stage 2: teacher p[k] averaged over heads.
+    """Fused gather + teacher p[k] averaged over heads (K1+K2 fusion).
 
     Grid: (B*S1, cdiv(valid_k, BLOCK_K)).
-    Each program computes one K tile for one (b, s1), moving the previous
-    serial K loop out of the main kernel.
+    Each program inline-gathers k/kr at sparse positions for its K-tile
+    (single shared idx load per tile) and computes scores/softmax without
+    writing key_gathered / key_rope_gathered to HBM.
     """
     pid = tl.program_id(0)
     k_block = tl.program_id(1)
@@ -128,10 +109,16 @@ def _teacher_distribution_kernel(
     k_offs = k_start + local_k
     k_mask = k_offs < s2_bound
 
+    # Inline gather: load sparse_indices once per K-tile, shared by
+    # both D and D_rope inner loops; ~1KB UB (int32 x BLOCK_K=128).
+    idx = tl.load(sparse_indices_ptr + pid * topK + k_offs,
+                  mask=k_mask, other=0)
+    idx = tl.maximum(tl.minimum(idx, S2 - 1), 0)
+
     q_base = pid * N1 * D
-    kg_base = pid * topK * D
+    k_batch_base = b * S2 * D
     qr_base = pid * N1 * D_rope
-    kr_g_base = pid * topK * D_rope
+    kr_batch_base = b * S2 * D_rope
     sm_base = pid * N1
     inv_n1 = 1.0 / N1
 
@@ -151,8 +138,8 @@ def _teacher_distribution_kernel(
                 mask=h_mask[:, None] & d_valid[None, :],
                 other=0.0)
             k_tile = tl.load(
-                key_gathered_ptr + kg_base
-                + k_offs[:, None] * D + d_offs[None, :],
+                key_ptr + k_batch_base
+                + idx[:, None] * D + d_offs[None, :],
                 mask=k_mask[:, None] & d_valid[None, :],
                 other=0.0)
             scores += tl.dot(q_tile, tl.trans(k_tile))
@@ -166,8 +153,8 @@ def _teacher_distribution_kernel(
                 mask=h_mask[:, None] & d_valid[None, :],
                 other=0.0)
             kr_tile = tl.load(
-                key_rope_gathered_ptr + kr_g_base
-                + k_offs[:, None] * D_rope + d_offs[None, :],
+                key_rope_ptr + kr_batch_base
+                + idx[:, None] * D_rope + d_offs[None, :],
                 mask=k_mask[:, None] & d_valid[None, :],
                 other=0.0)
             scores += tl.dot(qr_tile, tl.trans(kr_tile))
@@ -196,8 +183,8 @@ def _teacher_distribution_kernel(
                     mask=h_mask[:, None] & d_valid[None, :],
                     other=0.0)
                 k_tile = tl.load(
-                    key_gathered_ptr + kg_base
-                    + k_offs[:, None] * D + d_offs[None, :],
+                    key_ptr + k_batch_base
+                    + idx[:, None] * D + d_offs[None, :],
                     mask=k_mask[:, None] & d_valid[None, :],
                     other=0.0)
                 scores += tl.dot(q_tile, tl.trans(k_tile))
@@ -211,8 +198,8 @@ def _teacher_distribution_kernel(
                     mask=h_mask[:, None] & d_valid[None, :],
                     other=0.0)
                 kr_tile = tl.load(
-                    key_rope_gathered_ptr + kr_g_base
-                    + k_offs[:, None] * D_rope + d_offs[None, :],
+                    key_rope_ptr + kr_batch_base
+                    + idx[:, None] * D_rope + d_offs[None, :],
                     mask=k_mask[:, None] & d_valid[None, :],
                     other=0.0)
                 scores += tl.dot(qr_tile, tl.trans(kr_tile))
@@ -620,24 +607,21 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     d_weights = ms.mint.zeros((B * S1, Nidx1), dtype=weights.dtype)
     loss_parts = ms.mint.zeros((B * S1,), dtype=ms.float32)
 
-    # Gathered
-    key_gathered = ms.mint.zeros((B * S1, topK, D), dtype=key.dtype)
+    # Gathered (K2 inlines key/key_rope gather; only key_index is materialized
+    # because K3/K4 still consume key_index_gathered)
     key_index_gathered = ms.mint.zeros((B * S1, topK, D_idx), dtype=key_index.dtype)
-    key_rope_gathered = ms.mint.zeros((B * S1, topK, D_rope), dtype=key_rope.dtype)
 
-    # gather key / keyIndex / keyRope at sparse positions (single fused launch)
-    max_d = max(D, D_idx, D_rope)
+    # gather key_index at sparse positions
     grid_gather = (
         B * S1,
         triton.cdiv(valid_k, BLOCK_K_GATHER),
-        triton.cdiv(max_d, BLOCK_D_GATHER),
+        triton.cdiv(D_idx, BLOCK_D_GATHER),
     )
     _gather_kv_kernel[grid_gather](
-        k_flat, sparse_flat, key_gathered,
-        ki_flat, key_index_gathered,
-        kr_flat, key_rope_gathered,
+        ki_flat, sparse_flat, key_index_gathered,
         actual_seq_qlen, actual_seq_klen,
-        S1, S2, topK, D, D_IDX=D_idx, D_ROPE=D_rope, S1_OFFSET=s1_offset,
+        S1, S2, topK, S1_OFFSET=s1_offset,
+        D_IDX=D_idx,
         VALID_K=valid_k, BLOCK_K=BLOCK_K_GATHER, BLOCK_D=BLOCK_D_GATHER)
 
     grid_bs1 = (B * S1,)
@@ -647,11 +631,12 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     _teacher_distribution_kernel[
         (B * S1, triton.cdiv(valid_k, BLOCK_K_TEACHER))
     ](
-        q_flat, key_gathered,
-        qr_flat, key_rope_gathered,
+        q_flat, k_flat,
+        qr_flat, kr_flat,
+        sparse_flat,
         sm_max_flat, sm_sum_flat,
         buf_p,
-        B, S1, N1, D, D_rope, topK,
+        B, S1, S2, N1, D, D_rope, topK,
         scale_value, s1_offset,
         actual_seq_qlen, actual_seq_klen,
         VALID_K=valid_k, BLOCK_K=BLOCK_K_TEACHER, BLOCK_D=BLOCK_D_TEACHER,
