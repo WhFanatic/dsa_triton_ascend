@@ -67,33 +67,42 @@ def _gather_kv_kernel(
 
 
 @triton.jit
-def _teacher_distribution_kernel(
+def _teacher_indexer_kl_kernel(
     query_ptr, key_ptr,
     query_rope_ptr, key_rope_ptr,
     key_index_ptr,
+    query_index_ptr,
+    weights_ptr,
     key_index_gathered_ptr,
     sparse_indices_ptr,
     softmax_max_ptr, softmax_sum_ptr,
-    buf_p_ptr,
-    B, S1, S2, N1, D, D_rope, D_idx, topK,
+    buf_p_ptr, buf_i_ptr,
+    di_ptr, loss_ptr, s_idx_buf_ptr,
+    B, S1, S2, N1, Nidx1, D, D_rope, D_idx, topK,
     scale_value, S1_OFFSET,
     act_q_ptr, act_k_ptr,
     VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
     BLOCK_D_IDX: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    BLOCK_G: tl.constexpr,
 ):
-    """Fused gather + teacher p[k] averaged over heads + ki gather
-    (K1+K2 fusion, formerly two separate kernels).
+    """Fused K1+K2: teacher + indexer + KL loss + dI in one launch.
 
-    Grid: (B*S1, cdiv(valid_k, BLOCK_K)).
-    Each program inline-gathers k/kr at sparse positions for its K-tile
-    (single shared idx load per tile) and computes scores/softmax without
-    writing key_gathered / key_rope_gathered to HBM. Then it gathers
-    key_index at the same sparse positions into key_index_gathered (this
-    replaces the standalone _gather_kv_kernel).
+    Grid: (B*S1,). Each program owns one (b,s1) and runs three stages back-to-back
+    inside a single launch. `buf_p` and `buf_i` are still GM scratch, but written
+    and read inside the SAME program — the readback lands L2-hot (SFA grad's
+    Pass A→B pattern). This saves one kernel launch + sync, and (more importantly)
+    factors out the per-K-tile reloads of q/qr/sm_max/sm_sum that the original
+    2D grid (B*S1, k-blocks) forced.
+
+    Stage T (teacher): inline gather k/kr per K-tile, scores = (q·k^T + qr·kr^T)·scale,
+      p_tile = mean_h(softmax(scores)) → buf_p. Also gathers key_index → key_index_gathered.
+    Stage I (indexer): per K-tile, idx_scores = qi·ki_gathered^T,
+      I_tile = sum_g w_g·ReLU(idx_scores) → buf_i; ReLU values → s_idx_buf.
+    Stage Final: load i_full[VALID_K] from buf_i (L2-hot), p_full[VALID_K] from buf_p;
+      softmax(I) → KL(p‖softmax(I)) loss; dI = softmax(I) − p → di_ptr.
     """
     pid = tl.program_id(0)
-    k_block = tl.program_id(1)
     b = pid // S1
     s1 = pid % S1
     s1_global = s1 + S1_OFFSET
@@ -105,21 +114,6 @@ def _teacher_distribution_kernel(
     act_k = tl.load(act_k_ptr + b)
     s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1_global + 1, 0))
     s2_bound = tl.minimum(s2_real, VALID_K)
-    k_start = k_block * BLOCK_K
-    if k_start >= s2_bound:
-        return
-
-    local_k = tl.arange(0, BLOCK_K)
-    h_local = tl.arange(0, BLOCK_H)
-    d_local = tl.arange(0, BLOCK_D)
-    k_offs = k_start + local_k
-    k_mask = k_offs < s2_bound
-
-    # Inline gather: load sparse_indices once per K-tile, shared by
-    # both D and D_rope inner loops; ~1KB UB (int32 x BLOCK_K=128).
-    idx = tl.load(sparse_indices_ptr + pid * topK + k_offs,
-                  mask=k_mask, other=0)
-    idx = tl.maximum(tl.minimum(idx, S2 - 1), 0)
 
     q_base = pid * N1 * D
     k_batch_base = b * S2 * D
@@ -127,60 +121,40 @@ def _teacher_distribution_kernel(
     kr_batch_base = b * S2 * D_rope
     sm_base = pid * N1
     inv_n1 = 1.0 / N1
+    qi_base = pid * Nidx1 * D_idx
+    ki_g_base = pid * topK * D_idx
+    w_base = pid * Nidx1
+    ki_src_base = b * S2 * D_idx
+    sidx_base = pid * Nidx1 * topK
+    buf_p_base = pid * topK
+    buf_i_base = pid * topK
 
-    # Fast path when BLOCK_H >= N1 (typical: N1=64, BLOCK_H=64).
-    # Eliminates outer h-loop overhead and lets the cube + softmax stages
-    # overlap better.
-    if BLOCK_H >= N1:
-        h_offs = h_local
-        h_mask = h_offs < N1
-        scores = tl.zeros([BLOCK_H, BLOCK_K], dtype=tl.float32)
+    local_k = tl.arange(0, BLOCK_K)
+    h_local = tl.arange(0, BLOCK_H)
+    d_local = tl.arange(0, BLOCK_D)
+    d_idx_local = tl.arange(0, BLOCK_D_IDX)
+    g_local = tl.arange(0, BLOCK_G)
 
-        for d_start in range(0, D, BLOCK_D):
-            d_offs = d_start + d_local
-            d_valid = d_offs < D
-            q_tile = tl.load(
-                query_ptr + q_base + h_offs[:, None] * D + d_offs[None, :],
-                mask=h_mask[:, None] & d_valid[None, :],
-                other=0.0)
-            k_tile = tl.load(
-                key_ptr + k_batch_base
-                + idx[:, None] * D + d_offs[None, :],
-                mask=k_mask[:, None] & d_valid[None, :],
-                other=0.0)
-            scores += tl.dot(q_tile, tl.trans(k_tile))
+    # Load sm_max/sm_sum/inv_sum once per program (resident across all K-tiles).
+    h_offs = h_local
+    h_mask = h_offs < N1
+    sm_max = tl.load(softmax_max_ptr + sm_base + h_offs,
+                     mask=h_mask, other=0.0).to(tl.float32)
+    sm_sum = tl.load(softmax_sum_ptr + sm_base + h_offs,
+                     mask=h_mask, other=1.0).to(tl.float32)
+    inv_sum = 1.0 / (sm_sum + 1e-8)
 
-        for d_start in range(0, D_rope, BLOCK_D):
-            d_offs = d_start + d_local
-            d_valid = d_offs < D_rope
-            qr_tile = tl.load(
-                query_rope_ptr + qr_base
-                + h_offs[:, None] * D_rope + d_offs[None, :],
-                mask=h_mask[:, None] & d_valid[None, :],
-                other=0.0)
-            kr_tile = tl.load(
-                key_rope_ptr + kr_batch_base
-                + idx[:, None] * D_rope + d_offs[None, :],
-                mask=k_mask[:, None] & d_valid[None, :],
-                other=0.0)
-            scores += tl.dot(qr_tile, tl.trans(kr_tile))
+    # Stage T: per K-tile compute p_tile and gather ki.
+    for k_start in range(0, VALID_K, BLOCK_K):
+        if k_start < s2_bound:
+            k_offs = k_start + local_k
+            k_mask = k_offs < s2_bound
 
-        sm_max = tl.load(softmax_max_ptr + sm_base + h_offs,
-                         mask=h_mask, other=0.0).to(tl.float32)
-        sm_sum = tl.load(softmax_sum_ptr + sm_base + h_offs,
-                         mask=h_mask, other=1.0).to(tl.float32)
-        inv_sum = 1.0 / (sm_sum + 1e-8)
-        # combined scale: probs = exp(scores * scale - sm_max) * inv_sum
-        probs = tl.exp(scores * scale_value - sm_max[:, None]) * inv_sum[:, None]
-        probs = tl.where(h_mask[:, None] & k_mask[None, :], probs, 0.0)
-        p_acc = tl.sum(probs, axis=0)
-    else:
-        p_acc = tl.zeros([BLOCK_K], dtype=tl.float32)
-        for h_start in range(0, N1, BLOCK_H):
-            h_offs = h_start + h_local
-            h_mask = h_offs < N1
+            idx = tl.load(sparse_indices_ptr + pid * topK + k_offs,
+                          mask=k_mask, other=0)
+            idx = tl.maximum(tl.minimum(idx, S2 - 1), 0)
+
             scores = tl.zeros([BLOCK_H, BLOCK_K], dtype=tl.float32)
-
             for d_start in range(0, D, BLOCK_D):
                 d_offs = d_start + d_local
                 d_valid = d_offs < D
@@ -210,74 +184,25 @@ def _teacher_distribution_kernel(
                     other=0.0)
                 scores += tl.dot(qr_tile, tl.trans(kr_tile))
 
-            sm_max = tl.load(softmax_max_ptr + sm_base + h_offs,
-                             mask=h_mask, other=0.0).to(tl.float32)
-            sm_sum = tl.load(softmax_sum_ptr + sm_base + h_offs,
-                             mask=h_mask, other=1.0).to(tl.float32)
-            probs = tl.exp(scores * scale_value - sm_max[:, None]) / (
-                sm_sum[:, None] + 1e-8)
+            probs = tl.exp(scores * scale_value - sm_max[:, None]) * inv_sum[:, None]
             probs = tl.where(h_mask[:, None] & k_mask[None, :], probs, 0.0)
-            p_acc += tl.sum(probs, axis=0)
+            p_tile = tl.sum(probs, axis=0) * inv_n1
+            tl.store(buf_p_ptr + buf_p_base + k_offs, p_tile, mask=k_mask)
 
-    tl.store(buf_p_ptr + pid * topK + k_offs,
-             p_acc * inv_n1, mask=k_mask)
+            # ki gather (shared idx)
+            for d_start in range(0, D_idx, BLOCK_D_IDX):
+                d_offs = d_start + d_idx_local
+                d_valid = d_offs < D_idx
+                mask_2d = k_mask[:, None] & d_valid[None, :]
+                ki_vals = tl.load(
+                    key_index_ptr + ki_src_base + idx[:, None] * D_idx + d_offs[None, :],
+                    mask=mask_2d, other=0.0)
+                tl.store(
+                    key_index_gathered_ptr + ki_g_base
+                    + k_offs[:, None] * D_idx + d_offs[None, :],
+                    ki_vals, mask=mask_2d)
 
-    # Inline gather of key_index (replaces standalone _gather_kv_kernel).
-    # Same k-block, reuse idx already loaded. Tile D_idx by BLOCK_D_IDX.
-    ki_src_base = b * S2 * D_idx
-    ki_dst_base = pid * topK * D_idx
-    d_idx_local = tl.arange(0, BLOCK_D_IDX)
-    for d_start in range(0, D_idx, BLOCK_D_IDX):
-        d_offs = d_start + d_idx_local
-        d_valid = d_offs < D_idx
-        mask_2d = k_mask[:, None] & d_valid[None, :]
-        ki_vals = tl.load(
-            key_index_ptr + ki_src_base + idx[:, None] * D_idx + d_offs[None, :],
-            mask=mask_2d, other=0.0)
-        tl.store(
-            key_index_gathered_ptr + ki_dst_base
-            + k_offs[:, None] * D_idx + d_offs[None, :],
-            ki_vals, mask=mask_2d)
-
-
-@triton.jit
-def _indexer_grad_kl_loss_kernel(
-    query_index_ptr, key_index_gathered_ptr,
-    weights_ptr,
-    di_ptr,
-    loss_ptr,
-    s_idx_buf_ptr, buf_i_ptr, buf_p_ptr,
-    S1, Nidx1, D_idx, topK,
-    S1_OFFSET,
-    act_q_ptr, act_k_ptr,
-    VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
-    BLOCK_G: tl.constexpr,
-):
-    """Indexer score, teacher KL, and dI. Grid: (B*S1,).
-
-    Stage 1: I[k]=sum_g W_g*ReLU(qi_g @ ki_gathered[k]^T), saves s_idx_buf.
-    Stage 3+4: softmax(I) -> KL(p || softmax(I)), dI = softmax(I) - p.
-    """
-    pid = tl.program_id(0)
-    b = pid // S1
-    s1 = pid % S1
-    s1_global = s1 + S1_OFFSET
-
-    act_q = tl.load(act_q_ptr + b)
-    if s1_global >= act_q:
-        return
-
-    act_k = tl.load(act_k_ptr + b)
-    s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1_global + 1, 0))
-
-    qi_base = pid * Nidx1 * D_idx
-    ki_g_base = pid * topK * D_idx
-    w_base = pid * Nidx1
-    local_k = tl.arange(0, BLOCK_K)
-    g_local = tl.arange(0, BLOCK_G)
-    d_idx_local = tl.arange(0, BLOCK_D)
-
-    # Stage 1: I[k] = sum_g W_g * ReLU(qi_g @ ki_gathered[k]^T)
+    # Stage I: per K-tile compute I_tile and store ReLU to s_idx_buf + I_tile to buf_i.
     for k_start in range(0, VALID_K, BLOCK_K):
         if k_start < s2_real:
             k_offs = k_start + local_k
@@ -289,7 +214,7 @@ def _indexer_grad_kl_loss_kernel(
                 idx_scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
 
                 for d_start in range(0, D_idx, BLOCK_D):
-                    d_offs = d_start + d_idx_local
+                    d_offs = d_start + d_local
                     d_valid = d_offs < D_idx
                     qi_tile = tl.load(
                         query_index_ptr + qi_base
@@ -309,18 +234,16 @@ def _indexer_grad_kl_loss_kernel(
                               mask=g_mask, other=0.0).to(tl.float32)
                 i_tile += tl.sum(relu * w_g[:, None], axis=0)
                 tl.store(
-                    s_idx_buf_ptr + pid * Nidx1 * topK
+                    s_idx_buf_ptr + sidx_base
                     + g_offs[:, None] * topK + k_offs[None, :],
                     relu.to(s_idx_buf_ptr.dtype.element_ty),
                     mask=g_mask[:, None] & k_mask[None, :])
-            tl.store(buf_i_ptr + pid * topK + k_offs, i_tile, mask=k_mask)
+            tl.store(buf_i_ptr + buf_i_base + k_offs, i_tile, mask=k_mask)
 
-    # Stage 3+4: softmax(I) -> KL(p || softmax(I)) loss, dI = softmax(I) - p
-    # Load full I[0:VALID_K] into UB once (fp32, ~8KB at VALID_K=2048) and
-    # share across max/sum/softmax stages to avoid re-reading buf_i 3x.
+    # Stage Final: load i_full / p_full (L2-hot from above), softmax + KL + dI.
     valid_k_offs = tl.arange(0, VALID_K)
     valid_k_mask = valid_k_offs < s2_real
-    i_full = tl.load(buf_i_ptr + pid * topK + valid_k_offs,
+    i_full = tl.load(buf_i_ptr + buf_i_base + valid_k_offs,
                      mask=valid_k_mask, other=float('-inf'))
     i_max = tl.max(i_full, axis=0)
     exp_i_full = tl.where(valid_k_mask, tl.exp(i_full - i_max), 0.0)
@@ -328,7 +251,7 @@ def _indexer_grad_kl_loss_kernel(
     inv_i_sum = 1.0 / (i_sum + 1e-8)
     log_i_sum = tl.log(i_sum + 1e-8)
     softmax_i_full = exp_i_full * inv_i_sum
-    p_full = tl.load(buf_p_ptr + pid * topK + valid_k_offs,
+    p_full = tl.load(buf_p_ptr + buf_p_base + valid_k_offs,
                      mask=valid_k_mask, other=0.0)
     di_full = tl.where(valid_k_mask, softmax_i_full - p_full, 0.0)
     tl.store(di_ptr + pid * topK + valid_k_offs, di_full, mask=valid_k_mask)
@@ -591,7 +514,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
 
     BLOCK_K_GATHER = 256
     BLOCK_K_MAIN = 128
-    BLOCK_K_TEACHER = 128
+    BLOCK_K_TEACHER = 64
     BLOCK_H_MAIN = 32
     BLOCK_H_TEACHER = 64
     BLOCK_G_MAIN = 16
@@ -642,37 +565,23 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     if _SLISYNC:
         runtime.synchronize()
 
-    _teacher_distribution_kernel[
-        (B * S1, triton.cdiv(valid_k, BLOCK_K_TEACHER))
-    ](
+    _teacher_indexer_kl_kernel[grid_bs1](
         q_flat, k_flat,
         qr_flat, kr_flat,
         ki_flat,
+        qi_flat,
+        w_flat,
         key_index_gathered,
         sparse_flat,
         sm_max_flat, sm_sum_flat,
-        buf_p,
-        B, S1, S2, N1, D, D_rope, D_idx, topK,
+        buf_p, buf_i,
+        di, loss_parts, s_idx_buf,
+        B, S1, S2, N1, Nidx1, D, D_rope, D_idx, topK,
         scale_value, s1_offset,
         actual_seq_qlen, actual_seq_klen,
         VALID_K=valid_k, BLOCK_K=BLOCK_K_TEACHER, BLOCK_D=BLOCK_D_TEACHER,
         BLOCK_D_IDX=BLOCK_D_GATHER,
         BLOCK_H=BLOCK_H_TEACHER,
-    )
-
-    if _SLISYNC:
-        runtime.synchronize()
-
-    _indexer_grad_kl_loss_kernel[grid_bs1](
-        qi_flat, key_index_gathered,
-        w_flat,
-        di,
-        loss_parts,
-        s_idx_buf, buf_i, buf_p,
-        S1, Nidx1, D_idx, topK,
-        s1_offset,
-        actual_seq_qlen, actual_seq_klen,
-        VALID_K=valid_k, BLOCK_K=BLOCK_K_MAIN, BLOCK_D=BLOCK_D_MAIN,
         BLOCK_G=BLOCK_G_MAIN,
     )
 
