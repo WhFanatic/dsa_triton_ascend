@@ -22,50 +22,6 @@ _SLISYNC = os.getenv("SLI_SYNC", "0") == "1"
 _DEBUG_DUMP = {}
 
 
-# gather kernel
-@triton.jit
-def _gather_kv_kernel(
-    src_idx_ptr, indices_ptr, dst_idx_ptr,
-    act_q_ptr, act_k_ptr,
-    S1, S2, topK, S1_OFFSET,
-    D_IDX: tl.constexpr,
-    VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
-):
-    """Gather key_index at sparse positions (K1, post K1+K2 fusion).
-
-    Grid: (B * S1, cdiv(valid_k, BLOCK_K), cdiv(D_IDX, BLOCK_D)).
-    Only key_index is materialized — K3/K4 still read key_index_gathered
-    from HBM. K2 (_teacher_distribution_kernel) inlines key/key_rope
-    gather to avoid the original 9GB HBM round-trip.
-    """
-    pid = tl.program_id(0)
-    k_block = tl.program_id(1)
-    d_block = tl.program_id(2)
-    b = pid // S1
-    s1 = pid % S1
-    s1_global = s1 + S1_OFFSET
-    act_q = tl.load(act_q_ptr + b)
-    act_k = tl.load(act_k_ptr + b)
-    s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1_global + 1, 0))
-    s2_real = tl.where(s1_global < act_q, s2_real, 0)
-    s2_bound = tl.minimum(s2_real, VALID_K)
-    if k_block * BLOCK_K >= s2_bound:
-        return
-
-    k_offs = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
-    k_mask = k_offs < s2_bound
-    idx = tl.load(indices_ptr + pid * topK + k_offs, mask=k_mask, other=0)
-    idx = tl.maximum(tl.minimum(idx, S2 - 1), 0)
-
-    d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
-    d_mask = d_offs < D_IDX
-    mask_2d = k_mask[:, None] & d_mask[None, :]
-    src_offs = b * S2 * D_IDX + idx[:, None] * D_IDX + d_offs[None, :]
-    vals = tl.load(src_idx_ptr + src_offs, mask=mask_2d, other=0.0)
-    dst_offs = pid * topK * D_IDX + k_offs[:, None] * D_IDX + d_offs[None, :]
-    tl.store(dst_idx_ptr + dst_offs, vals, mask=mask_2d)
-
-
 @triton.jit
 def _teacher_indexer_kl_kernel(
     query_ptr, key_ptr,
@@ -265,30 +221,36 @@ def _teacher_indexer_kl_kernel(
 
 
 @triton.jit
-def _query_index_weight_grad_kernel(
+def _indexer_grad_kernel(
     query_index_ptr,
     key_index_gathered_ptr,
     weights_ptr,
     di_ptr,
     s_idx_buf_ptr,
+    sparse_indices_ptr,
     d_query_index_ptr,
     d_weights_ptr,
+    d_key_index_ptr,
     act_q_ptr, act_k_ptr,
-    S1, Nidx1, D_idx, topK,
+    B, S1, S2, Nidx1, D_idx, topK,
     S1_OFFSET,
-    VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
+    VALID_K: tl.constexpr,
+    BLOCK_K_A: tl.constexpr,
+    BLOCK_K_B: tl.constexpr,
+    BLOCK_D: tl.constexpr,
     BLOCK_G: tl.constexpr,
 ):
-    """Stage 5: dW and dQueryIndex from chain rule.
+    """Fused K2 (dW + dQueryIndex) + K3 (dKeyIndex scatter-add).
 
-    Grid: (B*S1, cdiv(Nidx1, BLOCK_G)). Each program produces dW and
-    dQueryIndex for a whole [BLOCK_G, D_idx] tile. The K reduction is done
-    via tl.dot([BLOCK_G, BLOCK_K] x [BLOCK_K, BLOCK_D]) so the cube unit
-    carries the FMAs and BLOCK_G works as a vector dimension, not a scalar
-    static_range. BLOCK_D should cover D_idx in one shot to avoid splitting.
+    Grid: (B*S1,). Each program owns one (b,s1) and runs two sequential passes
+    back-to-back (SFA grad pattern: single kernel, multiple passes, workspace
+    reuse via L2):
+      Pass A (g outer, K inner): dW + dQI; reads di / s_idx_buf / ki_gathered.
+      Pass B (K outer, g inner): dKI atomic_add; reads di / s_idx_buf / qi.
+    Pass B's di / s_idx_buf reads land L2-hot from Pass A — saves one cold
+    HBM round-trip and one kernel launch.
     """
     pid = tl.program_id(0)
-    g_block = tl.program_id(1)
     b = pid // S1
     s1 = pid % S1
     s1_global = s1 + S1_OFFSET
@@ -307,160 +269,90 @@ def _query_index_weight_grad_kernel(
     ki_g_base = pid * topK * D_idx
     w_base = pid * Nidx1
     sidx_base = pid * Nidx1 * topK
-    local_k = tl.arange(0, BLOCK_K)
+    di_base = pid * topK
+    sp_base = pid * topK
+
     g_local = tl.arange(0, BLOCK_G)
-    g_offs = g_block * BLOCK_G + g_local
-    g_mask = g_offs < Nidx1
     d_offs = tl.arange(0, BLOCK_D)
     d_valid = d_offs < D_idx
+    local_k_a = tl.arange(0, BLOCK_K_A)
+    local_k_b = tl.arange(0, BLOCK_K_B)
 
-    w_g = tl.load(weights_ptr + w_base + g_offs,
-                  mask=g_mask, other=0.0).to(tl.float32)
-
-    dw_acc = tl.zeros([BLOCK_G], dtype=tl.float32)
-    dqi_acc = tl.zeros([BLOCK_G, BLOCK_D], dtype=tl.float32)
-
-    for k_start in range(0, VALID_K, BLOCK_K):
-        k_offs = k_start + local_k
-        k_mask = k_offs < s2_bound
-
-        # relu_tile: [BLOCK_G, BLOCK_K]. Stored in input dtype (fp16/bf16) to
-        # halve HBM bandwidth; promote to fp32 here for accurate dW reduction.
-        relu_tile = tl.load(
-            s_idx_buf_ptr + sidx_base
-            + g_offs[:, None] * topK + k_offs[None, :],
-            mask=g_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
-
-        # di_tile: [BLOCK_K], shared across all g in this block
-        di_tile = tl.load(di_ptr + pid * topK + k_offs,
-                          mask=k_mask, other=0.0)
-
-        # dW_g += sum_k(di_k * relu_gk)
-        dw_acc += tl.sum(di_tile[None, :] * relu_tile, axis=1)
-
-        # ds_idx: [BLOCK_G, BLOCK_K]
-        relu_mask = (relu_tile > 0.0).to(tl.float32)
-        ds_idx = di_tile[None, :] * w_g[:, None] * relu_mask
-
-        # ki_tile: [BLOCK_K, BLOCK_D], shared across all g
-        # Keep ki_tile in fp16 to halve UB pressure on tight backends
-        # (e.g. CANN 9.0 + Ascend910_9382 multi-buffer pass). tl.dot
-        # accepts fp16 x fp16 -> fp32 accumulator.
-        ki_tile = tl.load(
-            key_index_gathered_ptr + ki_g_base
-            + k_offs[:, None] * D_idx + d_offs[None, :],
-            mask=k_mask[:, None] & d_valid[None, :],
-            other=0.0)
-
-        # dqi_acc += [BLOCK_G, BLOCK_K] @ [BLOCK_K, BLOCK_D]
-        dqi_acc += tl.dot(ds_idx.to(ki_tile.dtype), ki_tile)
-
-    # Store dQueryIndex tile [BLOCK_G, BLOCK_D]
-    dqi_offs = (qi_base
-                + g_offs[:, None] * D_idx + d_offs[None, :])
-    tl.store(d_query_index_ptr + dqi_offs,
-             dqi_acc.to(d_query_index_ptr.dtype.element_ty),
-             mask=g_mask[:, None] & d_valid[None, :])
-
-    # Store dW tile [BLOCK_G]
-    tl.store(d_weights_ptr + w_base + g_offs,
-             dw_acc.to(d_weights_ptr.dtype.element_ty),
-             mask=g_mask)
-
-
-# scatter-add dKeyIndex kernel
-@triton.jit
-def _scatter_dkey_index_kernel(
-    query_index_ptr,
-    weights_ptr, di_ptr, sparse_indices_ptr,
-    s_idx_buf_ptr,
-    d_key_index_ptr,
-    act_q_ptr, act_k_ptr,
-    B, S1, S2, Nidx1, D_idx, topK,
-    valid_k, S1_OFFSET,
-    BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
-    BLOCK_G: tl.constexpr,
-):
-    """Scatter-add dKeyIndex. Grid: (B*S1, cdiv(valid_k, BLOCK_K), D-blocks).
-
-    dki[b, target_k] += dI[k] * w[g] * 1_{relu>0} * qi[g]
-
-    Vectorized over g: instead of a scalar for-loop over Nidx1, we tile g into
-    BLOCK_G chunks and fuse the (di * w * mask) construction with a
-    [BLOCK_K, BLOCK_G] @ [BLOCK_G, BLOCK_D] tl.dot. This moves the FMAs to
-    the cube unit (matching the dQueryIndex kernel's strategy) and replaces
-    the serial broadcast-add with a single cube call per g-tile.
-    """
-    bs1_idx = tl.program_id(0)
-    k_block = tl.program_id(1)
-    d_block = tl.program_id(2)
-    b = bs1_idx // S1
-    s1 = bs1_idx % S1
-    s1_global = s1 + S1_OFFSET
-
-    act_q = tl.load(act_q_ptr + b)
-    act_k = tl.load(act_k_ptr + b)
-    if s1_global >= act_q:
-        return
-
-    s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1_global + 1, 0))
-    s2_bound = tl.minimum(s2_real, valid_k)
-    if k_block * BLOCK_K >= s2_bound:
-        return
-
-    k_offsets = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
-    k_mask = k_offsets < s2_bound
-
-    qi_base = bs1_idx * Nidx1 * D_idx
-    w_base = bs1_idx * Nidx1
-    sidx_base = bs1_idx * Nidx1 * topK
-    di_k = tl.load(di_ptr + bs1_idx * topK + k_offsets,
-                   mask=k_mask, other=0.0).to(tl.float32)
-    target_k = tl.load(sparse_indices_ptr + bs1_idx * topK + k_offsets,
-                       mask=k_mask, other=0)
-    target_k = tl.maximum(tl.minimum(target_k, S2 - 1), 0)
-
-    d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
-    d_valid = d_offs < D_idx
-    g_local = tl.arange(0, BLOCK_G)
-
-    dki_acc = tl.zeros([BLOCK_K, BLOCK_D], dtype=tl.float32)
-
+    # Pass A: g outer, K inner -> dW, dQI
     for g_start in range(0, Nidx1, BLOCK_G):
         g_offs = g_start + g_local
         g_mask = g_offs < Nidx1
-
-        # w_g: [BLOCK_G]
         w_g = tl.load(weights_ptr + w_base + g_offs,
                       mask=g_mask, other=0.0).to(tl.float32)
+        dw_acc = tl.zeros([BLOCK_G], dtype=tl.float32)
+        dqi_acc = tl.zeros([BLOCK_G, BLOCK_D], dtype=tl.float32)
 
-        # relu_gk: [BLOCK_G, BLOCK_K]
-        relu_gk = tl.load(
-            s_idx_buf_ptr + sidx_base
-            + g_offs[:, None] * topK + k_offsets[None, :],
-            mask=g_mask[:, None] & k_mask[None, :], other=0.0)
-        relu_mask = (relu_gk > 0.0).to(tl.float32)
+        for k_start in range(0, VALID_K, BLOCK_K_A):
+            k_offs = k_start + local_k_a
+            k_mask = k_offs < s2_bound
 
-        # ds_idx[g, k] = di_k * w_g * mask -> [BLOCK_G, BLOCK_K]
-        ds_idx_gk = di_k[None, :] * w_g[:, None] * relu_mask
+            relu_tile = tl.load(
+                s_idx_buf_ptr + sidx_base
+                + g_offs[:, None] * topK + k_offs[None, :],
+                mask=g_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+            di_tile = tl.load(di_ptr + di_base + k_offs, mask=k_mask, other=0.0)
 
-        # qi tile: [BLOCK_G, BLOCK_D]
-        # Cast to fp16 to halve UB pressure (matches dQueryIndex path,
-        # tl.dot accepts fp16 x fp16 -> fp32 accumulator).
-        qi_tile = tl.load(
-            query_index_ptr + qi_base
-            + g_offs[:, None] * D_idx + d_offs[None, :],
-            mask=g_mask[:, None] & d_valid[None, :], other=0.0)
+            dw_acc += tl.sum(di_tile[None, :] * relu_tile, axis=1)
 
-        # dki_acc[k, d] += sum_g ds_idx[g,k] * qi[g,d]
-        #              = trans(ds_idx)[k,g] @ qi[g,d]
-        ds_idx_kg = tl.trans(ds_idx_gk).to(qi_tile.dtype)
-        dki_acc += tl.dot(ds_idx_kg, qi_tile)
+            relu_mask = (relu_tile > 0.0).to(tl.float32)
+            ds_idx = di_tile[None, :] * w_g[:, None] * relu_mask
 
-    dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs[None, :]
-    tl.atomic_add(d_key_index_ptr + dki_offs,
-                  dki_acc,
-                  mask=k_mask[:, None] & d_valid[None, :])
+            ki_tile = tl.load(
+                key_index_gathered_ptr + ki_g_base
+                + k_offs[:, None] * D_idx + d_offs[None, :],
+                mask=k_mask[:, None] & d_valid[None, :], other=0.0)
+
+            dqi_acc += tl.dot(ds_idx.to(ki_tile.dtype), ki_tile)
+
+        dqi_offs = qi_base + g_offs[:, None] * D_idx + d_offs[None, :]
+        tl.store(d_query_index_ptr + dqi_offs,
+                 dqi_acc.to(d_query_index_ptr.dtype.element_ty),
+                 mask=g_mask[:, None] & d_valid[None, :])
+        tl.store(d_weights_ptr + w_base + g_offs,
+                 dw_acc.to(d_weights_ptr.dtype.element_ty),
+                 mask=g_mask)
+
+    # Pass B: K outer, g inner -> dKI atomic_add
+    # di / s_idx_buf reads land L2-hot from Pass A above.
+    for k_start in range(0, VALID_K, BLOCK_K_B):
+        k_offs = k_start + local_k_b
+        k_mask = k_offs < s2_bound
+        di_k = tl.load(di_ptr + di_base + k_offs, mask=k_mask, other=0.0).to(tl.float32)
+        target_k = tl.load(sparse_indices_ptr + sp_base + k_offs, mask=k_mask, other=0)
+        target_k = tl.maximum(tl.minimum(target_k, S2 - 1), 0)
+
+        dki_acc = tl.zeros([BLOCK_K_B, BLOCK_D], dtype=tl.float32)
+
+        for g_start in range(0, Nidx1, BLOCK_G):
+            g_offs = g_start + g_local
+            g_mask = g_offs < Nidx1
+            w_g = tl.load(weights_ptr + w_base + g_offs,
+                          mask=g_mask, other=0.0).to(tl.float32)
+
+            relu_gk = tl.load(
+                s_idx_buf_ptr + sidx_base
+                + g_offs[:, None] * topK + k_offs[None, :],
+                mask=g_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+            relu_mask = (relu_gk > 0.0).to(tl.float32)
+
+            ds_idx_gk = di_k[None, :] * w_g[:, None] * relu_mask
+
+            qi_tile = tl.load(
+                query_index_ptr + qi_base
+                + g_offs[:, None] * D_idx + d_offs[None, :],
+                mask=g_mask[:, None] & d_valid[None, :], other=0.0)
+
+            ds_idx_kg = tl.trans(ds_idx_gk).to(qi_tile.dtype)
+            dki_acc += tl.dot(ds_idx_kg, qi_tile)
+
+        dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs[None, :]
+        tl.atomic_add(d_key_index_ptr + dki_offs, dki_acc,
+                      mask=k_mask[:, None] & d_valid[None, :])
 
 
 # helpers
@@ -524,9 +416,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     BLOCK_K_QUERY_WEIGHT = 128
     BLOCK_G_QUERY_WEIGHT = 32
     BLOCK_D_QUERY_WEIGHT = 128
-    BLOCK_K_SCATTER = 256
-    BLOCK_D_SCATTER = 128
-    BLOCK_G_SCATTER = 32
+    BLOCK_K_SCATTER = 128
 
     # Flatten N2=1, Nidx2=1 dimensions (MQA: single KV head)
     q_flat = query.reshape(B * S1, N1, D).contiguous()
@@ -588,36 +478,24 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     if _SLISYNC:
         runtime.synchronize()
 
-    _query_index_weight_grad_kernel[
-        (B * S1, triton.cdiv(Nidx1, BLOCK_G_QUERY_WEIGHT))
-    ](
+    _indexer_grad_kernel[grid_bs1](
         qi_flat,
         key_index_gathered,
         w_flat,
         di,
         s_idx_buf,
+        sparse_flat,
         d_query_index,
         d_weights,
-        actual_seq_qlen, actual_seq_klen,
-        S1, Nidx1, D_idx, topK,
-        s1_offset,
-        VALID_K=valid_k, BLOCK_K=BLOCK_K_QUERY_WEIGHT,
-        BLOCK_D=BLOCK_D_QUERY_WEIGHT, BLOCK_G=BLOCK_G_QUERY_WEIGHT,
-    )
-
-    _scatter_dkey_index_kernel[
-        (B * S1, triton.cdiv(valid_k, BLOCK_K_SCATTER),
-         triton.cdiv(D_idx, BLOCK_D_SCATTER))
-    ](
-        qi_flat,
-        w_flat, di, sparse_flat,
-        s_idx_buf,
         d_key_index_acc,
         actual_seq_qlen, actual_seq_klen,
         B, S1, S2, Nidx1, D_idx, topK,
-        valid_k, s1_offset,
-        BLOCK_K=BLOCK_K_SCATTER, BLOCK_D=BLOCK_D_SCATTER,
-        BLOCK_G=BLOCK_G_SCATTER,
+        s1_offset,
+        VALID_K=valid_k,
+        BLOCK_K_A=BLOCK_K_QUERY_WEIGHT,
+        BLOCK_K_B=BLOCK_K_SCATTER,
+        BLOCK_D=BLOCK_D_QUERY_WEIGHT,
+        BLOCK_G=BLOCK_G_QUERY_WEIGHT,
     )
 
     if os.getenv("SLI_DUMP"):

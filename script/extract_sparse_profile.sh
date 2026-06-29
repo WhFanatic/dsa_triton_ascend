@@ -358,8 +358,7 @@ if [ -z "${NUM_CHUNKS}" ] && [ -n "${TRITON_PARSE}" ]; then
         {
             name=$nameC; sub(/.*\//, "", name)
             if (name ~ /_teacher_indexer_kl_kernel/)         cnt["teacher_indexer_kl"]++
-            else if (name ~ /_query_index_weight_grad_kernel/) cnt["query"]++
-            else if (name ~ /_scatter_dkey_index_kernel/)    cnt["scatter"]++
+            else if (name ~ /_indexer_grad_kernel/)          cnt["indexer_grad"]++
         }
         END {
             n = 0
@@ -469,8 +468,7 @@ else
     awk -F'\t' -v num_chunks="${NUM_CHUNKS}" -v chunk_src="${CHUNK_SRC}" '
     function tag(n) {
         if (n ~ /teacher_indexer_kl/) return "teacher_indexer_kl"
-        if (n ~ /query_index/)        return "query_idx_weight"
-        if (n ~ /scatter_dkey/)       return "scatter_dkey"
+        if (n ~ /indexer_grad/)       return "indexer_grad"
         return ""
     }
     {
@@ -481,11 +479,11 @@ else
         name[t] = $1
     }
     END {
-        order[1]="teacher_indexer_kl"; order[2]="query_idx_weight"; order[3]="scatter_dkey"
+        order[1]="teacher_indexer_kl"; order[2]="indexer_grad"
         total = 0
-        for (i=1; i<=3; i++) if (cnt[order[i]] > 0) total += sum[order[i]]/cnt[order[i]]
+        for (i=1; i<=2; i++) if (cnt[order[i]] > 0) total += sum[order[i]]/cnt[order[i]]
         if (total <= 0) { print "  (no kernels matched)"; exit }
-        for (i=1; i<=3; i++) {
+        for (i=1; i<=2; i++) {
             t = order[i]
             if (cnt[t] > 0) {
                 avg = sum[t]/cnt[t]
