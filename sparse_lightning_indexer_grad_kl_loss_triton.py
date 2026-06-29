@@ -121,7 +121,7 @@ def _sli_grad_fused_kernel(
                         + idx[:, None] * D + d_offs[None, :],
                         mask=k_mask[:, None] & d_valid[None, :],
                         other=0.0)
-                    scores += tl.dot(q_tile, tl.trans(k_tile))
+                    scores = tl.dot(q_tile, tl.trans(k_tile), acc=scores)
 
                 for d_start in range(0, D_rope, BLOCK_D):
                     d_offs = d_start + d_local
@@ -136,7 +136,7 @@ def _sli_grad_fused_kernel(
                         + idx[:, None] * D_rope + d_offs[None, :],
                         mask=k_mask[:, None] & d_valid[None, :],
                         other=0.0)
-                    scores += tl.dot(qr_tile, tl.trans(kr_tile))
+                    scores = tl.dot(qr_tile, tl.trans(kr_tile), acc=scores)
 
                 probs = tl.exp(scores * scale_value - sm_max[:, None]) * inv_sum[:, None]
                 probs = tl.where(h_mask[:, None] & k_mask[None, :], probs, 0.0)
@@ -182,7 +182,7 @@ def _sli_grad_fused_kernel(
                         + k_offs[:, None] * D_idx + d_offs[None, :],
                         mask=k_mask[:, None] & d_valid[None, :],
                         other=0.0)
-                    idx_scores += tl.dot(qi_tile, tl.trans(ki_tile))
+                    idx_scores = tl.dot(qi_tile, tl.trans(ki_tile), acc=idx_scores)
 
                 relu = tl.maximum(idx_scores, 0.0)
                 relu = tl.where(g_mask[:, None] & k_mask[None, :], relu, 0.0)
@@ -255,7 +255,7 @@ def _sli_grad_fused_kernel(
                 + k_offs[:, None] * D_idx + d_offs_g[None, :],
                 mask=k_mask[:, None] & d_valid_g[None, :], other=0.0)
 
-            dqi_acc += tl.dot(ds_idx.to(ki_tile.dtype), ki_tile)
+            dqi_acc = tl.dot(ds_idx.to(ki_tile.dtype), ki_tile, acc=dqi_acc)
 
         dqi_offs = qi_base + g_offs[:, None] * D_idx + d_offs_g[None, :]
         tl.store(d_query_index_ptr + dqi_offs,
@@ -296,7 +296,7 @@ def _sli_grad_fused_kernel(
                 mask=g_mask[:, None] & d_valid_g[None, :], other=0.0)
 
             ds_idx_kg = tl.trans(ds_idx_gk).to(qi_tile.dtype)
-            dki_acc += tl.dot(ds_idx_kg, qi_tile)
+            dki_acc = tl.dot(ds_idx_kg, qi_tile, acc=dki_acc)
 
         dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs_g[None, :]
         tl.atomic_add(d_key_index_ptr + dki_offs, dki_acc,
