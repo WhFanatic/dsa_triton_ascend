@@ -23,7 +23,7 @@ _DEBUG_DUMP = {}
 
 
 @triton.jit
-def _teacher_indexer_kl_kernel(
+def _sli_grad_fused_kernel(
     query_ptr, key_ptr,
     query_rope_ptr, key_rope_ptr,
     key_index_ptr,
@@ -34,6 +34,9 @@ def _teacher_indexer_kl_kernel(
     softmax_max_ptr, softmax_sum_ptr,
     buf_p_ptr, buf_i_ptr,
     di_ptr, loss_ptr, s_idx_buf_ptr,
+    d_query_index_ptr,
+    d_weights_ptr,
+    d_key_index_ptr,
     B, S1, S2, N1, Nidx1, D, D_rope, D_idx, topK,
     scale_value, S1_OFFSET,
     act_q_ptr, act_k_ptr,
@@ -41,22 +44,16 @@ def _teacher_indexer_kl_kernel(
     BLOCK_D_IDX: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_G: tl.constexpr,
+    BLOCK_K_A: tl.constexpr,
+    BLOCK_K_B: tl.constexpr,
+    BLOCK_D_G: tl.constexpr,
+    BLOCK_G_G: tl.constexpr,
 ):
-    """Fused K1+K2: teacher + indexer + KL loss + dI in one launch.
+    """Single fused kernel: K1 (teacher+indexer+KL+dI) + K2 (dW+dQI) + K3 (dKI scatter).
 
-    Grid: (B*S1,). Each program owns one (b,s1) and runs three stages back-to-back
-    inside a single launch. `buf_p` and `buf_i` are still GM scratch, but written
-    and read inside the SAME program — the readback lands L2-hot (SFA grad's
-    Pass A→B pattern). This saves one kernel launch + sync, and (more importantly)
-    factors out the per-K-tile reloads of q/qr/sm_max/sm_sum that the original
-    2D grid (B*S1, k-blocks) forced.
-
-    Stage T (teacher): inline gather k/kr per K-tile, scores = (q·k^T + qr·kr^T)·scale,
-      p_tile = mean_h(softmax(scores)) → buf_p. Also gathers key_index → key_index_gathered.
-    Stage I (indexer): per K-tile, idx_scores = qi·ki_gathered^T,
-      I_tile = sum_g w_g·ReLU(idx_scores) → buf_i; ReLU values → s_idx_buf.
-    Stage Final: load i_full[VALID_K] from buf_i (L2-hot), p_full[VALID_K] from buf_p;
-      softmax(I) → KL(p‖softmax(I)) loss; dI = softmax(I) − p → di_ptr.
+    Grid: (B*S1,). One program per (b,s1), running all stages back-to-back in a
+    single launch. Saves one kernel launch + sync vs the previous 2-kernel split,
+    keeps di / buf_p / buf_i / s_idx_buf / key_index_gathered L2-hot across stages.
     """
     pid = tl.program_id(0)
     b = pid // S1
@@ -222,73 +219,21 @@ def _teacher_indexer_kl_kernel(
                        0.0)
     tl.store(loss_ptr + pid, tl.sum(kl_full, axis=0))
 
-
-@triton.jit
-def _indexer_grad_kernel(
-    query_index_ptr,
-    key_index_gathered_ptr,
-    weights_ptr,
-    di_ptr,
-    s_idx_buf_ptr,
-    sparse_indices_ptr,
-    d_query_index_ptr,
-    d_weights_ptr,
-    d_key_index_ptr,
-    act_q_ptr, act_k_ptr,
-    B, S1, S2, Nidx1, D_idx, topK,
-    S1_OFFSET,
-    VALID_K: tl.constexpr,
-    BLOCK_K_A: tl.constexpr,
-    BLOCK_K_B: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_G: tl.constexpr,
-):
-    """Fused K2 (dW + dQueryIndex) + K3 (dKeyIndex scatter-add).
-
-    Grid: (B*S1,). Each program owns one (b,s1) and runs two sequential passes
-    back-to-back (SFA grad pattern: single kernel, multiple passes, workspace
-    reuse via L2):
-      Pass A (g outer, K inner): dW + dQI; reads di / s_idx_buf / ki_gathered.
-      Pass B (K outer, g inner): dKI atomic_add; reads di / s_idx_buf / qi.
-    Pass B's di / s_idx_buf reads land L2-hot from Pass A — saves one cold
-    HBM round-trip and one kernel launch.
-    """
-    pid = tl.program_id(0)
-    b = pid // S1
-    s1 = pid % S1
-    s1_global = s1 + S1_OFFSET
-
-    act_q = tl.load(act_q_ptr + b)
-    if s1_global >= act_q:
-        return
-
-    act_k = tl.load(act_k_ptr + b)
-    s2_real = tl.minimum(topK, tl.maximum(act_k - act_q + s1_global + 1, 0))
-    s2_bound = tl.minimum(s2_real, VALID_K)
-    if s2_bound <= 0:
-        return
-
-    qi_base = pid * Nidx1 * D_idx
-    ki_g_base = pid * topK * D_idx
-    w_base = pid * Nidx1
-    sidx_base = pid * Nidx1 * topK
-    di_base = pid * topK
-    sp_base = pid * topK
-
-    g_local = tl.arange(0, BLOCK_G)
-    d_offs = tl.arange(0, BLOCK_D)
-    d_valid = d_offs < D_idx
+    # Pass A: g outer, K inner -> dW, dQI. di / s_idx_buf / ki_gathered are L2-hot
+    # from Stages T/I/Final above.
     local_k_a = tl.arange(0, BLOCK_K_A)
     local_k_b = tl.arange(0, BLOCK_K_B)
+    g_local_g = tl.arange(0, BLOCK_G_G)
+    d_offs_g = tl.arange(0, BLOCK_D_G)
+    d_valid_g = d_offs_g < D_idx
 
-    # Pass A: g outer, K inner -> dW, dQI
-    for g_start in range(0, Nidx1, BLOCK_G):
-        g_offs = g_start + g_local
+    for g_start in range(0, Nidx1, BLOCK_G_G):
+        g_offs = g_start + g_local_g
         g_mask = g_offs < Nidx1
         w_g = tl.load(weights_ptr + w_base + g_offs,
                       mask=g_mask, other=0.0).to(tl.float32)
-        dw_acc = tl.zeros([BLOCK_G], dtype=tl.float32)
-        dqi_acc = tl.zeros([BLOCK_G, BLOCK_D], dtype=tl.float32)
+        dw_acc = tl.zeros([BLOCK_G_G], dtype=tl.float32)
+        dqi_acc = tl.zeros([BLOCK_G_G, BLOCK_D_G], dtype=tl.float32)
 
         for k_start in range(0, VALID_K, BLOCK_K_A):
             k_offs = k_start + local_k_a
@@ -298,7 +243,7 @@ def _indexer_grad_kernel(
                 s_idx_buf_ptr + sidx_base
                 + g_offs[:, None] * topK + k_offs[None, :],
                 mask=g_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
-            di_tile = tl.load(di_ptr + di_base + k_offs, mask=k_mask, other=0.0)
+            di_tile = tl.load(di_ptr + pid * topK + k_offs, mask=k_mask, other=0.0)
 
             dw_acc += tl.sum(di_tile[None, :] * relu_tile, axis=1)
 
@@ -307,32 +252,32 @@ def _indexer_grad_kernel(
 
             ki_tile = tl.load(
                 key_index_gathered_ptr + ki_g_base
-                + k_offs[:, None] * D_idx + d_offs[None, :],
-                mask=k_mask[:, None] & d_valid[None, :], other=0.0)
+                + k_offs[:, None] * D_idx + d_offs_g[None, :],
+                mask=k_mask[:, None] & d_valid_g[None, :], other=0.0)
 
             dqi_acc += tl.dot(ds_idx.to(ki_tile.dtype), ki_tile)
 
-        dqi_offs = qi_base + g_offs[:, None] * D_idx + d_offs[None, :]
+        dqi_offs = qi_base + g_offs[:, None] * D_idx + d_offs_g[None, :]
         tl.store(d_query_index_ptr + dqi_offs,
                  dqi_acc.to(d_query_index_ptr.dtype.element_ty),
-                 mask=g_mask[:, None] & d_valid[None, :])
+                 mask=g_mask[:, None] & d_valid_g[None, :])
         tl.store(d_weights_ptr + w_base + g_offs,
                  dw_acc.to(d_weights_ptr.dtype.element_ty),
                  mask=g_mask)
 
-    # Pass B: K outer, g inner -> dKI atomic_add
-    # di / s_idx_buf reads land L2-hot from Pass A above.
+    # Pass B: K outer, g inner -> dKI atomic_add. di / s_idx_buf reads land
+    # L2-hot from Pass A above.
     for k_start in range(0, VALID_K, BLOCK_K_B):
         k_offs = k_start + local_k_b
         k_mask = k_offs < s2_bound
-        di_k = tl.load(di_ptr + di_base + k_offs, mask=k_mask, other=0.0).to(tl.float32)
-        target_k = tl.load(sparse_indices_ptr + sp_base + k_offs, mask=k_mask, other=0)
+        di_k = tl.load(di_ptr + pid * topK + k_offs, mask=k_mask, other=0.0).to(tl.float32)
+        target_k = tl.load(sparse_indices_ptr + pid * topK + k_offs, mask=k_mask, other=0)
         target_k = tl.maximum(tl.minimum(target_k, S2 - 1), 0)
 
-        dki_acc = tl.zeros([BLOCK_K_B, BLOCK_D], dtype=tl.float32)
+        dki_acc = tl.zeros([BLOCK_K_B, BLOCK_D_G], dtype=tl.float32)
 
-        for g_start in range(0, Nidx1, BLOCK_G):
-            g_offs = g_start + g_local
+        for g_start in range(0, Nidx1, BLOCK_G_G):
+            g_offs = g_start + g_local_g
             g_mask = g_offs < Nidx1
             w_g = tl.load(weights_ptr + w_base + g_offs,
                           mask=g_mask, other=0.0).to(tl.float32)
@@ -347,15 +292,15 @@ def _indexer_grad_kernel(
 
             qi_tile = tl.load(
                 query_index_ptr + qi_base
-                + g_offs[:, None] * D_idx + d_offs[None, :],
-                mask=g_mask[:, None] & d_valid[None, :], other=0.0)
+                + g_offs[:, None] * D_idx + d_offs_g[None, :],
+                mask=g_mask[:, None] & d_valid_g[None, :], other=0.0)
 
             ds_idx_kg = tl.trans(ds_idx_gk).to(qi_tile.dtype)
             dki_acc += tl.dot(ds_idx_kg, qi_tile)
 
-        dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs[None, :]
+        dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs_g[None, :]
         tl.atomic_add(d_key_index_ptr + dki_offs, dki_acc,
-                      mask=k_mask[:, None] & d_valid[None, :])
+                      mask=k_mask[:, None] & d_valid_g[None, :])
 
 
 # helpers
@@ -458,7 +403,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     if _SLISYNC:
         runtime.synchronize()
 
-    _teacher_indexer_kl_kernel[grid_bs1](
+    _sli_grad_fused_kernel[grid_bs1](
         q_flat, k_flat,
         qr_flat, kr_flat,
         ki_flat,
@@ -469,6 +414,9 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         sm_max_flat, sm_sum_flat,
         buf_p, buf_i,
         di, loss_parts, s_idx_buf,
+        d_query_index,
+        d_weights,
+        d_key_index_acc,
         B, S1, S2, N1, Nidx1, D, D_rope, D_idx, topK,
         scale_value, s1_offset,
         actual_seq_qlen, actual_seq_klen,
@@ -476,29 +424,10 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
         BLOCK_D_IDX=BLOCK_D_GATHER,
         BLOCK_H=BLOCK_H_TEACHER,
         BLOCK_G=BLOCK_G_MAIN,
-    )
-
-    if _SLISYNC:
-        runtime.synchronize()
-
-    _indexer_grad_kernel[grid_bs1](
-        qi_flat,
-        key_index_gathered,
-        w_flat,
-        di,
-        s_idx_buf,
-        sparse_flat,
-        d_query_index,
-        d_weights,
-        d_key_index_acc,
-        actual_seq_qlen, actual_seq_klen,
-        B, S1, S2, Nidx1, D_idx, topK,
-        s1_offset,
-        VALID_K=valid_k,
         BLOCK_K_A=BLOCK_K_QUERY_WEIGHT,
         BLOCK_K_B=BLOCK_K_SCATTER,
-        BLOCK_D=BLOCK_D_QUERY_WEIGHT,
-        BLOCK_G=BLOCK_G_QUERY_WEIGHT,
+        BLOCK_D_G=BLOCK_D_QUERY_WEIGHT,
+        BLOCK_G_G=BLOCK_G_QUERY_WEIGHT,
     )
 
     if os.getenv("SLI_DUMP"):

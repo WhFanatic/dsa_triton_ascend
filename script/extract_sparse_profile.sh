@@ -357,8 +357,7 @@ if [ -z "${NUM_CHUNKS}" ] && [ -n "${TRITON_PARSE}" ]; then
                 nameC=col["Name"]; next }
         {
             name=$nameC; sub(/.*\//, "", name)
-            if (name ~ /_teacher_indexer_kl_kernel/)         cnt["teacher_indexer_kl"]++
-            else if (name ~ /_indexer_grad_kernel/)          cnt["indexer_grad"]++
+            if (name ~ /_sli_grad_fused_kernel/)              cnt["sli_grad_fused"]++
         }
         END {
             n = 0
@@ -467,8 +466,7 @@ else
     # categorise kernels into 5 logical stages by name substring match
     awk -F'\t' -v num_chunks="${NUM_CHUNKS}" -v chunk_src="${CHUNK_SRC}" '
     function tag(n) {
-        if (n ~ /teacher_indexer_kl/) return "teacher_indexer_kl"
-        if (n ~ /indexer_grad/)       return "indexer_grad"
+        if (n ~ /sli_grad_fused/) return "sli_grad_fused"
         return ""
     }
     {
@@ -479,11 +477,11 @@ else
         name[t] = $1
     }
     END {
-        order[1]="teacher_indexer_kl"; order[2]="indexer_grad"
+        order[1]="sli_grad_fused"
         total = 0
-        for (i=1; i<=2; i++) if (cnt[order[i]] > 0) total += sum[order[i]]/cnt[order[i]]
+        for (i=1; i<=1; i++) if (cnt[order[i]] > 0) total += sum[order[i]]/cnt[order[i]]
         if (total <= 0) { print "  (no kernels matched)"; exit }
-        for (i=1; i<=2; i++) {
+        for (i=1; i<=1; i++) {
             t = order[i]
             if (cnt[t] > 0) {
                 avg = sum[t]/cnt[t]

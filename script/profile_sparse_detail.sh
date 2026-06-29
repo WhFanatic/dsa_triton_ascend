@@ -33,8 +33,7 @@ KERNEL_ONLY_SCRIPT="perf_sli_grad_kl_loss_triton.py"
 
 # 要分别采集的 kernel 前缀（msprof op --kernel-name 接受 |，但这里每个独立跑）
 KERNELS=(
-    "_teacher_indexer_kl"
-    "_indexer_grad"
+    "_sli_grad_fused"
 )
 
 echo "================================================"
