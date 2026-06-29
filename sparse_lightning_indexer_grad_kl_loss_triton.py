@@ -91,15 +91,6 @@ def _teacher_indexer_kl_kernel(
     d_idx_local = tl.arange(0, BLOCK_D_IDX)
     g_local = tl.arange(0, BLOCK_G)
 
-    # Load sm_max/sm_sum/inv_sum once per program (resident across all K-tiles).
-    h_offs = h_local
-    h_mask = h_offs < N1
-    sm_max = tl.load(softmax_max_ptr + sm_base + h_offs,
-                     mask=h_mask, other=0.0).to(tl.float32)
-    sm_sum = tl.load(softmax_sum_ptr + sm_base + h_offs,
-                     mask=h_mask, other=1.0).to(tl.float32)
-    inv_sum = 1.0 / (sm_sum + 1e-8)
-
     # Stage T: per K-tile compute p_tile and gather ki.
     for k_start in range(0, VALID_K, BLOCK_K):
         if k_start < s2_bound:
@@ -110,39 +101,51 @@ def _teacher_indexer_kl_kernel(
                           mask=k_mask, other=0)
             idx = tl.maximum(tl.minimum(idx, S2 - 1), 0)
 
-            scores = tl.zeros([BLOCK_H, BLOCK_K], dtype=tl.float32)
-            for d_start in range(0, D, BLOCK_D):
-                d_offs = d_start + d_local
-                d_valid = d_offs < D
-                q_tile = tl.load(
-                    query_ptr + q_base + h_offs[:, None] * D + d_offs[None, :],
-                    mask=h_mask[:, None] & d_valid[None, :],
-                    other=0.0)
-                k_tile = tl.load(
-                    key_ptr + k_batch_base
-                    + idx[:, None] * D + d_offs[None, :],
-                    mask=k_mask[:, None] & d_valid[None, :],
-                    other=0.0)
-                scores += tl.dot(q_tile, tl.trans(k_tile))
+            p_tile_acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+            for h_start in range(0, N1, BLOCK_H):
+                h_offs = h_start + h_local
+                h_mask = h_offs < N1
+                sm_max = tl.load(softmax_max_ptr + sm_base + h_offs,
+                                 mask=h_mask, other=0.0).to(tl.float32)
+                sm_sum = tl.load(softmax_sum_ptr + sm_base + h_offs,
+                                 mask=h_mask, other=1.0).to(tl.float32)
+                inv_sum = 1.0 / (sm_sum + 1e-8)
 
-            for d_start in range(0, D_rope, BLOCK_D):
-                d_offs = d_start + d_local
-                d_valid = d_offs < D_rope
-                qr_tile = tl.load(
-                    query_rope_ptr + qr_base
-                    + h_offs[:, None] * D_rope + d_offs[None, :],
-                    mask=h_mask[:, None] & d_valid[None, :],
-                    other=0.0)
-                kr_tile = tl.load(
-                    key_rope_ptr + kr_batch_base
-                    + idx[:, None] * D_rope + d_offs[None, :],
-                    mask=k_mask[:, None] & d_valid[None, :],
-                    other=0.0)
-                scores += tl.dot(qr_tile, tl.trans(kr_tile))
+                scores = tl.zeros([BLOCK_H, BLOCK_K], dtype=tl.float32)
+                for d_start in range(0, D, BLOCK_D):
+                    d_offs = d_start + d_local
+                    d_valid = d_offs < D
+                    q_tile = tl.load(
+                        query_ptr + q_base + h_offs[:, None] * D + d_offs[None, :],
+                        mask=h_mask[:, None] & d_valid[None, :],
+                        other=0.0)
+                    k_tile = tl.load(
+                        key_ptr + k_batch_base
+                        + idx[:, None] * D + d_offs[None, :],
+                        mask=k_mask[:, None] & d_valid[None, :],
+                        other=0.0)
+                    scores += tl.dot(q_tile, tl.trans(k_tile))
 
-            probs = tl.exp(scores * scale_value - sm_max[:, None]) * inv_sum[:, None]
-            probs = tl.where(h_mask[:, None] & k_mask[None, :], probs, 0.0)
-            p_tile = tl.sum(probs, axis=0) * inv_n1
+                for d_start in range(0, D_rope, BLOCK_D):
+                    d_offs = d_start + d_local
+                    d_valid = d_offs < D_rope
+                    qr_tile = tl.load(
+                        query_rope_ptr + qr_base
+                        + h_offs[:, None] * D_rope + d_offs[None, :],
+                        mask=h_mask[:, None] & d_valid[None, :],
+                        other=0.0)
+                    kr_tile = tl.load(
+                        key_rope_ptr + kr_batch_base
+                        + idx[:, None] * D_rope + d_offs[None, :],
+                        mask=k_mask[:, None] & d_valid[None, :],
+                        other=0.0)
+                    scores += tl.dot(qr_tile, tl.trans(kr_tile))
+
+                probs = tl.exp(scores * scale_value - sm_max[:, None]) * inv_sum[:, None]
+                probs = tl.where(h_mask[:, None] & k_mask[None, :], probs, 0.0)
+                p_tile_acc += tl.sum(probs, axis=0)
+
+            p_tile = p_tile_acc * inv_n1
             tl.store(buf_p_ptr + buf_p_base + k_offs, p_tile, mask=k_mask)
 
             # ki gather (shared idx)
