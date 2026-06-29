@@ -354,7 +354,7 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
 
     BLOCK_K_GATHER = 256
     BLOCK_K_MAIN = 128
-    BLOCK_K_TEACHER = 128
+    BLOCK_K_TEACHER = 64
     BLOCK_H_MAIN = 32
     BLOCK_H_TEACHER = 64
     BLOCK_G_MAIN = 16
