@@ -357,9 +357,7 @@ if [ -z "${NUM_CHUNKS}" ] && [ -n "${TRITON_PARSE}" ]; then
                 nameC=col["Name"]; next }
         {
             name=$nameC; sub(/.*\//, "", name)
-            if (name ~ /_gather_kv_kernel/)                  cnt["gather_kv"]++
-            else if (name ~ /_teacher_distribution_kernel/)  cnt["teacher"]++
-            else if (name ~ /_indexer_grad_kl_loss_kernel/)  cnt["indexer"]++
+            if (name ~ /_teacher_indexer_kl_kernel/)         cnt["teacher_indexer_kl"]++
             else if (name ~ /_query_index_weight_grad_kernel/) cnt["query"]++
             else if (name ~ /_scatter_dkey_index_kernel/)    cnt["scatter"]++
         }
@@ -470,11 +468,9 @@ else
     # categorise kernels into 5 logical stages by name substring match
     awk -F'\t' -v num_chunks="${NUM_CHUNKS}" -v chunk_src="${CHUNK_SRC}" '
     function tag(n) {
-        if (n ~ /gather_kv/)        return "gather_kv"
-        if (n ~ /teacher/)          return "teacher_dist"
-        if (n ~ /indexer_grad_kl/)  return "indexer_grad_kl"
-        if (n ~ /query_index/)      return "query_idx_weight"
-        if (n ~ /scatter_dkey/)     return "scatter_dkey"
+        if (n ~ /teacher_indexer_kl/) return "teacher_indexer_kl"
+        if (n ~ /query_index/)        return "query_idx_weight"
+        if (n ~ /scatter_dkey/)       return "scatter_dkey"
         return ""
     }
     {
@@ -485,12 +481,11 @@ else
         name[t] = $1
     }
     END {
-        order[1]="gather_kv"; order[2]="teacher_dist"; order[3]="indexer_grad_kl"
-        order[4]="query_idx_weight"; order[5]="scatter_dkey"
+        order[1]="teacher_indexer_kl"; order[2]="query_idx_weight"; order[3]="scatter_dkey"
         total = 0
-        for (i=1; i<=5; i++) if (cnt[order[i]] > 0) total += sum[order[i]]/cnt[order[i]]
+        for (i=1; i<=3; i++) if (cnt[order[i]] > 0) total += sum[order[i]]/cnt[order[i]]
         if (total <= 0) { print "  (no kernels matched)"; exit }
-        for (i=1; i<=5; i++) {
+        for (i=1; i<=3; i++) {
             t = order[i]
             if (cnt[t] > 0) {
                 avg = sum[t]/cnt[t]
