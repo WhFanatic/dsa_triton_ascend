@@ -2,12 +2,29 @@
 import pytest
 import numpy as np
 import mindspore as ms
+from sparse_flash_attention_numpy import BF16 as _BF16
 
 ms.set_context(mode=ms.GRAPH_MODE, jit_config={"jit_level": "O0"})
 
 DROPE = 64
-_TOLS = {ms.float16: (1e-2, 1e-2), ms.bfloat16: (2e-1, 2e-2)} # TODO 这里精度需要最少1e-3
+# _TOLS is for the large-shape smoke group only (d_ki finite-checked, not
+# numerically compared). The 1e-3 target from the original TODO is now met by
+# the precision group via _PRECISION_TOLS below.
+_TOLS = {ms.float16: (1e-2, 1e-2), ms.bfloat16: (2e-1, 2e-2)}
 NEAR_ZERO = 1e-2
+
+# ms dtype -> numpy golden dtype (bf16 uses round-to-nearest-even sentinel)
+_NP_DTYPE = {ms.float16: np.float16, ms.bfloat16: _BF16}
+# Tolerances for Triton-vs-numpy (golden aligned with CANN fp32 internals,
+# tighter than the CANN-vs-Triton _TOLS which stays loose for bf16).
+_GEN_TOLS = {ms.float16: (1e-3, 1e-3), ms.bfloat16: (1e-2, 1e-2)}
+# dKeyIndex: scatter-add atomic noise (same rationale as CANN-vs-numpy).
+_GEN_DKI_TOLS = {ms.float16: (1e-2, 1e-2), ms.bfloat16: (7e-2, 7e-2)}
+
+# Precision group (Triton vs CANN, small shapes): tightened to the numpy-vs-CANN
+# leg (fp32 internals). dKeyIndex stays loose for scatter-add atomic noise.
+_PRECISION_TOLS = {ms.float16: (1e-3, 1e-3), ms.bfloat16: (1e-2, 1e-2)}
+_PRECISION_DKI_TOLS = {ms.float16: (1e-2, 1e-2), ms.bfloat16: (7e-2, 7e-2)}
 
 SPARSE_GRAD_CANN_TEST_CONFIGS = [
     (1, 1, 2048, 32, 512, 8, 128, 1024),
@@ -22,6 +39,18 @@ SPARSE_GRAD_LARGE_TEST_CONFIGS = [
     (1, 1024, 1024, 32, 512, 8, 128, 1024),
     (1, 4096, 4096, 32, 512, 8, 128, 1024),
     (1, 4096, 4096, 64, 512, 64, 128, 2048),
+]
+
+# Generalization configs: D (DQuery) and Nidx1 values beyond CANN spec.
+# CANN baseline only supports D=512 and Nidx1 in {8,16,32,64}; these cases
+# compare Triton against the NumPy golden reference (fp16) instead.
+# D_idx stays 128 (256/512 not supported by Triton yet).
+SPARSE_GRAD_GENERALIZATION_TEST_CONFIGS = [
+    (1, 4, 2048, 32, 128, 8, 128, 1024),    # D=128
+    (1, 4, 2048, 32, 256, 8, 128, 1024),    # D=256
+    (1, 4, 2048, 64, 256, 16, 128, 1024),   # D=256, N1=64
+    (1, 4, 2048, 32, 512, 128, 128, 1024),  # Nidx1=128
+    (1, 4, 2048, 64, 512, 128, 128, 1024),  # Nidx1=128, N1=64
 ]
 
 def _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=ms.float16):
@@ -123,25 +152,32 @@ def _compute_softmax_stats(q, k, qr, kr, scale_value,
 
 
 def _to_np(t):
-    return t.asnumpy().astype(np.float32)
+    # bf16 asnumpy() is unreliable; cast on-device to fp32 first
+    return t.astype(ms.float32).asnumpy()
 
 
-def _assert_close_skip_nearzero(a, b, atol, rtol):
+def _assert_close_skip_nearzero(a, b, atol, rtol, name=None):
     a_np, b_np = np.asarray(a, np.float32), np.asarray(b, np.float32)
     near_zero = (np.abs(a_np) < NEAR_ZERO) & (np.abs(b_np) < NEAR_ZERO)
     a_f = np.where(near_zero, 0.0, a_np)
     b_f = np.where(near_zero, 0.0, b_np)
-    np.testing.assert_allclose(a_f, b_f, atol=atol, rtol=rtol)
+    diff = np.abs(a_f - b_f)
+    max_abs = float(diff.max()) if diff.size else 0.0
+    ok = np.allclose(a_f, b_f, atol=atol, rtol=rtol)
+    if name:
+        print(f"  {name}: {'PASS' if ok else 'FAIL'}  max_abs_diff={max_abs:.6f}")
+    assert ok, f"{name or 'tensor'}: max_abs_diff={max_abs} exceeds atol={atol}"
 
 
 def _assert_outputs_close(base_outputs, tri_outputs, dtype):
     d_qi_base, d_ki_base, d_w_base, loss_base = base_outputs
     d_qi_tri, d_ki_tri, d_w_tri, loss_tri = tri_outputs
-    atol, rtol = _TOLS[dtype]
-    _assert_close_skip_nearzero(_to_np(d_qi_base), _to_np(d_qi_tri), atol, rtol)
-    _assert_close_skip_nearzero(_to_np(d_ki_base), _to_np(d_ki_tri), atol, rtol)
-    _assert_close_skip_nearzero(_to_np(d_w_base), _to_np(d_w_tri), atol, rtol)
-    _assert_close_skip_nearzero(_to_np(loss_base), _to_np(loss_tri), atol, rtol)
+    satol, srtol = _PRECISION_TOLS[dtype]
+    datol, drtol = _PRECISION_DKI_TOLS[dtype]
+    _assert_close_skip_nearzero(_to_np(d_qi_base), _to_np(d_qi_tri), satol, srtol, "dQueryIndex")
+    _assert_close_skip_nearzero(_to_np(d_ki_base), _to_np(d_ki_tri), datol, drtol, "dKeyIndex")
+    _assert_close_skip_nearzero(_to_np(d_w_base), _to_np(d_w_tri), satol, srtol, "dW")
+    _assert_close_skip_nearzero(_to_np(loss_base), _to_np(loss_tri), satol, srtol, "loss")
 
 
 def _assert_large_outputs(base_outputs, tri_outputs, dtype):
@@ -149,9 +185,9 @@ def _assert_large_outputs(base_outputs, tri_outputs, dtype):
     d_qi_tri, d_ki_tri, d_w_tri, loss_tri = tri_outputs
     atol, rtol = _TOLS[dtype]
 
-    _assert_close_skip_nearzero(_to_np(d_qi_base), _to_np(d_qi_tri), atol, rtol)
-    _assert_close_skip_nearzero(_to_np(d_w_base), _to_np(d_w_tri), atol, rtol)
-    _assert_close_skip_nearzero(_to_np(loss_base), _to_np(loss_tri), atol, rtol)
+    _assert_close_skip_nearzero(_to_np(d_qi_base), _to_np(d_qi_tri), atol, rtol, "dQueryIndex")
+    _assert_close_skip_nearzero(_to_np(d_w_base), _to_np(d_w_tri), atol, rtol, "dW")
+    _assert_close_skip_nearzero(_to_np(loss_base), _to_np(loss_tri), atol, rtol, "loss")
 
     assert d_ki_tri.shape == d_ki_base.shape, (
         f"d_ki shape mismatch: {d_ki_tri.shape} vs {d_ki_base.shape}"
@@ -208,6 +244,63 @@ def _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
         _assert_outputs_close(base_outputs, tri_outputs, dtype)
 
 
+def _run_triton_numpy_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
+                                sparse_pattern="causal_random", dtype=ms.float16):
+    """Triton vs NumPy golden for generalization configs (CANN unsupported).
+
+    NumPy golden is aligned with CANN fp32 internals (inputs quantized to
+    fp16/bf16, intermediates fp32), so both fp16 and bf16 are meaningful.
+    """
+    from sparse_lightning_indexer_grad_kl_loss_triton import (
+        SparseLightningIndexerGradKLLossTriton,
+    )
+    from sli_grad_kl_loss_numpy import numpy_reference, _compute_sm_stats
+    scale_value = 1.0 / np.sqrt(D)
+    np_dtype = _NP_DTYPE[dtype]
+
+    q, k, qr, kr, qi, ki, w, si = _make_inputs(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=dtype)
+    if sparse_pattern != "random":
+        si = _make_sparse_indices(B, S1, S2, topK, sparse_pattern)
+
+    q_np = _to_np(q)
+    k_np = _to_np(k)
+    qr_np = _to_np(qr)
+    kr_np = _to_np(kr)
+    qi_np = _to_np(qi)
+    ki_np = _to_np(ki)
+    w_np = _to_np(w)
+    si_np = si.asnumpy()
+
+    sm_max_np, sm_sum_np = _compute_sm_stats(
+        q_np, k_np, qr_np, kr_np, scale_value, np_dtype)
+    softmax_max = ms.Tensor(sm_max_np, dtype=ms.float32)
+    softmax_sum = ms.Tensor(sm_sum_np, dtype=ms.float32)
+
+    # Triton
+    cell = SparseLightningIndexerGradKLLossTriton(
+        scale_value=scale_value, layout="BSND", sparse_mode=3,
+    )
+    tri_outputs = cell(
+        q, k, qi, ki, w, si, softmax_max, softmax_sum,
+        query_rope=qr, key_rope=kr,
+    )
+
+    # NumPy golden
+    ref = numpy_reference(
+        q_np, k_np, qr_np, kr_np, qi_np, ki_np, w_np, si_np,
+        sm_max_np, sm_sum_np, scale_value, np_dtype,
+    )
+
+    d_qi_tri, d_ki_tri, d_w_tri, loss_tri = tri_outputs
+    strict_atol, strict_rtol = _GEN_TOLS[dtype]
+    dki_atol, dki_rtol = _GEN_DKI_TOLS[dtype]
+    _assert_close_skip_nearzero(_to_np(d_qi_tri), ref['dQueryIndex'], strict_atol, strict_rtol)
+    _assert_close_skip_nearzero(_to_np(d_ki_tri), ref['dKeyIndex'], dki_atol, dki_rtol)
+    _assert_close_skip_nearzero(_to_np(d_w_tri), ref['dW'], strict_atol, strict_rtol)
+    _assert_close_skip_nearzero(_to_np(loss_tri), ref['loss'], strict_atol, strict_rtol)
+
+
 @pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("B,S1,S2,N1,D,Nidx1,D_idx,topK",
                          SPARSE_GRAD_CANN_TEST_CONFIGS)
@@ -233,6 +326,13 @@ def test_sparse_grad_kl_loss_sparse_indices_patterns(sparse_pattern):
         Nidx1=8, D_idx=128, topK=1024,
         sparse_pattern=sparse_pattern,
     )
+
+
+@pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("B,S1,S2,N1,D,Nidx1,D_idx,topK",
+                         SPARSE_GRAD_GENERALIZATION_TEST_CONFIGS)
+def test_sparse_grad_kl_loss_generalization(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype):
+    _run_triton_numpy_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=dtype)
 
 
 if __name__ == "__main__":

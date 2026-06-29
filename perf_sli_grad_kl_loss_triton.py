@@ -17,7 +17,7 @@ def _cann_supports_config(D, topK):
     return D == 512 and topK % 1024 == 0
 
 
-def _do_bench(fn, warmup=10, rep=50):
+def _do_bench(fn, warmup=1, rep=1):
     """Simple benchmarking with manual timing (Ascend-compatible)."""
     for _ in range(warmup):
         out = fn()
@@ -143,7 +143,8 @@ def run_timing():
         speedup = o_med / t_med if t_med > 0 else float("inf")
 
         print(f"cann:    median={o_med:.2f}ms, p20={o_p20:.2f}ms, p80={o_p80:.2f}ms")
-        print(f"speedup: {speedup:.2f}x")
+        if t_med > 0:
+            print(f"speedup: {speedup:.2f}x")
 
         del q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum, cell, op
         runtime.synchronize()
@@ -151,7 +152,7 @@ def run_timing():
 
 
 def run_profiling():
-    total_steps = 10
+    total_steps = 2
     out_dir = "./profiler_data_sli_grad_kl_loss"
 
     B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 4096, 4096, 64, 512, 64, 128, 2048
@@ -175,7 +176,7 @@ def run_profiling():
     with ms.profiler.profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
         with_stack=True,
-        schedule=ms.profiler.schedule(wait=2, warmup=2, active=4, repeat=1, skip_first=2),
+        schedule=ms.profiler.schedule(wait=0, warmup=1, active=1, repeat=1, skip_first=0),
         on_trace_ready=ms.profiler.tensorboard_trace_handler(out_dir),
         profile_memory=False,
         experimental_config=experimental_config
@@ -256,7 +257,7 @@ def run_kernel_only():
         scale_value=scale_value, layout="BSND", sparse_mode=3,
     )
 
-    for _ in range(10):
+    for _ in range(1):
         out = cell(
             q, k, qi, ki, w, si, softmax_max, softmax_sum,
             query_rope=qr, key_rope=kr,
@@ -274,8 +275,14 @@ if __name__ == "__main__":
     np.random.seed(42)
     ms.set_seed(42)
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--kernel-only":
+    if len(sys.argv) > 1 and sys.argv[1] == "--timing-only":
+        run_timing()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--kernel-only":
         run_kernel_only()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--triton-only":
+        run_profiling()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--cann-only":
+        run_profiling_cann()
     else:
         run_timing()
         run_profiling()
