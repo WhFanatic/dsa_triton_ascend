@@ -70,21 +70,27 @@ def _gather_kv_kernel(
 def _teacher_distribution_kernel(
     query_ptr, key_ptr,
     query_rope_ptr, key_rope_ptr,
+    key_index_ptr,
+    key_index_gathered_ptr,
     sparse_indices_ptr,
     softmax_max_ptr, softmax_sum_ptr,
     buf_p_ptr,
-    B, S1, S2, N1, D, D_rope, topK,
+    B, S1, S2, N1, D, D_rope, D_idx, topK,
     scale_value, S1_OFFSET,
     act_q_ptr, act_k_ptr,
     VALID_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
+    BLOCK_D_IDX: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    """Fused gather + teacher p[k] averaged over heads (K1+K2 fusion).
+    """Fused gather + teacher p[k] averaged over heads + ki gather
+    (K1+K2 fusion, formerly two separate kernels).
 
     Grid: (B*S1, cdiv(valid_k, BLOCK_K)).
     Each program inline-gathers k/kr at sparse positions for its K-tile
     (single shared idx load per tile) and computes scores/softmax without
-    writing key_gathered / key_rope_gathered to HBM.
+    writing key_gathered / key_rope_gathered to HBM. Then it gathers
+    key_index at the same sparse positions into key_index_gathered (this
+    replaces the standalone _gather_kv_kernel).
     """
     pid = tl.program_id(0)
     k_block = tl.program_id(1)
@@ -216,6 +222,23 @@ def _teacher_distribution_kernel(
     tl.store(buf_p_ptr + pid * topK + k_offs,
              p_acc * inv_n1, mask=k_mask)
 
+    # Inline gather of key_index (replaces standalone _gather_kv_kernel).
+    # Same k-block, reuse idx already loaded. Tile D_idx by BLOCK_D_IDX.
+    ki_src_base = b * S2 * D_idx
+    ki_dst_base = pid * topK * D_idx
+    d_idx_local = tl.arange(0, BLOCK_D_IDX)
+    for d_start in range(0, D_idx, BLOCK_D_IDX):
+        d_offs = d_start + d_idx_local
+        d_valid = d_offs < D_idx
+        mask_2d = k_mask[:, None] & d_valid[None, :]
+        ki_vals = tl.load(
+            key_index_ptr + ki_src_base + idx[:, None] * D_idx + d_offs[None, :],
+            mask=mask_2d, other=0.0)
+        tl.store(
+            key_index_gathered_ptr + ki_dst_base
+            + k_offs[:, None] * D_idx + d_offs[None, :],
+            ki_vals, mask=mask_2d)
+
 
 @triton.jit
 def _indexer_grad_kl_loss_kernel(
@@ -288,7 +311,7 @@ def _indexer_grad_kl_loss_kernel(
                 tl.store(
                     s_idx_buf_ptr + pid * Nidx1 * topK
                     + g_offs[:, None] * topK + k_offs[None, :],
-                    relu,
+                    relu.to(s_idx_buf_ptr.dtype.element_ty),
                     mask=g_mask[:, None] & k_mask[None, :])
             tl.store(buf_i_ptr + pid * topK + k_offs, i_tile, mask=k_mask)
 
@@ -378,11 +401,12 @@ def _query_index_weight_grad_kernel(
         k_offs = k_start + local_k
         k_mask = k_offs < s2_bound
 
-        # relu_tile: [BLOCK_G, BLOCK_K]
+        # relu_tile: [BLOCK_G, BLOCK_K]. Stored in input dtype (fp16/bf16) to
+        # halve HBM bandwidth; promote to fp32 here for accurate dW reduction.
         relu_tile = tl.load(
             s_idx_buf_ptr + sidx_base
             + g_offs[:, None] * topK + k_offs[None, :],
-            mask=g_mask[:, None] & k_mask[None, :], other=0.0)
+            mask=g_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
 
         # di_tile: [BLOCK_K], shared across all g in this block
         di_tile = tl.load(di_ptr + pid * topK + k_offs,
@@ -595,9 +619,12 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     sm_max_flat = softmax_max.reshape(B * S1, N1).contiguous()
     sm_sum_flat = softmax_sum.reshape(B * S1, N1).contiguous()
 
-    # Intermediates
+    # Intermediates. s_idx_buf is stored in the source dtype (typically fp16)
+    # to halve HBM bandwidth — query_weight & scatter only need its sign
+    # (for relu_mask) and a single fp16-precise value (for dW). Quality of
+    # relu output is bounded by the fp16 qi/ki inputs that produced it.
     di = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
-    s_idx_buf = ms.mint.zeros((B * S1, Nidx1, topK), dtype=ms.float32)
+    s_idx_buf = ms.mint.zeros((B * S1, Nidx1, topK), dtype=query_index.dtype)
     buf_i = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
     buf_p = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
 
@@ -607,22 +634,9 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     d_weights = ms.mint.zeros((B * S1, Nidx1), dtype=weights.dtype)
     loss_parts = ms.mint.zeros((B * S1,), dtype=ms.float32)
 
-    # Gathered (K2 inlines key/key_rope gather; only key_index is materialized
-    # because K3/K4 still consume key_index_gathered)
+    # Gathered (the fused teacher kernel below writes key_index_gathered as a
+    # side-effect, eliminating the standalone _gather_kv_kernel)
     key_index_gathered = ms.mint.zeros((B * S1, topK, D_idx), dtype=key_index.dtype)
-
-    # gather key_index at sparse positions
-    grid_gather = (
-        B * S1,
-        triton.cdiv(valid_k, BLOCK_K_GATHER),
-        triton.cdiv(D_idx, BLOCK_D_GATHER),
-    )
-    _gather_kv_kernel[grid_gather](
-        ki_flat, sparse_flat, key_index_gathered,
-        actual_seq_qlen, actual_seq_klen,
-        S1, S2, topK, S1_OFFSET=s1_offset,
-        D_IDX=D_idx,
-        VALID_K=valid_k, BLOCK_K=BLOCK_K_GATHER, BLOCK_D=BLOCK_D_GATHER)
 
     grid_bs1 = (B * S1,)
     if _SLISYNC:
@@ -633,13 +647,16 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     ](
         q_flat, k_flat,
         qr_flat, kr_flat,
+        ki_flat,
+        key_index_gathered,
         sparse_flat,
         sm_max_flat, sm_sum_flat,
         buf_p,
-        B, S1, S2, N1, D, D_rope, topK,
+        B, S1, S2, N1, D, D_rope, D_idx, topK,
         scale_value, s1_offset,
         actual_seq_qlen, actual_seq_klen,
         VALID_K=valid_k, BLOCK_K=BLOCK_K_TEACHER, BLOCK_D=BLOCK_D_TEACHER,
+        BLOCK_D_IDX=BLOCK_D_GATHER,
         BLOCK_H=BLOCK_H_TEACHER,
     )
 
@@ -662,7 +679,6 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     if _SLISYNC:
         runtime.synchronize()
 
-    runtime.synchronize()
     _query_index_weight_grad_kernel[
         (B * S1, triton.cdiv(Nidx1, BLOCK_G_QUERY_WEIGHT))
     ](
