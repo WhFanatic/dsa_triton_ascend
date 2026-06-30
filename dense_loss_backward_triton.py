@@ -256,33 +256,34 @@ def _dense_loss_kernel(
     local_k = tl.arange(0, BLOCK_K)
     local_loss = tl.zeros([1], dtype=tl.float32)
     for k_start in range(0, S2, BLOCK_K):
-        s2_offsets = k_start + local_k
-        k_mask = valid_q & (s2_offsets < visible)
-        ki = _dense_indexer_ki_cube(key_index_ptr, b, S2, s2_offsets, k_mask, D_IDX)
-        dot = _dense_indexer_dot_cube(qi, ki)
-        i_tile = tl.sum(tl.maximum(dot, 0.0) * w[:, None], axis=0)
-        student = tl.exp(i_tile - i_max) / i_sum_safe
-        student = tl.where(k_mask & has_valid, student, 0.0)
-        teacher = _dense_teacher_p_tile(
-            query_ptr, key_ptr, query_rope_ptr, key_rope_ptr,
-            softmax_max_ptr, softmax_sum_ptr,
-            B, S1, S2, N1, N2, G, D, D_rope,
-            bs1_idx, b, s1, s2_offsets, k_mask,
-            scale_value,
-            BLOCK_K, BLOCK_D, HAS_ROPE,
-        )
-        teacher = tl.where(k_mask & has_valid, teacher, 0.0)
+        if k_start < visible:
+            s2_offsets = k_start + local_k
+            k_mask = valid_q & (s2_offsets < visible)
 
-        di = student - teacher
-        di_offs = bs1_idx * S2 + s2_offsets
-        tl.store(di_ptr + di_offs, di.to(di_ptr.dtype.element_ty), mask=k_mask)
+            ki = _dense_indexer_ki_cube(key_index_ptr, b, S2, s2_offsets, k_mask, D_IDX)
+            dot = _dense_indexer_dot_cube(qi, ki)
+            i_tile = tl.sum(tl.maximum(dot, 0.0) * w[:, None], axis=0)
+            student = tl.exp(i_tile - i_max) / i_sum_safe
+            student = tl.where(k_mask & has_valid, student, 0.0)
+            teacher = _dense_teacher_p_tile(
+                query_ptr, key_ptr, query_rope_ptr, key_rope_ptr,
+                softmax_max_ptr, softmax_sum_ptr,
+                B, S1, S2, N1, N2, G, D, D_rope,
+                bs1_idx, b, s1, s2_offsets, k_mask,
+                scale_value,
+                BLOCK_K, BLOCK_D, HAS_ROPE,
+            )
+            teacher = tl.where(k_mask & has_valid, teacher, 0.0)
 
-        p_clamped = tl.maximum(teacher, 1.0e-8)
-        q_clamped = tl.maximum(student, 1.0e-8)
-        kl = p_clamped * (tl.log(p_clamped) - tl.log(q_clamped))
-        kl = tl.where(k_mask & has_valid, kl, 0.0)
-        local_loss += tl.sum(kl, axis=0)
+            di = student - teacher
+            di_offs = bs1_idx * S2 + s2_offsets
+            tl.store(di_ptr + di_offs, di.to(di_ptr.dtype.element_ty), mask=k_mask)
 
+            p_clamped = tl.maximum(teacher, 1.0e-8)
+            q_clamped = tl.maximum(student, 1.0e-8)
+            kl = p_clamped * (tl.log(p_clamped) - tl.log(q_clamped))
+            kl = tl.where(k_mask & has_valid, kl, 0.0)
+            local_loss += tl.sum(kl, axis=0)
     loss_lane = tl.arange(0, 1)
     tl.atomic_add(loss_ptr + loss_lane, local_loss, mask=loss_lane == 0)
 
