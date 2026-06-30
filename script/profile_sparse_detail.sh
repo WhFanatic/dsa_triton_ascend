@@ -20,11 +20,11 @@
 
 DEVICE_ID="${1:-6}"
 OUT_DIR="${2:-./profiler_data_sli_detail}"
-export ASCEND_RT_VISIBLE_DEVICES="${DEVICE_ID}"
-export TRITON_END=mindspore
-export TRITON_BACKEND=mindspore
-export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-export TRITON_CACHE_DIR=./my_triton_cache
+# export ASCEND_RT_VISIBLE_DEVICES="${DEVICE_ID}"
+# export TRITON_END=mindspore
+# export TRITON_BACKEND=mindspore
+# export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+# export TRITON_CACHE_DIR=./my_triton_cache
 
 export SLI_SYNC=1
 export SPARSE_GRAD_PROFILE_MARKERS=1

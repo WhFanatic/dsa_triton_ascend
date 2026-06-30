@@ -16,11 +16,11 @@
 # Requirements: Ascend NPU, mindspore 2.9.0, triton-ascend 3.2.1
 # ============================================================================
 
-export ASCEND_RT_VISIBLE_DEVICES=6
-export TRITON_END=mindspore
-export TRITON_BACKEND=mindspore
-export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-export TRITON_CACHE_DIR=./my_triton_cache
+# export ASCEND_RT_VISIBLE_DEVICES=6
+# export TRITON_END=mindspore
+# export TRITON_BACKEND=mindspore
+# export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+# export TRITON_CACHE_DIR=./my_triton_cache
 
 MODE="${1:-all}"
 PROFILER_SCRIPT="perf_sli_grad_kl_loss_triton.py"
@@ -36,7 +36,7 @@ echo ""
 
 run_timing() {
     echo ">>> Triton vs CANN timing benchmark ..."
-    python "${PROFILER_SCRIPT}" --timing-only
+    TRITON_PRINT_AUTOTUNING=1 python "${PROFILER_SCRIPT}" --timing-only
 }
 
 run_triton() {
