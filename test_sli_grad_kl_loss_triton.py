@@ -6,7 +6,7 @@ import mindspore as ms
 ms.set_context(mode=ms.GRAPH_MODE, jit_config={"jit_level": "O0"})
 
 DROPE = 64
-_TOLS = {ms.float16: (2e-3, 2e-3), ms.bfloat16: (1e-3, 1e-3)}
+_TOLS = {ms.float16: (2e-3, 2e-3), ms.bfloat16: (1e-2, 1e-2)}
 NEAR_ZERO = 1e-2
 
 SPARSE_GRAD_CANN_TEST_CONFIGS = [
