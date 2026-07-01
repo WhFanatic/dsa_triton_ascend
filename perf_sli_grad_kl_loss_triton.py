@@ -50,14 +50,14 @@ def _make_sparse_indices(B, S1, S2, topK):
     return ms.Tensor(si, dtype=ms.int32).to("Ascend")
 
 
-def _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=ms.float16):
-    q = ms.Tensor(np.random.randn(B, S1, N1, D).astype(np.float16), dtype=dtype).to("Ascend")
-    k = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float16), dtype=dtype).to("Ascend")
-    qr = ms.Tensor(np.random.randn(B, S1, N1, DROPE).astype(np.float16), dtype=dtype).to("Ascend")
-    kr = ms.Tensor(np.random.randn(B, S2, 1, DROPE).astype(np.float16), dtype=dtype).to("Ascend")
-    qi = ms.Tensor(np.random.randn(B, S1, Nidx1, D_idx).astype(np.float16), dtype=dtype).to("Ascend")
-    ki = ms.Tensor(np.random.randn(B, S2, 1, D_idx).astype(np.float16), dtype=dtype).to("Ascend")
-    w = ms.Tensor(np.abs(np.random.randn(B, S1, Nidx1)).astype(np.float16), dtype=dtype).to("Ascend")
+def _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=ms.bfloat16):
+    q = ms.Tensor(np.random.randn(B, S1, N1, D).astype(np.float32), dtype=dtype).to("Ascend")
+    k = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float32), dtype=dtype).to("Ascend")
+    qr = ms.Tensor(np.random.randn(B, S1, N1, DROPE).astype(np.float32), dtype=dtype).to("Ascend")
+    kr = ms.Tensor(np.random.randn(B, S2, 1, DROPE).astype(np.float32), dtype=dtype).to("Ascend")
+    qi = ms.Tensor(np.random.randn(B, S1, Nidx1, D_idx).astype(np.float32), dtype=dtype).to("Ascend")
+    ki = ms.Tensor(np.random.randn(B, S2, 1, D_idx).astype(np.float32), dtype=dtype).to("Ascend")
+    w = ms.Tensor(np.abs(np.random.randn(B, S1, Nidx1)).astype(np.float32), dtype=dtype).to("Ascend")
     si = _make_sparse_indices(B, S1, S2, topK)
     softmax_max = ms.Tensor(
         np.random.randn(B, 1, S1, N1).astype(np.float32), dtype=ms.float32
@@ -94,9 +94,7 @@ def _materialize_grad_outputs(outputs):
 
 def run_timing():
     configs = [
-        # (1, 128, 2048, 64, 512, 64, 128, 2048),
-        # (1, 1024, 2048, 64, 512, 64, 128, 2048),
-        (1, 4096, 4096, 64, 512, 64, 128, 2048),
+        (1, 512, 4096, 64, 512, 64, 128, 2048),
     ]
 
     for B, S1, S2, N1, D, Nidx1, D_idx, topK in configs:
@@ -155,7 +153,7 @@ def run_profiling():
     total_steps = 8
     out_dir = "./profiler_data_sli_grad_kl_loss"
 
-    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 4096, 4096, 64, 512, 64, 128, 2048
+    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 512, 4096, 64, 512, 64, 128, 2048
 
     scale_value = 1.0 / np.sqrt(D)
     q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum = _make_inputs(
@@ -199,7 +197,7 @@ def run_profiling_cann():
     total_steps = 10
     out_dir = "./profiler_data_sli_grad_kl_loss_cann"
 
-    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 4096, 4096, 64, 512, 64, 128, 2048
+    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 512, 4096, 64, 512, 64, 128, 2048
     if not _cann_supports_config(D, topK):
         print(
             "CANN profiling skipped: CANN requires D=512 for "

@@ -19,10 +19,17 @@ SPARSE_GRAD_CANN_TEST_CONFIGS = [
 ]
 
 SPARSE_GRAD_LARGE_TEST_CONFIGS = [
+    (1, 512, 4096, 64, 512, 64, 128, 2048), # 目标shape，后续性能基于此shape
     (1, 1024, 1024, 32, 512, 8, 128, 1024),
     (1, 4096, 4096, 32, 512, 8, 128, 1024),
     (1, 4096, 4096, 64, 512, 64, 128, 2048),
 ]
+
+_PRECISION_CONFIGS = (
+    [(*c, "causal_random", False) for c in SPARSE_GRAD_CANN_TEST_CONFIGS] +
+    [(*c, "causal_continuous", True) for c in SPARSE_GRAD_LARGE_TEST_CONFIGS]
+)
+
 
 def _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=ms.float16):
     rng = np.random.RandomState(42)
@@ -208,21 +215,26 @@ def _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
         _assert_outputs_close(base_outputs, tri_outputs, dtype)
 
 
+@pytest.mark.smoke
 @pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("B,S1,S2,N1,D,Nidx1,D_idx,topK",
-                         SPARSE_GRAD_CANN_TEST_CONFIGS)
-def test_sparse_grad_kl_loss_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype):
-    _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=dtype)
+def test_sparse_grad_kl_loss_smoke(dtype):
+    _run_cann_triton_precision(
+        1, 512, 4096, 64, 512, 64, 128, 2048,
+        sparse_pattern="causal_continuous", large_check=True, dtype=dtype,
+    )
 
 
-@pytest.mark.large
+@pytest.mark.accuracy
 @pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("B,S1,S2,N1,D,Nidx1,D_idx,topK",
-                         SPARSE_GRAD_LARGE_TEST_CONFIGS)
-def test_sparse_grad_kl_loss_large_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype):
+@pytest.mark.parametrize(
+    "B,S1,S2,N1,D,Nidx1,D_idx,topK,sparse_pattern,large_check",
+    _PRECISION_CONFIGS,
+)
+def test_sparse_grad_kl_loss_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
+                                       sparse_pattern, large_check, dtype):
     _run_cann_triton_precision(
         B, S1, S2, N1, D, Nidx1, D_idx, topK,
-        sparse_pattern="causal_continuous", large_check=True, dtype=dtype,
+        sparse_pattern=sparse_pattern, large_check=large_check, dtype=dtype,
     )
 
 
@@ -236,7 +248,9 @@ def test_sparse_grad_kl_loss_sparse_indices_patterns(sparse_pattern):
 
 
 if __name__ == "__main__":
-    test_sparse_grad_kl_loss_precision(1, 4, 2048, 32, 512, 8, 128, 1024, ms.float16)
+    test_sparse_grad_kl_loss_precision(1, 4, 2048, 32, 512, 8, 128, 1024,
+                                       "causal_random", False, ms.float16)
     print("fp16 precision test passed!")
-    test_sparse_grad_kl_loss_precision(1, 4, 2048, 32, 512, 8, 128, 1024, ms.bfloat16)
+    test_sparse_grad_kl_loss_precision(1, 4, 2048, 32, 512, 8, 128, 1024,
+                                       "causal_random", False, ms.bfloat16)
     print("bf16 precision test passed!")
