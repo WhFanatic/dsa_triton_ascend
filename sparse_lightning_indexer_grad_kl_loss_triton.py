@@ -380,12 +380,8 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     sm_max_flat = softmax_max.reshape(B * S1, N1).contiguous()
     sm_sum_flat = softmax_sum.reshape(B * S1, N1).contiguous()
 
-    # Intermediates. s_idx_buf is stored in the source dtype (typically fp16)
-    # to halve HBM bandwidth — query_weight & scatter only need its sign
-    # (for relu_mask) and a single fp16-precise value (for dW). Quality of
-    # relu output is bounded by the fp16 qi/ki inputs that produced it.
     di = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
-    s_idx_buf = ms.mint.zeros((B * S1, Nidx1, topK), dtype=query_index.dtype)
+    s_idx_buf = ms.mint.zeros((B * S1, Nidx1, topK), dtype=ms.float32)
     buf_i = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
     buf_p = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
 
