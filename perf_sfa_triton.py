@@ -4,11 +4,12 @@ import mindspore as ms
 from mindspore import ops, runtime
 from mindspore.profiler import ProfilerLevel, ProfilerActivity, AicoreMetrics
 
-D_NOPE = 512  #客户建议优先测试数值256，来源kv_lora_rank:256
+D_NOPE = 512  #来源kv_lora_rank:256
 D_ROPE = 64
+DEFAULT_CONFIG = (1, 512, 4096, 64, 2048)
 
 
-def _do_bench(fn, warmup=10, rep=50):
+def _do_bench(fn, warmup=3, rep=10):
     for _ in range(warmup):
         out = fn()
         runtime.synchronize()
@@ -64,7 +65,7 @@ def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.bfloat16, D=D_NOPE):
 def run_autotune_confirm():
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
 
-    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 2048
+    B, S1, S2, N1, sparse_count = DEFAULT_CONFIG
     q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
 
@@ -88,10 +89,7 @@ def run_timing():
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
 
     configs = [
-        # (1, 128, 1024, 64, 16),
-        # (1, 256, 2048, 64, 32),
-        # (1, 512, 4096, 64, 64),
-        (1, 512, 4096, 64, 2048),
+        DEFAULT_CONFIG,
     ]
 
     for B, S1, S2, N1, sparse_count in configs:
@@ -140,7 +138,7 @@ def run_profiling():
     total_steps = 10
     out_dir = './profiler_data_sfa'
 
-    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 2048
+    B, S1, S2, N1, sparse_count = DEFAULT_CONFIG
 
     q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
@@ -181,7 +179,7 @@ def run_profiling_cann():
     total_steps = 10
     out_dir = './profiler_data_sfa_cann'
 
-    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 2048
+    B, S1, S2, N1, sparse_count = DEFAULT_CONFIG
 
     q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
@@ -219,7 +217,7 @@ def run_profiling_cann():
 def run_kernel_only():
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
 
-    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 2048
+    B, S1, S2, N1, sparse_count = DEFAULT_CONFIG
 
     q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)

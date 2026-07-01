@@ -98,8 +98,27 @@ def _prune_configs(configs, named_args, **kwargs):
     phase 1 (q_tile, k_tile) are freed before phase 2 starts, so the peak
     UB is max(phase1, phase2), not the sum.
     """
+    import os
+    _diag = os.environ.get("SFA_DIAG_CFG")
+    if _diag:
+        try:
+            _dbg, _dbk, _dbd, _dbdv = map(int, _diag.split(","))
+            _target = {"BLOCK_G": _dbg, "BLOCK_K": _dbk, "BLOCK_D": _dbd, "BLOCK_DV": _dbdv}
+            for _c in configs:
+                if _c.kwargs == _target:
+                    return [_c]
+        except Exception:
+            pass
     _UB_LIMIT_BYTES = 180 * 1024
     _GRID_LIMIT = 131072
+    # Ascend Cube/MMA B-matrix 单 tile (BK*BD / BK*BDV) 元素上限, 超过则 MTE 地址越界 (实测归纳)
+    _CUBE_TILE_LIMIT = 8192
+    # 大 shape: autotune do_bench 多配置累积 VMM 物理页贴满, 只保留实测最优配置
+    _LARGE_SHAPE_LIMIT = 80 * 1024 * 1024
+    _LARGE_SHAPE_BEST = [
+        {"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64},
+        {"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64},
+    ]
 
     def _get(name):
         if name in named_args:
@@ -154,6 +173,10 @@ def _prune_configs(configs, named_args, **kwargs):
             continue
         if bdv is not None and D is not None and bdv > D:
             continue
+        if bk is not None and bd is not None and bk * bd > _CUBE_TILE_LIMIT:
+            continue
+        if bk is not None and bdv is not None and bk * bdv > _CUBE_TILE_LIMIT:
+            continue
         # Hard limit: BLOCK_G > 16 causes UB overflow for D=128 regardless of
         # multiplier (verified: BG=32/64 crash, BG=16/8 safe across all shapes).
         if D is not None and D <= 128 and bg is not None and bg > 16:
@@ -166,6 +189,9 @@ def _prune_configs(configs, named_args, **kwargs):
             if grid0 * grid1 > _GRID_LIMIT:
                 continue
         kept.append(c)
+
+    if BS1 is not None and N1 is not None and D is not None and BS1 * N1 * D > _LARGE_SHAPE_LIMIT:
+        kept = [c for c in kept if c.kwargs in _LARGE_SHAPE_BEST]
 
     if not kept:
         print('Warning: all autotune params pruned')
@@ -281,7 +307,7 @@ def _sfa_scores_block(
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
         # More configs unlocked by ub_multiplier=1.1
-        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
+
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 256}),
         triton.Config({"BLOCK_G": 4,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 512}),
         # Extreme configs unlocked by ub_multiplier=1.0
