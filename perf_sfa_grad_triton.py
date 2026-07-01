@@ -17,13 +17,13 @@ import mindspore as ms
 from mindspore import ops, runtime
 from mindspore.profiler import ProfilerLevel, ProfilerActivity, AicoreMetrics
 
-D_NOPE = 512  #客户建议优先测试数值256，来源kv_lora_rank:256
+D_NOPE = 512  #来源kv_lora_rank:256
 D_ROPE = 64
 
 PROF_SHAPE = (1, 512, 4096, 64, 2048)
 
 
-def _do_bench(fn, warmup=10, rep=50):
+def _do_bench(fn, warmup=3, rep=10):
     for _ in range(warmup):
         out = fn()
         runtime.synchronize()
@@ -133,7 +133,7 @@ def run_timing():
         # (1, 128, 1024, 64, 16),
         # (1, 256, 2048, 64, 32),
         # (1, 512, 4096, 64, 64),
-        (1, 512, 4096, 64, 2048),
+        PROF_SHAPE,
     ]
 
     # 每个 case fork 到独立子进程: 拿到干净的分配器/VMM 状态, 隔离跨 case 内存
