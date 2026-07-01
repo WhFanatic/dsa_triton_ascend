@@ -115,12 +115,12 @@ def _sli_grad_fused_kernel(
                     q_tile = tl.load(
                         query_ptr + q_base + h_offs[:, None] * D + d_offs[None, :],
                         mask=h_mask[:, None] & d_valid[None, :],
-                        other=0.0)
+                        other=0.0).to(tl.float32)
                     k_tile = tl.load(
                         key_ptr + k_batch_base
                         + idx[:, None] * D + d_offs[None, :],
                         mask=k_mask[:, None] & d_valid[None, :],
-                        other=0.0)
+                        other=0.0).to(tl.float32)
                     scores += tl.dot(q_tile, tl.trans(k_tile))
 
                 for d_start in range(0, D_rope, BLOCK_D):
@@ -130,12 +130,12 @@ def _sli_grad_fused_kernel(
                         query_rope_ptr + qr_base
                         + h_offs[:, None] * D_rope + d_offs[None, :],
                         mask=h_mask[:, None] & d_valid[None, :],
-                        other=0.0)
+                        other=0.0).to(tl.float32)
                     kr_tile = tl.load(
                         key_rope_ptr + kr_batch_base
                         + idx[:, None] * D_rope + d_offs[None, :],
                         mask=k_mask[:, None] & d_valid[None, :],
-                        other=0.0)
+                        other=0.0).to(tl.float32)
                     scores += tl.dot(qr_tile, tl.trans(kr_tile))
 
                 probs = tl.exp(scores * scale_value - sm_max[:, None]) * inv_sum[:, None]
@@ -176,12 +176,12 @@ def _sli_grad_fused_kernel(
                         query_index_ptr + qi_base
                         + g_offs[:, None] * D_idx + d_offs[None, :],
                         mask=g_mask[:, None] & d_valid[None, :],
-                        other=0.0)
+                        other=0.0).to(tl.float32)
                     ki_tile = tl.load(
                         key_index_gathered_ptr + ki_g_base
                         + k_offs[:, None] * D_idx + d_offs[None, :],
                         mask=k_mask[:, None] & d_valid[None, :],
-                        other=0.0)
+                        other=0.0).to(tl.float32)
                     idx_scores += tl.dot(qi_tile, tl.trans(ki_tile))
 
                 relu = tl.maximum(idx_scores, 0.0)
@@ -253,9 +253,9 @@ def _sli_grad_fused_kernel(
             ki_tile = tl.load(
                 key_index_gathered_ptr + ki_g_base
                 + k_offs[:, None] * D_idx + d_offs_g[None, :],
-                mask=k_mask[:, None] & d_valid_g[None, :], other=0.0)
+                mask=k_mask[:, None] & d_valid_g[None, :], other=0.0).to(tl.float32)
 
-            dqi_acc += tl.dot(ds_idx.to(ki_tile.dtype), ki_tile)
+            dqi_acc += tl.dot(ds_idx, ki_tile)
 
         dqi_offs = qi_base + g_offs[:, None] * D_idx + d_offs_g[None, :]
         tl.store(d_query_index_ptr + dqi_offs,
@@ -293,9 +293,9 @@ def _sli_grad_fused_kernel(
             qi_tile = tl.load(
                 query_index_ptr + qi_base
                 + g_offs[:, None] * D_idx + d_offs_g[None, :],
-                mask=g_mask[:, None] & d_valid_g[None, :], other=0.0)
+                mask=g_mask[:, None] & d_valid_g[None, :], other=0.0).to(tl.float32)
 
-            ds_idx_kg = tl.trans(ds_idx_gk).to(qi_tile.dtype)
+            ds_idx_kg = tl.trans(ds_idx_gk)
             dki_acc += tl.dot(ds_idx_kg, qi_tile)
 
         dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs_g[None, :]
@@ -380,12 +380,10 @@ def _sparse_lightning_indexer_grad_kl_loss_core(
     sm_max_flat = softmax_max.reshape(B * S1, N1).contiguous()
     sm_sum_flat = softmax_sum.reshape(B * S1, N1).contiguous()
 
-    # Intermediates. s_idx_buf is stored in the source dtype (typically fp16)
-    # to halve HBM bandwidth — query_weight & scatter only need its sign
-    # (for relu_mask) and a single fp16-precise value (for dW). Quality of
-    # relu output is bounded by the fp16 qi/ki inputs that produced it.
+    # Intermediates. s_idx_buf 存 fp32：Stage I 里 relu(qi·ki^T) 是 fp32 中间量，
+    # 若存回 bf16 会因 7-bit 舍入吃掉 dW 的 1e-3 精度。
     di = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
-    s_idx_buf = ms.mint.zeros((B * S1, Nidx1, topK), dtype=query_index.dtype)
+    s_idx_buf = ms.mint.zeros((B * S1, Nidx1, topK), dtype=ms.float32)
     buf_i = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
     buf_p = ms.mint.zeros((B * S1, topK), dtype=ms.float32)
 
