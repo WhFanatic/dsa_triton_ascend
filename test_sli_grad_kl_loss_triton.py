@@ -9,25 +9,57 @@ DROPE = 64
 _TOLS = {ms.float16: (2e-3, 2e-3), ms.bfloat16: (1e-2, 1e-2)}
 NEAR_ZERO = 1e-2
 
-SPARSE_GRAD_CANN_TEST_CONFIGS = [
+# 每个参数取值至少覆盖一次：
+#   N1∈{32,64,128}, Nidx1∈{8,16,32,64}, S1∈{1,4}, S2∈{2048,4096}, topK∈{1024,2048}
+SPARSE_GRAD_CANN_TRITON_STRICT_CHECK_TEST_CONFIGS = [
     (1, 1, 2048, 32, 512, 8, 128, 1024),
-    (1, 4, 2048, 32, 512, 8, 128, 1024),
     (1, 4, 2048, 64, 512, 16, 128, 1024),
     (1, 4, 2048, 128, 512, 32, 128, 1024),
-    (1, 3, 2048, 32, 512, 16, 128, 1024),
     (1, 4, 4096, 32, 512, 64, 128, 2048),
 ]
 
-SPARSE_GRAD_LARGE_TEST_CONFIGS = [
+# 大 shape：跳过 d_ki 元素级比较（累加顺序 + fp16 舍入使得 1-ULP 差异不可避免）。
+# 覆盖 S1∈{512,1024,4096}, S2∈{1024,4096}, N1∈{32,64}, Nidx1∈{8,64}, topK∈{1024,2048}
+SPARSE_GRAD_CANN_TRITON_LARGE_CHECK_TEST_CONFIGS = [
     (1, 512, 4096, 64, 512, 64, 128, 2048), # 目标shape，后续性能基于此shape
     (1, 1024, 1024, 32, 512, 8, 128, 1024),
-    (1, 4096, 4096, 32, 512, 8, 128, 1024),
     (1, 4096, 4096, 64, 512, 64, 128, 2048),
 ]
 
-_PRECISION_CONFIGS = (
-    [(*c, "causal_random", False) for c in SPARSE_GRAD_CANN_TEST_CONFIGS] +
-    [(*c, "causal_continuous", True) for c in SPARSE_GRAD_LARGE_TEST_CONFIGS]
+# CANN A3 不支持但需求要 Triton 支持的 shape：
+#   N1∈{32,64,128}, Nidx1∈{32,64,128}, D∈{128,256,512}, D_idx∈{128,256,512}, topK∈{1024,2048}
+# 每个二元组合(N1×D, N1×Nidx1, D×D_idx, Nidx1×D_idx)至少覆盖一次
+SPARSE_GRAD_TRITON_NUMPY_TEST_CONFIGS = [
+    # 同值对角线：确认每维每值可独立工作
+    (1, 4, 2048, 64, 512, 64, 128, 2048),
+    (1, 4, 2048, 32, 128, 32, 128, 1024),
+    (1, 4, 2048, 64, 256, 64, 256, 1024),
+    (1, 4, 2048, 128, 512, 128, 512, 2048),
+    # 交叉组合：填补对角线之外的二元组合空白
+    (1, 4, 2048, 32, 256, 128, 512, 1024),   # N1=32×D=256, N1=32×Nidx1=128, D=256×D_idx=512, Nidx1=128×D_idx=512
+    (1, 4, 2048, 32, 512, 64, 256, 2048),    # N1=32×D=512, N1=32×Nidx1=64, D=512×D_idx=256, Nidx1=64×D_idx=256
+    (1, 4, 2048, 64, 128, 32, 256, 1024),    # N1=64×D=128, N1=64×Nidx1=32, D=128×D_idx=256, Nidx1=32×D_idx=256
+    (1, 4, 2048, 128, 128, 32, 512, 2048),   # N1=128×D=128, N1=128×Nidx1=32, D=128×D_idx=512, Nidx1=32×D_idx=512
+    (1, 4, 2048, 128, 256, 64, 128, 1024),   # N1=128×D=256, N1=128×Nidx1=64, D=256×D_idx=128, Nidx1=64×D_idx=128
+    (1, 4, 2048, 128, 512, 128, 128, 2048),  # Nidx1=128×D_idx=128
+    (1, 4, 2048, 64, 512, 128, 512, 1024),   # N1=64×Nidx1=128, Nidx1=128×D_idx=512, D=512×topK=1024
+    (1, 4, 2048, 32, 256, 64, 512, 2048),    # Nidx1=64×D_idx=512, D=256×topK=2048
+    (1, 4, 2048, 64, 512, 128, 256, 1024),   # Nidx1=128×D_idx=256
+]
+
+# numpy_reference 是纯 Python 循环，规模一大就非常慢；这里只跑较小 shape。
+# 覆盖 N1∈{32,64,128}, Nidx1∈{8,16,32,64}, S1∈{1,4}, S2∈{2048,4096}, topK∈{1024,2048}
+SPARSE_GRAD_CANN_NUMPY_TEST_CONFIGS = [
+    (1, 4, 2048, 64, 512, 64, 128, 2048),
+    # (1, 1, 2048, 32, 512, 8, 128, 1024),
+    # (1, 4, 2048, 64, 512, 16, 128, 1024),
+    # (1, 4, 2048, 128, 512, 32, 128, 1024),
+    # (1, 4, 4096, 32, 512, 64, 128, 2048),
+]
+
+SPARSE_GRAD_CANN_TRITON_TEST_CONFIGS = (
+    [(*c, "causal_random", False) for c in SPARSE_GRAD_CANN_TRITON_STRICT_CHECK_TEST_CONFIGS] +
+    [(*c, "causal_continuous", True) for c in SPARSE_GRAD_CANN_TRITON_LARGE_CHECK_TEST_CONFIGS]
 )
 
 
@@ -93,7 +125,7 @@ def _actual_seq_to_numpy(actual_seq, seq_len, batch_size):
 def _compute_softmax_stats(q, k, qr, kr, scale_value,
                            actual_seq_qlen=None, actual_seq_klen=None):
     """softmaxMax/Sum from FULL forward FlashAttention: (B, 1, S1, N1).
-    
+
     Must compute over ALL S2 keys, not just topK gathered subset.
     """
     B, S1, N1, D = q.shape
@@ -215,6 +247,92 @@ def _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
         _assert_outputs_close(base_outputs, tri_outputs, dtype)
 
 
+def _run_triton_numpy_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
+                                sparse_pattern="causal_random"):
+    """Compare Triton output against pure numpy reference.
+
+    Used for shapes CANN A3 does not support (Nidx1=128 或 D∈{128,256}).
+    numpy_reference 内部按 fp16 语义 round，因此这里固定 dtype=fp16。
+    """
+    from sparse_lightning_indexer_grad_kl_loss_triton import (
+        SparseLightningIndexerGradKLLossTriton,
+    )
+    from sli_grad_kl_loss_numpy import numpy_reference
+
+    dtype = ms.float16
+    scale_value = 1.0 / np.sqrt(D)
+
+    q, k, qr, kr, qi, ki, w, si = _make_inputs(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=dtype)
+    if sparse_pattern != "random":
+        si = _make_sparse_indices(B, S1, S2, topK, sparse_pattern)
+    softmax_max, softmax_sum = _compute_softmax_stats(
+        q, k, qr, kr, scale_value)
+
+    ref = numpy_reference(
+        q.asnumpy(), k.asnumpy(), qr.asnumpy(), kr.asnumpy(),
+        qi.asnumpy(), ki.asnumpy(), w.asnumpy(), si.asnumpy(),
+        softmax_max.asnumpy(), softmax_sum.asnumpy(), scale_value,
+    )
+
+    cell = SparseLightningIndexerGradKLLossTriton(
+        scale_value=scale_value, layout="BSND", sparse_mode=3,
+    )
+    d_qi_tri, d_ki_tri, d_w_tri, loss_tri = cell(
+        q, k, qi, ki, w, si, softmax_max, softmax_sum,
+        query_rope=qr, key_rope=kr,
+    )
+
+    atol, rtol = _TOLS[dtype]
+    _assert_close_skip_nearzero(ref['dQueryIndex'], _to_np(d_qi_tri), atol, rtol)
+    _assert_close_skip_nearzero(ref['dKeyIndex'], _to_np(d_ki_tri), atol, rtol)
+    _assert_close_skip_nearzero(ref['dW'], _to_np(d_w_tri), atol, rtol)
+    _assert_close_skip_nearzero(ref['loss'], _to_np(loss_tri), atol, rtol)
+
+
+def _run_cann_numpy_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
+                              sparse_pattern="causal_random"):
+    """Compare CANN baseline against pure numpy reference.
+
+    Sanity-check that CANN and numpy_reference agree on the CANN-supported
+    subset; dtype fixed to fp16 to match numpy_reference's fp16-round semantics.
+    """
+    from sli_grad_kl_loss_cann import SparseLightningIndexerGradKLLoss
+    from sli_grad_kl_loss_numpy import numpy_reference
+
+    dtype = ms.float16
+    scale_value = 1.0 / np.sqrt(D)
+
+    q, k, qr, kr, qi, ki, w, si = _make_inputs(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=dtype)
+    if sparse_pattern != "random":
+        si = _make_sparse_indices(B, S1, S2, topK, sparse_pattern)
+    softmax_max, softmax_sum = _compute_softmax_stats(
+        q, k, qr, kr, scale_value)
+
+    ref = numpy_reference(
+        q.asnumpy(), k.asnumpy(), qr.asnumpy(), kr.asnumpy(),
+        qi.asnumpy(), ki.asnumpy(), w.asnumpy(), si.asnumpy(),
+        softmax_max.asnumpy(), softmax_sum.asnumpy(), scale_value,
+    )
+
+    op = SparseLightningIndexerGradKLLoss()
+    d_qi_cann, d_ki_cann, d_w_cann, loss_cann = op(
+        q, k, qi, ki, w, si, softmax_max, softmax_sum,
+        query_rope=qr, key_rope=kr,
+        scale_value=scale_value, layout="BSND", sparse_mode=3,
+    )
+
+    atol, rtol = _TOLS[dtype]
+    _assert_close_skip_nearzero(ref['dQueryIndex'], _to_np(d_qi_cann), atol, rtol)
+    _assert_close_skip_nearzero(ref['dKeyIndex'], _to_np(d_ki_cann), atol, rtol)
+    _assert_close_skip_nearzero(ref['dW'], _to_np(d_w_cann), atol, rtol)
+    _assert_close_skip_nearzero(ref['loss'], _to_np(loss_cann), atol, rtol)
+
+
+# ============================================================================
+# Test cases
+# ============================================================================
 @pytest.mark.smoke
 @pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16], ids=["fp16", "bf16"])
 def test_sparse_grad_kl_loss_smoke(dtype):
@@ -228,13 +346,40 @@ def test_sparse_grad_kl_loss_smoke(dtype):
 @pytest.mark.parametrize("dtype", [ms.float16, ms.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize(
     "B,S1,S2,N1,D,Nidx1,D_idx,topK,sparse_pattern,large_check",
-    _PRECISION_CONFIGS,
+    SPARSE_GRAD_CANN_TRITON_TEST_CONFIGS,
 )
-def test_sparse_grad_kl_loss_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
-                                       sparse_pattern, large_check, dtype):
+def test_sparse_grad_kl_loss_precision_cann_triton(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK,
+        sparse_pattern, large_check, dtype):
     _run_cann_triton_precision(
         B, S1, S2, N1, D, Nidx1, D_idx, topK,
         sparse_pattern=sparse_pattern, large_check=large_check, dtype=dtype,
+    )
+
+
+@pytest.mark.accuracy
+@pytest.mark.parametrize(
+    "B,S1,S2,N1,D,Nidx1,D_idx,topK",
+    SPARSE_GRAD_TRITON_NUMPY_TEST_CONFIGS,
+)
+def test_sparse_grad_kl_loss_precision_triton_numpy(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK):
+    _run_triton_numpy_precision(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK,
+        sparse_pattern="causal_random",
+    )
+
+
+@pytest.mark.accuracy
+@pytest.mark.parametrize(
+    "B,S1,S2,N1,D,Nidx1,D_idx,topK",
+    SPARSE_GRAD_CANN_NUMPY_TEST_CONFIGS,
+)
+def test_sparse_grad_kl_loss_precision_cann_numpy(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK):
+    _run_cann_numpy_precision(
+        B, S1, S2, N1, D, Nidx1, D_idx, topK,
+        sparse_pattern="causal_random",
     )
 
 
@@ -248,9 +393,17 @@ def test_sparse_grad_kl_loss_sparse_indices_patterns(sparse_pattern):
 
 
 if __name__ == "__main__":
-    test_sparse_grad_kl_loss_precision(1, 4, 2048, 32, 512, 8, 128, 1024,
-                                       "causal_random", False, ms.float16)
-    print("fp16 precision test passed!")
-    test_sparse_grad_kl_loss_precision(1, 4, 2048, 32, 512, 8, 128, 1024,
-                                       "causal_random", False, ms.bfloat16)
-    print("bf16 precision test passed!")
+    test_sparse_grad_kl_loss_precision_cann_triton(
+        1, 4, 2048, 32, 512, 8, 128, 1024,
+        "causal_random", False, ms.float16)
+    print("fp16 cann_triton precision test passed!")
+    test_sparse_grad_kl_loss_precision_cann_triton(
+        1, 4, 2048, 32, 512, 8, 128, 1024,
+        "causal_random", False, ms.bfloat16)
+    print("bf16 cann_triton precision test passed!")
+    test_sparse_grad_kl_loss_precision_triton_numpy(
+        1, 4, 2048, 128, 512, 128, 128, 1024)
+    print("triton_numpy precision test passed!")
+    test_sparse_grad_kl_loss_precision_cann_numpy(
+        1, 4, 2048, 32, 512, 8, 128, 1024)
+    print("cann_numpy precision test passed!")

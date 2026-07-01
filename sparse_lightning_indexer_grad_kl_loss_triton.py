@@ -219,54 +219,58 @@ def _sli_grad_fused_kernel(
                        0.0)
     tl.store(loss_ptr + pid, tl.sum(kl_full, axis=0))
 
-    # Pass A: g outer, K inner -> dW, dQI. di / s_idx_buf / ki_gathered are L2-hot
-    # from Stages T/I/Final above.
+    # Pass A: g outer -> dW (D-independent) then dQI (D outer, K inner).
+    # di / s_idx_buf / ki_gathered are L2-hot from Stages T/I/Final above.
     local_k_a = tl.arange(0, BLOCK_K_A)
     local_k_b = tl.arange(0, BLOCK_K_B)
     g_local_g = tl.arange(0, BLOCK_G_G)
-    d_offs_g = tl.arange(0, BLOCK_D_G)
-    d_valid_g = d_offs_g < D_idx
+    d_local_g = tl.arange(0, BLOCK_D_G)
 
     for g_start in range(0, Nidx1, BLOCK_G_G):
         g_offs = g_start + g_local_g
         g_mask = g_offs < Nidx1
         w_g = tl.load(weights_ptr + w_base + g_offs,
                       mask=g_mask, other=0.0).to(tl.float32)
-        dw_acc = tl.zeros([BLOCK_G_G], dtype=tl.float32)
-        dqi_acc = tl.zeros([BLOCK_G_G, BLOCK_D_G], dtype=tl.float32)
 
+        dw_acc = tl.zeros([BLOCK_G_G], dtype=tl.float32)
         for k_start in range(0, VALID_K, BLOCK_K_A):
             k_offs = k_start + local_k_a
             k_mask = k_offs < s2_bound
-
             relu_tile = tl.load(
                 s_idx_buf_ptr + sidx_base
                 + g_offs[:, None] * topK + k_offs[None, :],
                 mask=g_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
             di_tile = tl.load(di_ptr + pid * topK + k_offs, mask=k_mask, other=0.0)
-
             dw_acc += tl.sum(di_tile[None, :] * relu_tile, axis=1)
-
-            relu_mask = (relu_tile > 0.0).to(tl.float32)
-            ds_idx = di_tile[None, :] * w_g[:, None] * relu_mask
-
-            ki_tile = tl.load(
-                key_index_gathered_ptr + ki_g_base
-                + k_offs[:, None] * D_idx + d_offs_g[None, :],
-                mask=k_mask[:, None] & d_valid_g[None, :], other=0.0).to(tl.float32)
-
-            dqi_acc += tl.dot(ds_idx, ki_tile)
-
-        dqi_offs = qi_base + g_offs[:, None] * D_idx + d_offs_g[None, :]
-        tl.store(d_query_index_ptr + dqi_offs,
-                 dqi_acc.to(d_query_index_ptr.dtype.element_ty),
-                 mask=g_mask[:, None] & d_valid_g[None, :])
         tl.store(d_weights_ptr + w_base + g_offs,
                  dw_acc.to(d_weights_ptr.dtype.element_ty),
                  mask=g_mask)
 
-    # Pass B: K outer, g inner -> dKI atomic_add. di / s_idx_buf reads land
-    # L2-hot from Pass A above.
+        for d_start in range(0, D_idx, BLOCK_D_G):
+            d_offs_g = d_start + d_local_g
+            d_valid_g = d_offs_g < D_idx
+            dqi_acc = tl.zeros([BLOCK_G_G, BLOCK_D_G], dtype=tl.float32)
+            for k_start in range(0, VALID_K, BLOCK_K_A):
+                k_offs = k_start + local_k_a
+                k_mask = k_offs < s2_bound
+                relu_tile = tl.load(
+                    s_idx_buf_ptr + sidx_base
+                    + g_offs[:, None] * topK + k_offs[None, :],
+                    mask=g_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+                di_tile = tl.load(di_ptr + pid * topK + k_offs, mask=k_mask, other=0.0)
+                relu_mask = (relu_tile > 0.0).to(tl.float32)
+                ds_idx = di_tile[None, :] * w_g[:, None] * relu_mask
+                ki_tile = tl.load(
+                    key_index_gathered_ptr + ki_g_base
+                    + k_offs[:, None] * D_idx + d_offs_g[None, :],
+                    mask=k_mask[:, None] & d_valid_g[None, :], other=0.0).to(tl.float32)
+                dqi_acc += tl.dot(ds_idx, ki_tile)
+            dqi_offs = qi_base + g_offs[:, None] * D_idx + d_offs_g[None, :]
+            tl.store(d_query_index_ptr + dqi_offs,
+                     dqi_acc.to(d_query_index_ptr.dtype.element_ty),
+                     mask=g_mask[:, None] & d_valid_g[None, :])
+
+    # Pass B: K outer -> D outer, g inner -> dKI atomic_add.
     for k_start in range(0, VALID_K, BLOCK_K_B):
         k_offs = k_start + local_k_b
         k_mask = k_offs < s2_bound
@@ -274,33 +278,30 @@ def _sli_grad_fused_kernel(
         target_k = tl.load(sparse_indices_ptr + pid * topK + k_offs, mask=k_mask, other=0)
         target_k = tl.maximum(tl.minimum(target_k, S2 - 1), 0)
 
-        dki_acc = tl.zeros([BLOCK_K_B, BLOCK_D_G], dtype=tl.float32)
-
-        for g_start in range(0, Nidx1, BLOCK_G_G):
-            g_offs = g_start + g_local_g
-            g_mask = g_offs < Nidx1
-            w_g = tl.load(weights_ptr + w_base + g_offs,
-                          mask=g_mask, other=0.0).to(tl.float32)
-
-            relu_gk = tl.load(
-                s_idx_buf_ptr + sidx_base
-                + g_offs[:, None] * topK + k_offs[None, :],
-                mask=g_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
-            relu_mask = (relu_gk > 0.0).to(tl.float32)
-
-            ds_idx_gk = di_k[None, :] * w_g[:, None] * relu_mask
-
-            qi_tile = tl.load(
-                query_index_ptr + qi_base
-                + g_offs[:, None] * D_idx + d_offs_g[None, :],
-                mask=g_mask[:, None] & d_valid_g[None, :], other=0.0).to(tl.float32)
-
-            ds_idx_kg = tl.trans(ds_idx_gk)
-            dki_acc += tl.dot(ds_idx_kg, qi_tile)
-
-        dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs_g[None, :]
-        tl.atomic_add(d_key_index_ptr + dki_offs, dki_acc,
-                      mask=k_mask[:, None] & d_valid_g[None, :])
+        for d_start in range(0, D_idx, BLOCK_D_G):
+            d_offs_g = d_start + d_local_g
+            d_valid_g = d_offs_g < D_idx
+            dki_acc = tl.zeros([BLOCK_K_B, BLOCK_D_G], dtype=tl.float32)
+            for g_start in range(0, Nidx1, BLOCK_G_G):
+                g_offs = g_start + g_local_g
+                g_mask = g_offs < Nidx1
+                w_g = tl.load(weights_ptr + w_base + g_offs,
+                              mask=g_mask, other=0.0).to(tl.float32)
+                relu_gk = tl.load(
+                    s_idx_buf_ptr + sidx_base
+                    + g_offs[:, None] * topK + k_offs[None, :],
+                    mask=g_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+                relu_mask = (relu_gk > 0.0).to(tl.float32)
+                ds_idx_gk = di_k[None, :] * w_g[:, None] * relu_mask
+                qi_tile = tl.load(
+                    query_index_ptr + qi_base
+                    + g_offs[:, None] * D_idx + d_offs_g[None, :],
+                    mask=g_mask[:, None] & d_valid_g[None, :], other=0.0).to(tl.float32)
+                ds_idx_kg = tl.trans(ds_idx_gk)
+                dki_acc += tl.dot(ds_idx_kg, qi_tile)
+            dki_offs = b * S2 * D_idx + target_k[:, None] * D_idx + d_offs_g[None, :]
+            tl.atomic_add(d_key_index_ptr + dki_offs, dki_acc,
+                          mask=k_mask[:, None] & d_valid_g[None, :])
 
 
 # helpers
