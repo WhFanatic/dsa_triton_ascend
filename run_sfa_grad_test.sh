@@ -25,10 +25,10 @@
 
 set -u
 
-export ASCEND_RT_VISIBLE_DEVICES=8
-export TRITON_END=mindspore
-export TRITON_BACKEND=mindspore
-export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+# export ASCEND_RT_VISIBLE_DEVICES=8
+# export TRITON_END=mindspore
+# export TRITON_BACKEND=mindspore
+# export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 
 GRAD_TEST=test_sfa_grad_triton.py
 FWD_TEST=test_sfa_triton.py
