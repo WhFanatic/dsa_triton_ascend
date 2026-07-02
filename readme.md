@@ -288,12 +288,13 @@ dense_lightning_indexer_softmax_lse_triton(
 - pre_tokens / next_tokens 参数暂未使用
 
 ## 测试
-测试前执行环境信息：
-export ASCEND_RT_VISIBLE_DEVICES=0
-export TRITON_END=mindspore
-export TRITON_BACKEND=mindspore
-export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-export TRITON_CACHE_DIR=./my_triton_cache
+测试前执行环境信息：  
+export ASCEND_RT_VISIBLE_DEVICES=0  
+export TRITON_END=mindspore  
+export TRITON_BACKEND=mindspore  
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0  
+export TRITON_CACHE_DIR=./my_triton_cache  
+
 
 ### 精度测试命令
 
