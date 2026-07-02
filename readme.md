@@ -339,4 +339,7 @@ TRITON_PRINT_AUTOTUNING=1 python perf_dense_loss_backward_triton.py
 - [triton-ascend 通过 `ops._ms_pyfunc()` 接入 mindspore 静态图](https://gitcode.com/Ascend/triton-ascend/issues/283)
 - [CANN lightning_indexer](https://gitcode.com/cann/ops-transformer/tree/master/attention/lightning_indexer)
 - [CANN sparse_lightning_indexer_grad_kl_loss](https://gitcode.com/cann/ops-transformer/tree/master/attention/sparse_lightning_indexer_grad_kl_loss)
+- [CANN SparseFlashAttention](https://gitcode.com/cann/ops-transformer/tree/master/attention/sparse_flash_attention)
+- [CANN SparseFlashAttentionGrad](https://gitcode.com/cann/ops-transformer/tree/master/attention/sparse_flash_attention_grad)
+- [CANN DenseLightningIndexerGradKLLoss](https://gitcode.com/cann/ops-transformer/tree/master/attention/dense_lightning_indexer_grad_kl_loss)
 - [mindspore.ops.lightning_indexer](https://www.mindspore.cn/docs/zh-CN/master/api_python/ops/mindspore.ops.lightning_indexer.html)
