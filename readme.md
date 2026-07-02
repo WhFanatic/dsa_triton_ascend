@@ -21,25 +21,6 @@
 | sparse_flash_attention (反向) | `sparse_flash_attention_grad_triton.py` | `test_sfa_grad_triton.py` | `perf_sfa_grad_triton.py` |
 | dense_loss_backward | `dense_loss_backward_triton.py` | `test_dense_loss_backward_triton.py` | `perf_dense_loss_backward_triton.py` |
 
-## 泛化性配置
-
-| 算子 | 参数 | 支持范围 |
-|------|------|----------|
-| lightning_indexer | N1（dsa_indexer_n_heads） | 32, 64, 128 |
-| | D（dsa_indexer_head_dim） | 128, 256, 512 |
-| sparse_lightning_indexer_grad_kl_loss | Nidx1（dsa_indexer_n_heads） | 32, 64, 128 |
-| | D_idx（dsa_indexer_head_dim） | 128, 256, 512 |
-| | D（query/key head_dim） | 128, 256, 512 |
-| sparse_flash_attention | N1（num_query_heads） | 1/2/4/8/16/32/64/128 |
-| | D（head_dim） | 128, 256, 512（CANN 仅 512，余者对 numpy golden 验证） |
-| | Dr（rope dim，固定） | 64 |
-| sparse_flash_attention_grad | N1（num_query_heads） | 1/2/4/8/16/32/64/128 |
-| | D（head_dim） | 128, 256, 512 |
-| | Dr（rope dim，固定） | 64 |
-| dense_loss_backward | Nidx1（dsa_indexer_n_heads） | 32, 64, 128 |
-| | D_idx（dsa_indexer_head_dim） | 128, 256, 512 |
-| | D（query/key head_dim） | 128, 256, 512 |
-
 ## lightning_indexer_triton
 
 ### 接口
