@@ -20,11 +20,16 @@ SPARSE_GRAD_CANN_TRITON_STRICT_CHECK_TEST_CONFIGS = [
 
 # 大 shape：跳过 d_ki 元素级比较（累加顺序 + fp16 舍入使得 1-ULP 差异不可避免）。
 # 覆盖 S1∈{512,1024,4096}, S2∈{1024,4096}, N1∈{32,64}, Nidx1∈{8,64}, topK∈{1024,2048}
-SPARSE_GRAD_CANN_TRITON_LARGE_CHECK_TEST_CONFIGS = [
+SPARSE_GRAD_CANN_TRITON_LOOSE_CHECK_TEST_CONFIGS = [
     (1, 512, 4096, 64, 512, 64, 128, 2048), # 目标shape，后续性能基于此shape
     (1, 1024, 1024, 32, 512, 8, 128, 1024),
     (1, 4096, 4096, 64, 512, 64, 128, 2048),
 ]
+
+SPARSE_GRAD_CANN_TRITON_TEST_CONFIGS = (
+    [(*c, "causal_random", False) for c in SPARSE_GRAD_CANN_TRITON_STRICT_CHECK_TEST_CONFIGS] +
+    [(*c, "causal_continuous", True) for c in SPARSE_GRAD_CANN_TRITON_LOOSE_CHECK_TEST_CONFIGS]
+)
 
 # CANN A3 不支持但需求要 Triton 支持的 shape：
 #   N1∈{32,64,128}, Nidx1∈{32,64,128}, D∈{128,256,512}, D_idx∈{128,256,512}, topK∈{1024,2048}
@@ -47,19 +52,23 @@ SPARSE_GRAD_TRITON_NUMPY_TEST_CONFIGS = [
     (1, 4, 2048, 64, 512, 128, 256, 1024),   # Nidx1=128×D_idx=256
 ]
 
-# numpy_reference 是纯 Python 循环，规模一大就非常慢；这里只跑较小 shape。
-# 覆盖 N1∈{32,64,128}, Nidx1∈{8,16,32,64}, S1∈{1,4}, S2∈{2048,4096}, topK∈{1024,2048}
-SPARSE_GRAD_CANN_NUMPY_TEST_CONFIGS = [
-    (1, 4, 2048, 64, 512, 64, 128, 2048),
-    # (1, 1, 2048, 32, 512, 8, 128, 1024),
-    # (1, 4, 2048, 64, 512, 16, 128, 1024),
-    # (1, 4, 2048, 128, 512, 32, 128, 1024),
-    # (1, 4, 4096, 32, 512, 64, 128, 2048),
+# 覆盖 N1∈{32,64,128}, Nidx1∈{8,16,32}, S1∈{1,4}, S2=2048, topK=1024
+SPARSE_GRAD_CANN_NUMPY_STRICT_CHECK_TEST_CONFIGS = [
+    (1, 1, 2048, 32, 512, 8, 128, 1024),
+    (1, 4, 2048, 64, 512, 16, 128, 1024),
+    (1, 4, 2048, 128, 512, 32, 128, 1024),
 ]
 
-SPARSE_GRAD_CANN_TRITON_TEST_CONFIGS = (
-    [(*c, "causal_random", False) for c in SPARSE_GRAD_CANN_TRITON_STRICT_CHECK_TEST_CONFIGS] +
-    [(*c, "causal_continuous", True) for c in SPARSE_GRAD_CANN_TRITON_LARGE_CHECK_TEST_CONFIGS]
+# 大 shape / 大 topK：跳过 d_ki 元素级比较（atomic_add 累加顺序在 CANN 与 numpy 之间不一致）。
+# 覆盖 Nidx1=64, S2=4096, topK=2048
+SPARSE_GRAD_CANN_NUMPY_LOOSE_CHECK_TEST_CONFIGS = [
+    (1, 4, 2048, 64, 512, 64, 128, 2048),
+    (1, 4, 4096, 32, 512, 64, 128, 2048),
+]
+
+SPARSE_GRAD_CANN_NUMPY_TEST_CONFIGS = (
+    [(*c, "causal_random", False) for c in SPARSE_GRAD_CANN_NUMPY_STRICT_CHECK_TEST_CONFIGS] +
+    [(*c, "causal_random", True) for c in SPARSE_GRAD_CANN_NUMPY_LOOSE_CHECK_TEST_CONFIGS]
 )
 
 
@@ -173,7 +182,7 @@ def _assert_close_skip_nearzero(a, b, atol, rtol):
     np.testing.assert_allclose(a_f, b_f, atol=atol, rtol=rtol)
 
 
-def _assert_outputs_close(base_outputs, tri_outputs, dtype):
+def _assert_outputs_close_strict(base_outputs, tri_outputs, dtype):
     d_qi_base, d_ki_base, d_w_base, loss_base = base_outputs
     d_qi_tri, d_ki_tri, d_w_tri, loss_tri = tri_outputs
     atol, rtol = _TOLS[dtype]
@@ -183,7 +192,7 @@ def _assert_outputs_close(base_outputs, tri_outputs, dtype):
     _assert_close_skip_nearzero(_to_np(loss_base), _to_np(loss_tri), atol, rtol)
 
 
-def _assert_large_outputs(base_outputs, tri_outputs, dtype):
+def _assert_outputs_close_loose(base_outputs, tri_outputs, dtype):
     d_qi_base, d_ki_base, d_w_base, loss_base = base_outputs
     d_qi_tri, d_ki_tri, d_w_tri, loss_tri = tri_outputs
     atol, rtol = _TOLS[dtype]
@@ -242,9 +251,9 @@ def _run_cann_triton_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
     )
 
     if large_check:
-        _assert_large_outputs(base_outputs, tri_outputs, dtype)
+        _assert_outputs_close_loose(base_outputs, tri_outputs, dtype)
     else:
-        _assert_outputs_close(base_outputs, tri_outputs, dtype)
+        _assert_outputs_close_strict(base_outputs, tri_outputs, dtype)
 
 
 def _run_triton_numpy_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
@@ -291,7 +300,7 @@ def _run_triton_numpy_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
 
 
 def _run_cann_numpy_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
-                              sparse_pattern="causal_random"):
+                              sparse_pattern="causal_random", large_check=False):
     """Compare CANN baseline against pure numpy reference.
 
     Sanity-check that CANN and numpy_reference agree on the CANN-supported
@@ -323,11 +332,17 @@ def _run_cann_numpy_precision(B, S1, S2, N1, D, Nidx1, D_idx, topK,
         scale_value=scale_value, layout="BSND", sparse_mode=3,
     )
 
-    atol, rtol = _TOLS[dtype]
-    _assert_close_skip_nearzero(ref['dQueryIndex'], _to_np(d_qi_cann), atol, rtol)
-    _assert_close_skip_nearzero(ref['dKeyIndex'], _to_np(d_ki_cann), atol, rtol)
-    _assert_close_skip_nearzero(ref['dW'], _to_np(d_w_cann), atol, rtol)
-    _assert_close_skip_nearzero(ref['loss'], _to_np(loss_cann), atol, rtol)
+    base_outputs = (
+        ms.Tensor(ref['dQueryIndex'], dtype=d_qi_cann.dtype),
+        ms.Tensor(ref['dKeyIndex'], dtype=d_ki_cann.dtype),
+        ms.Tensor(ref['dW'], dtype=d_w_cann.dtype),
+        ms.Tensor(ref['loss'], dtype=loss_cann.dtype),
+    )
+    cann_outputs = (d_qi_cann, d_ki_cann, d_w_cann, loss_cann)
+    if large_check:
+        _assert_outputs_close_loose(base_outputs, cann_outputs, dtype)
+    else:
+        _assert_outputs_close_strict(base_outputs, cann_outputs, dtype)
 
 
 # ============================================================================
@@ -372,14 +387,15 @@ def test_sparse_grad_kl_loss_precision_triton_numpy(
 
 @pytest.mark.accuracy
 @pytest.mark.parametrize(
-    "B,S1,S2,N1,D,Nidx1,D_idx,topK",
+    "B,S1,S2,N1,D,Nidx1,D_idx,topK,sparse_pattern,large_check",
     SPARSE_GRAD_CANN_NUMPY_TEST_CONFIGS,
 )
 def test_sparse_grad_kl_loss_precision_cann_numpy(
-        B, S1, S2, N1, D, Nidx1, D_idx, topK):
+        B, S1, S2, N1, D, Nidx1, D_idx, topK,
+        sparse_pattern, large_check):
     _run_cann_numpy_precision(
         B, S1, S2, N1, D, Nidx1, D_idx, topK,
-        sparse_pattern="causal_random",
+        sparse_pattern=sparse_pattern, large_check=large_check,
     )
 
 
@@ -405,5 +421,5 @@ if __name__ == "__main__":
         1, 4, 2048, 128, 512, 128, 128, 1024)
     print("triton_numpy precision test passed!")
     test_sparse_grad_kl_loss_precision_cann_numpy(
-        1, 4, 2048, 32, 512, 8, 128, 1024)
+        1, 4, 2048, 128, 512, 32, 128, 1024, "causal_random", False)
     print("cann_numpy precision test passed!")
