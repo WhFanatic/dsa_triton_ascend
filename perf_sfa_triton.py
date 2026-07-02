@@ -4,23 +4,28 @@ import mindspore as ms
 from mindspore import ops, runtime
 from mindspore.profiler import ProfilerLevel, ProfilerActivity, AicoreMetrics
 
-D_NOPE = 512
+D_NOPE = 512  #来源kv_lora_rank:256
 D_ROPE = 64
+DEFAULT_CONFIG = (1, 512, 4096, 64, 2048)
 
 
-def _do_bench(fn, warmup=10, rep=100):
+def _do_bench(fn, warmup=3, rep=10):
     for _ in range(warmup):
-        fn()
-    runtime.synchronize()
+        out = fn()
+        runtime.synchronize()
+        del out
+        runtime.empty_cache()
 
     times = []
     for _ in range(rep):
         runtime.synchronize()
         t0 = time.perf_counter()
-        fn()
+        out = fn()
         runtime.synchronize()
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)
+        del out
+        runtime.empty_cache()
 
     times.sort()
     n = len(times)
@@ -42,7 +47,7 @@ def _make_sparse_indices(B, S1, S2, sparse_count, sparse_mode):
     return ms.Tensor(si, dtype=ms.int32)
 
 
-def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.float16, D=D_NOPE):
+def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.bfloat16, D=D_NOPE):
     rng = np.random.RandomState(42)
 
     def _t(shape):
@@ -57,13 +62,34 @@ def _make_inputs(B, S1, S2, N1, sparse_count, dtype=ms.float16, D=D_NOPE):
     return q, k, v, qr, kr, si
 
 
+def run_autotune_confirm():
+    from sparse_flash_attention_triton import SparseFlashAttentionTriton
+
+    B, S1, S2, N1, sparse_count = DEFAULT_CONFIG
+    q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
+    scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
+
+    print(f"\nShape: B={B}, S1={S1}, S2={S2}, N1={N1}, topK={sparse_count}, D={D_NOPE}")
+    print("Running 1 invocation to trigger autotune — TRITON_PRINT_AUTOTUNING=1 output in stderr")
+    print("=" * 80)
+
+    cell = SparseFlashAttentionTriton(
+        scale_value=scale, sparse_mode=3, return_softmax_lse=True,
+    )
+    result = cell(q, k, v, si, query_rope=qr, key_rope=kr)
+    runtime.synchronize()
+    print(f"Autotune done. Output[0] shape: {result[0].shape}")
+
+    del q, k, v, qr, kr, si, cell, result
+    runtime.synchronize()
+    runtime.empty_cache()
+
+
 def run_timing():
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
 
     configs = [
-        (1, 128, 1024, 64, 16),
-        (1, 256, 2048, 64, 32),
-        (1, 512, 4096, 64, 64),
+        DEFAULT_CONFIG,
     ]
 
     for B, S1, S2, N1, sparse_count in configs:
@@ -101,6 +127,10 @@ def run_timing():
         if t_med is not None and o_med is not None and t_med > 0:
             print(f"speedup: {o_med / t_med:.2f}x")
 
+        del q, k, v, qr, kr, si, cell
+        runtime.synchronize()
+        runtime.empty_cache()
+
 
 def run_profiling():
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
@@ -108,7 +138,7 @@ def run_profiling():
     total_steps = 10
     out_dir = './profiler_data_sfa'
 
-    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 64
+    B, S1, S2, N1, sparse_count = DEFAULT_CONFIG
 
     q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
@@ -149,7 +179,7 @@ def run_profiling_cann():
     total_steps = 10
     out_dir = './profiler_data_sfa_cann'
 
-    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 64
+    B, S1, S2, N1, sparse_count = DEFAULT_CONFIG
 
     q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
@@ -187,7 +217,7 @@ def run_profiling_cann():
 def run_kernel_only():
     from sparse_flash_attention_triton import SparseFlashAttentionTriton
 
-    B, S1, S2, N1, sparse_count = 1, 512, 4096, 64, 64
+    B, S1, S2, N1, sparse_count = DEFAULT_CONFIG
 
     q, k, v, qr, kr, si = _make_inputs(B, S1, S2, N1, sparse_count)
     scale = 1.0 / np.sqrt(D_NOPE + D_ROPE)
@@ -208,8 +238,11 @@ if __name__ == "__main__":
     np.random.seed(42)
     ms.set_seed(42)
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--kernel-only":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "--kernel-only":
         run_kernel_only()
+    elif mode == "--autotune-confirm":
+        run_autotune_confirm()
     else:
         run_timing()
         run_profiling()

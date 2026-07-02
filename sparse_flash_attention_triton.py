@@ -25,10 +25,16 @@ import triton
 import triton.language as tl
 import triton.backends.ascend.runtime
 
+
 import mindspore as ms
 from mindspore import ops
 
 INT64_MAX = 9223372036854775807
+
+# Persistent device-side workspace cache for the gather path.  Reusing the
+# buffers across calls avoids the large allocate/zero/free overhead that
+# dominates the end-to-end time in the benchmark.
+_GATHER_WS_CACHE = {}
 
 # CANN constraints. attention_mode=2 (MLA-absorb) fixes Dr=64; D (kv_lora_rank,
 # the nope latent dim) is generalized here to 128/256/512 — CANN itself only
@@ -92,13 +98,21 @@ _patch_triton_ascend_mindspore_dtype_bytes()
 def _prune_configs(configs, named_args, **kwargs):
     """autotune config 过滤 (UB 上限 + grid pow2 + grid 总数上限)。
 
-    Two-pass kernel: no [BLOCK_G,D] resident acc; pass-2 keeps acc[BLOCK_G,BLOCK_DV]
-    + v[BLOCK_K,BLOCK_DV], so UB no longer scales with full D. The 2.0 factor below
-    is a coarse guard for Ascend's auto-multi-buffer doubling (the on-device
-    compiler is the final UB authority — observed it reject undersized estimates).
+    Phased UB estimation: the chunked path has two non-overlapping phases
+    per chunk — (1) score: Q@K^T, (2) P@V + accumulation. Buffers from
+    phase 1 (q_tile, k_tile) are freed before phase 2 starts, so the peak
+    UB is max(phase1, phase2), not the sum.
     """
-    _UB_LIMIT_BYTES = 180 * 1024   # headroom under the 192KB hard limit
-    _GRID_LIMIT = 131072  # 这个值持保留意见
+    _UB_LIMIT_BYTES = 180 * 1024
+    _GRID_LIMIT = 131072
+    # 大 shape (BS1*N1*D>80MB, 必走 inline-gather): BK*BD>8192 的 config 使 Cube
+    # B-matrix tile MTE 地址越界 (d84a17d 实测归纳), 仅保留 BK*BD<=8192 的实测最优.
+    # gathered path workspace<=2GB ⇒ BS1*N1*D<28MB, 永不触发, 不影响 gathered 分支.
+    _LARGE_SHAPE_LIMIT = 80 * 1024 * 1024
+    _LARGE_SHAPE_BEST = [
+        {"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64},
+        {"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64},
+    ]
 
     def _get(name):
         if name in named_args:
@@ -107,19 +121,38 @@ def _prune_configs(configs, named_args, **kwargs):
 
     N1 = _get("N1")
     BS1 = _get("B_S1")
+    D = _get("D")
+    topK = _get("topK")
+    # Conservative multiplier for D<=128: the compiler may keep all tiles
+    # (nope + rope + scores) alive simultaneously across d-loops, and may
+    # retain intermediate dot products. D>=256 uses 1.0 (verified safe).
+    ub_multiplier = 2.5 if (D is not None and D <= 128) else 1.0
 
     def _estimate_ub_bytes(block_g, block_k, block_d, block_dv):
         if None in (block_g, block_k, block_d, block_dv):
             return 0
-        acc = block_g * block_dv * 4        # acc[BLOCK_G, BLOCK_DV] fp32 (pass 2)
-        v_tile = block_k * block_dv * 2     # v[BLOCK_K, BLOCK_DV] fp16
-        q_tile = block_g * block_d * 2      # q/k QK tiles fp16
+        # Phase 1 (score computation): the compiler may keep all tiles alive
+        # simultaneously across nope/rope d-loops (q, k, qr, kr, scores, m/l).
+        # Critical for D<=128 where BLOCK_D covers both D and D_ROPE=64 in one
+        # iteration, making all tiles peak-resident at the same time.
+        rope_d = min(block_d, _D_ROPE)
+        q_tile = block_g * block_d * 2
         k_tile = block_k * block_d * 2
-        s_tile = block_g * block_k * 4      # scores[BLOCK_G, BLOCK_K] fp32
-        p_tile = block_g * block_k * 2      # p cast fp16 for PV
-        trans = block_k * block_d * 2       # tl.trans tmp
-        total = acc + v_tile + q_tile + k_tile + s_tile + p_tile + trans
-        return int(total * 2.0)             # multi-buffer doubling guard
+        qr_tile = block_g * rope_d * 2
+        kr_tile = block_k * rope_d * 2
+        s_tile = block_g * block_k * 4
+        m_l = block_g * 2 * 4
+        phase1 = q_tile + k_tile + qr_tile + kr_tile + s_tile + m_l
+
+        # Phase 2 (P@V + accumulation): p_raw + v_tile + pv_tile + acc_dv
+        p_tile = block_g * block_k * 4  # p_raw in fp32 (kept across dv-tiles)
+        v_tile = block_k * block_dv * 2
+        pv_tile = block_g * block_dv * 4
+        acc_dv = block_g * block_dv * 4
+        phase2 = p_tile + v_tile + pv_tile + acc_dv + m_l
+
+        total = max(phase1, phase2)
+        return int(total * ub_multiplier)
 
     kept = []
     for c in configs:
@@ -130,6 +163,19 @@ def _prune_configs(configs, named_args, **kwargs):
 
         if _estimate_ub_bytes(bg, bk, bd, bdv) > _UB_LIMIT_BYTES:
             continue
+        # index_select_simd has no mask; BLOCK_D/DV > D causes out-of-bounds MPU access.
+        if bd is not None and D is not None and bd > D:
+            continue
+        if bdv is not None and D is not None and bdv > D:
+            continue
+        # BLOCK_K larger than the actual topK window wastes UB and causes the
+        # last-block logic to read negative offsets; prune such configs.
+        if bk is not None and topK is not None and bk > topK:
+            continue
+        # Hard limit: BLOCK_G > 16 causes UB overflow for D=128 regardless of
+        # multiplier (verified: BG=32/64 crash, BG=16/8 safe across all shapes).
+        if D is not None and D <= 128 and bg is not None and bg > 16:
+            continue
         # NB: BLOCK_G may exceed N1; the kernel masks padded heads (g_valid),
         # so we do NOT prune on bg > N1 (would kill all configs for small N1).
         if None not in (BS1, N1) and bg:
@@ -138,6 +184,9 @@ def _prune_configs(configs, named_args, **kwargs):
             if grid0 * grid1 > _GRID_LIMIT:
                 continue
         kept.append(c)
+
+    if BS1 is not None and N1 is not None and D is not None and BS1 * N1 * D > _LARGE_SHAPE_LIMIT:
+        kept = [c for c in kept if c.kwargs in _LARGE_SHAPE_BEST]
 
     if not kept:
         print('Warning: all autotune params pruned')
@@ -152,8 +201,7 @@ def _sfa_scores_block(
     q_ptr, q_base, qr_ptr, qr_base,
     k_ptr, k_base, kr_ptr, kr_base,
     tok_clamped, tok_valid, g_offs, g_valid,
-    scale_value,
-    D: tl.constexpr, D_ROPE: tl.constexpr,
+    scale_value: tl.constexpr, D: tl.constexpr, D_ROPE: tl.constexpr,
     BLOCK_G: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """scores[BLOCK_G, BLOCK_K] = (q_nope·k_nope + q_rope·k_rope) * scale.
@@ -167,20 +215,24 @@ def _sfa_scores_block(
         d_valid = d_offs < D
         q_tile = tl.load(
             q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
-            mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            mask=g_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
         k_tile = tl.load(
             k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
-            mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+            mask=tok_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
         scores += tl.dot(q_tile, tl.trans(k_tile))
     for d_start in range(0, D_ROPE, BLOCK_D):
         d_offs = d_start + tl.arange(0, BLOCK_D)
         d_valid = d_offs < D_ROPE
         qr_tile = tl.load(
             qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
-            mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            mask=g_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
         kr_tile = tl.load(
             kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + d_offs[None, :],
-            mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+            mask=tok_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
         scores += tl.dot(qr_tile, tl.trans(kr_tile))
     scores = scores * scale_value
     return tl.where(tok_valid[None, :], scores, float('-inf'))
@@ -188,13 +240,83 @@ def _sfa_scores_block(
 
 @triton.autotune(
     configs=[
-        # Two-pass kernel: pass-2 keeps only acc[BLOCK_G, BLOCK_DV] (not [.,D]) +
-        # v[BLOCK_K, BLOCK_DV], so UB no longer scales with full D. BLOCK_DV<=128.
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 64, "BLOCK_DV": 64}),
+        # Original configs (BLOCK_G=16)
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # BLOCK_G=8: lower UB pressure, finer grid for small N1
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # BLOCK_G=32: higher per-core work density for large N1
+        triton.Config({"BLOCK_G": 32, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 32, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # BLOCK_G=64: one program covers all 64 heads, minimizing grid1
+        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # BLOCK_G=64 with larger BLOCK_K to halve chunked loop count (32 -> 16
+        # chunks at topK=2048). Larger BLOCK_K also makes the K_nope gather
+        # better-aligned with index_select_simd's preferred chunk size.
+        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # Wider BLOCK_K ranges
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 16, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # Larger BLOCK_DV: fewer dv-tile iterations, fewer fp32_acc GM round-trips
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        # Larger BLOCK_D=256: fewer nope d-tile iterations (2 vs 4 for D=512)
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        # Large BLOCK_DV + BLOCK_D combos: minimize both dv and d iterations
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        # BLOCK_DV=512 (full D=512 in one dv tile, no inner dv loop)
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 256, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        # Previously pruned by sum-based UB estimator; now allowed by phased estimator.
+        # BK=512+BD=128: 1 nope d-tile, 4 chunks (vs 16 for BK=128)
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 512, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # BK=256+BD=256: 2 nope d-tiles, 8 chunks; high cube utilization
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 128}),
+        # BG=64 + BK=256 + BD=128: covers all 64 heads, larger tiles
+        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # BG=64 + BK=128 + BD=128 + BDV=128: full-head with wider dv tiles
+        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # BK=256 + BDV=128: fewer dv-tile iterations
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # More configs unlocked by phased UB estimator
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 32, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # More configs unlocked by ub_multiplier=1.1
+
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 4,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        # Extreme configs unlocked by ub_multiplier=1.0
+        # triton.Config({"BLOCK_G": 32, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 128}),
+        # Large BLOCK_DV=256/512 configs: minimize dv-tile iterations
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 512}),
+        # BLOCK_D=512: single nope d-tile iteration for D=512, eliminating loop overhead
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 256}),
     ],
     key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
     prune_configs_by={"early_config_prune": _prune_configs},
@@ -205,8 +327,10 @@ def _sfa_kernel(
     k_ptr, kr_ptr, v_ptr,                # key/key_rope/value, all [B,S2,1,*]
     sparse_ptr,                          # token indices [B,S1,1,topK] int32 (block-wise pre-expanded on host)
     out_ptr, sm_max_ptr, sm_sum_ptr,     # outputs
+    fp32_acc_ptr,                        # fp32 accumulator [B,S1,N1,D] for chunked path
     act_q_ptr, act_k_ptr,
-    B_S1, S1, S2, N1, topK,
+    S2, N1, topK,
+    B_S1: tl.constexpr, S1: tl.constexpr,
     D: tl.constexpr, D_ROPE: tl.constexpr,
     scale_value,
     sparse_mode: tl.constexpr,
@@ -215,20 +339,40 @@ def _sfa_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_DV: tl.constexpr,
+    SINGLE_BLOCK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
 ):
-    """Flash attention over sparsely gathered KV (BSND, MQA / N2=1), two-pass.
+    """Flash attention over sparsely gathered KV (BSND, MQA / N2=1).
 
     Grid: (_next_pow2(B*S1), _next_pow2(cdiv(N1, BLOCK_G))), both pow2-padded.
     Each program: one (b,s1) position, BLOCK_G query heads. Inline-gathers KV
     rows by sparse token indices.
 
-    Pass 1: stream KV -> online-softmax stats m_i / l_i (only [BLOCK_G] vectors).
-    Pass 2: tile output dim by BLOCK_DV; per tile re-stream KV, recompute scores,
-            accumulate p @ v into acc[BLOCK_G, BLOCK_DV]. Keeps UB independent of D.
+    SINGLE_BLOCK (topK fits one BLOCK_TOPK block): scores/P computed ONCE and kept
+        resident, then dv-tiled P@V. Score/gather recompute is O(1), not
+        O(dv_tiles*k_blocks) as in the chunked fallback below. Used for topK<=128.
+    else (chunked online-softmax, large topK): single pass over KV chunks with
+        per-chunk correction of fp32 global accumulator (fp32_acc_ptr). Per chunk:
+        compute scores, p_raw = exp(scores - m_chunk), then dv-tiled P@V with
+        alpha_old/alpha_new correction applied via load-modify-store on fp32_acc.
+        Eliminates two-pass score recompute, reduces dots ~69%.
 
     sparse_ptr holds token positions directly; block-wise (sparse_block_size>1)
     is pre-expanded on host into per-token indices, so this kernel is token-wise.
     """
+    # Alignment hints: tensors are contiguous and start at least 128-byte aligned,
+    # so vector loads/stores can use aligned addressing (vector_core_partition.md).
+    q_ptr = tl.multiple_of(q_ptr, 128)
+    qr_ptr = tl.multiple_of(qr_ptr, 128)
+    k_ptr = tl.multiple_of(k_ptr, 128)
+    kr_ptr = tl.multiple_of(kr_ptr, 128)
+    v_ptr = tl.multiple_of(v_ptr, 128)
+    out_ptr = tl.multiple_of(out_ptr, 128)
+    fp32_acc_ptr = tl.multiple_of(fp32_acc_ptr, 128)
+    sparse_ptr = tl.multiple_of(sparse_ptr, 128)
+    sm_max_ptr = tl.multiple_of(sm_max_ptr, 128)
+    sm_sum_ptr = tl.multiple_of(sm_sum_ptr, 128)
+
     pid_bs1 = tl.program_id(0)
     pid_g = tl.program_id(1)
 
@@ -261,11 +405,11 @@ def _sfa_kernel(
     v_base = b * S2 * D
     sp_base = (b * S1 + s1) * topK
 
-    # ---- Pass 1: online-softmax stats (m_i, l_i); no V, no [BLOCK_G,D] acc ----
-    m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
-    for blk_start in range(0, topK, BLOCK_K):
-        blk_offs = blk_start + tl.arange(0, BLOCK_K)
+    if SINGLE_BLOCK:
+        # ---- fast path: one block covers the whole topK window; scores/P computed
+        # ONCE and kept resident, then dv-tiled P@V. Score/gather recompute is O(1),
+        # not O(dv_tiles*k_blocks) as in the two-pass fallback below. ----
+        blk_offs = tl.arange(0, BLOCK_TOPK)
         blk_in_count = blk_offs < topK
         tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
         tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
@@ -275,61 +419,547 @@ def _sfa_kernel(
             q_ptr, q_base, qr_ptr, qr_base,
             k_ptr, k_base, kr_ptr, kr_base,
             tok_clamped, tok_valid, g_offs, g_valid,
-            scale_value, D, D_ROPE, BLOCK_G, BLOCK_K, BLOCK_D)
+            scale_value, D, D_ROPE, BLOCK_G, BLOCK_TOPK, BLOCK_D)
 
-        # guard all-masked block: max stays -inf -> safe 0 so exp(-inf)=0, not nan.
-        m_blk = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_blk)
-        m_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+        m_i = tl.max(scores, axis=1)
+        m_safe = tl.where(m_i == float('-inf'), 0.0, m_i)
         p = tl.exp(scores - m_safe[:, None])
         p = tl.where(tok_valid[None, :], p, 0.0)
-        alpha = tl.exp(m_i - m_safe)
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        m_i = m_new
+        l_i = tl.sum(p, axis=1)
+        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
 
-    # final global max for pass 2 (empty rows: m_i==-inf -> use 0, p will be 0)
-    m_final = tl.where(m_i == float('-inf'), 0.0, m_i)
-    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+        out_base = (b * S1 + s1) * N1 * D
+        p_norm = p / l_safe[:, None]
+        for dv_start in range(0, D, BLOCK_DV):
+            dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+            dv_valid = dv_offs < D
+            v_tile = tl.load(
+                v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
+                mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+            out_tile = tl.dot(p_norm.to(v_tile.dtype), v_tile)
+            tl.store(
+                out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
+                out_tile.to(out_ptr.dtype.element_ty),
+                mask=g_valid[:, None] & dv_valid[None, :] & row_active)
 
-    # ---- Pass 2: tile output dim, recompute scores, accumulate p @ v ----
-    out_base = (b * S1 + s1) * N1 * D
-    for dv_start in range(0, D, BLOCK_DV):
-        dv_offs = dv_start + tl.arange(0, BLOCK_DV)
-        dv_valid = dv_offs < D
-        acc = tl.zeros([BLOCK_G, BLOCK_DV], dtype=tl.float32)
-        for blk_start in range(0, topK, BLOCK_K):
+        if return_lse:
+            sm_base = (b * S1 + s1) * N1
+            store_mask = g_valid & row_active & (l_i > 0.0)
+            tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
+            tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
+    else:
+        # ---- chunked online-softmax: one pass over KV chunks, per-chunk
+        # correction of fp32 global accumulator. Eliminates two-pass score
+        # recompute, reduces dots ~69% (928 -> 288 for the profiled shape).
+        # Score computation inlined (was _sfa_scores_block) so the compiler
+        # can see Q/QR loads are loop-invariant across blk_start and
+        # potentially reuse/cache them (loop-invariant-hoisting.md). ----
+        m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
+        fp32_base = (b * S1 + s1) * N1 * D
+
+        for blk_start in range(0, topK - BLOCK_K, BLOCK_K):
             blk_offs = blk_start + tl.arange(0, BLOCK_K)
             blk_in_count = blk_offs < topK
             tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
             tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
             tok_clamped = tl.where(tok_valid, tok, 0)
 
-            scores = _sfa_scores_block(
-                q_ptr, q_base, qr_ptr, qr_base,
-                k_ptr, k_base, kr_ptr, kr_base,
-                tok_clamped, tok_valid, g_offs, g_valid,
-                scale_value, D, D_ROPE, BLOCK_G, BLOCK_K, BLOCK_D)
+            # Inline score computation (inlined from _sfa_scores_block) so the
+            # compiler sees the full loop structure and can detect that Q/QR
+            # loads are loop-invariant across blk_start iterations.
+            # Load order: Q before K (Q has no dep on tok_clamped, can overlap
+            # with prev iter's fp32_acc store per load-order.md).
+            scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
+            for d_start in range(0, D, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < D
+                q_tile = tl.load(
+                    q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                    mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+                k_tile = tl.load(
+                    k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
+                    mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+                scores += tl.dot(q_tile, tl.trans(k_tile))
+            for d_start in range(0, D_ROPE, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < D_ROPE
+                qr_tile = tl.load(
+                    qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                    mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+                kr_tile = tl.load(
+                    kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + d_offs[None, :],
+                    mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+                scores += tl.dot(qr_tile, tl.trans(kr_tile))
+            scores = scores * scale_value
+            scores = tl.where(tok_valid[None, :], scores, float('-inf'))
 
-            p = tl.exp(scores - m_final[:, None])
-            p = tl.where(tok_valid[None, :], p, 0.0)
+            m_blk = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_blk)
+            m_new_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+            alpha_old = tl.exp(m_i - m_new_safe)
+            alpha_new = tl.exp(m_blk - m_new_safe)
+
+            m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
+            p_raw = tl.exp(scores - m_blk_safe[:, None])
+            # p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
+            l_chunk = tl.sum(p_raw, axis=1)
+            l_i = l_i * alpha_old + l_chunk * alpha_new
+
+            for dv_start in range(0, D, BLOCK_DV):
+                dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+                dv_valid = dv_offs < D
+                # Load fp32_acc before V so the independent load can overlap
+                # with the previous iteration's fp32_acc store (load-order.md).
+                acc_dv = tl.load(
+                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                    mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
+                v_tile = tl.load(
+                    v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
+                    mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+                pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
+                acc_dv = acc_dv * alpha_old[:, None] + pv_tile
+                tl.store(
+                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                    acc_dv,
+                    mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+            m_i = m_new
+
+        # Last k-block: compute scores/softmax as above, but fuse the
+        # fp32_acc normalization (divide by l_safe) and write directly to
+        # out_ptr.  Eliminates the separate post-loop dv-tile pass that
+        # reads fp32_acc back from GM (discrete_memory_access.md: eliminate
+        # redundant GM round-trips).
+        last_blk_start = topK - BLOCK_K
+        blk_offs = last_blk_start + tl.arange(0, BLOCK_K)
+        blk_in_count = blk_offs < topK
+        tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
+        tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
+        tok_clamped = tl.where(tok_valid, tok, 0)
+
+        scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
+        for d_start in range(0, D, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D
+            q_tile = tl.load(
+                q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            k_tile = tl.load(
+                k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
+                mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(q_tile, tl.trans(k_tile))
+        for d_start in range(0, D_ROPE, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D_ROPE
+            qr_tile = tl.load(
+                qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            kr_tile = tl.load(
+                kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + d_offs[None, :],
+                mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(qr_tile, tl.trans(kr_tile))
+        scores = scores * scale_value
+        scores = tl.where(tok_valid[None, :], scores, float('-inf'))
+
+        m_blk = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_blk)
+        m_new_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+        alpha_old = tl.exp(m_i - m_new_safe)
+        alpha_new = tl.exp(m_blk - m_new_safe)
+
+        m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
+        p_raw = tl.exp(scores - m_blk_safe[:, None])
+        p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
+        l_chunk = tl.sum(p_raw, axis=1)
+        l_i = l_i * alpha_old + l_chunk * alpha_new
+        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+
+        out_base = (b * S1 + s1) * N1 * D
+        for dv_start in range(0, D, BLOCK_DV):
+            dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+            dv_valid = dv_offs < D
+            # Load fp32_acc before V to overlap with previous store.
+            acc_dv = tl.load(
+                fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
             v_tile = tl.load(
                 v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
                 mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
-            acc += tl.dot(p.to(v_tile.dtype), v_tile)
+            pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
+            # Fuse normalization: write directly to out_ptr instead of
+            # fp32_acc_ptr, saving a full dv-tile GM read+write pass.
+            out_tile = (acc_dv * alpha_old[:, None] + pv_tile) / l_safe[:, None]
+            tl.store(
+                out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
+                out_tile.to(out_ptr.dtype.element_ty),
+                mask=g_valid[:, None] & dv_valid[None, :] & row_active)
 
-        out_tile = acc / l_safe[:, None]
+        m_i = m_new
+
+        if return_lse:
+            sm_base = (b * S1 + s1) * N1
+            store_mask = g_valid & row_active & (l_i > 0.0)
+            tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
+            tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
+
+
+# ---------------------------------------------------------------------------
+# device-side gather path: pre-pack the sparse KV window into contiguous
+# memory so the attention kernel can use vectorized sequential loads.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _sfa_gather_kernel(
+    k_ptr, kr_ptr, sparse_ptr,
+    gk_ptr, gkr_ptr, gvalid_ptr,
+    act_q_ptr, act_k_ptr,
+    S2, topK, S1,
+    B_S1: tl.constexpr,
+    D: tl.constexpr, D_ROPE: tl.constexpr,
+    sparse_mode: tl.constexpr,
+    BLOCK_GK: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid_bs1 = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    bs1_in_range = pid_bs1 < B_S1
+    pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0)
+
+    b = pid_bs1 // S1
+    s1 = pid_bs1 % S1
+
+    act_q = tl.load(act_q_ptr + b)
+    act_k = tl.load(act_k_ptr + b)
+
+    if sparse_mode == 0:
+        threshold = act_k
+    else:
+        threshold = act_k - act_q + s1 + 1
+
+    row_active = bs1_in_range & (s1 < act_q) & (threshold > 0)
+
+    k_base = b * S2 * D
+    kr_base = b * S2 * D_ROPE
+    sp_base = pid_bs1 * topK
+    gk_base = pid_bs1 * topK * D
+    gkr_base = pid_bs1 * topK * D_ROPE
+
+    k_offs = pid_k * BLOCK_GK + tl.arange(0, BLOCK_GK)
+    k_in_range = k_offs < topK
+    tok = tl.load(sparse_ptr + sp_base + k_offs, mask=k_in_range, other=-1)
+    tok_valid = k_in_range & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
+    tok_clamped = tl.where(tok_valid, tok, 0)
+
+    for d_start in range(0, D, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_valid = d_offs < D
+        k_tile = tl.load(
+            k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
+            mask=tok_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
         tl.store(
-            out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
-            out_tile.to(out_ptr.dtype.element_ty),
-            mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+            gk_ptr + gk_base + k_offs[:, None] * D + d_offs[None, :],
+            k_tile,
+            mask=bs1_in_range & k_in_range[:, None] & d_valid[None, :])
 
-    if return_lse:
-        # softmax_max/sum layout (B, N2=1, S1, N1) -> flat (b*S1+s1)*N1 + g.
-        # Empty/hidden rows (l_i==0) keep the pre-filled 0 to match the golden.
-        sm_base = (b * S1 + s1) * N1
-        store_mask = g_valid & row_active & (l_i > 0.0)
-        tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
-        tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
+    for d_start in range(0, D_ROPE, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_valid = d_offs < D_ROPE
+        kr_tile = tl.load(
+            kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + d_offs[None, :],
+            mask=tok_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
+        tl.store(
+            gkr_ptr + gkr_base + k_offs[:, None] * D_ROPE + d_offs[None, :],
+            kr_tile,
+            mask=bs1_in_range & k_in_range[:, None] & d_valid[None, :])
+
+    tl.store(
+        gvalid_ptr + sp_base + k_offs,
+        tl.where(tok_valid, 1, 0).to(gvalid_ptr.dtype.element_ty),
+        mask=bs1_in_range & k_in_range)
+
+
+@triton.autotune(
+    configs=[
+        # # Large tiles unlocked by contiguous gathered KV (no index_select_simd).
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        # # Conservative fallback configs.
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # D=128-safe: _prune_configs rejects BG>16 for D<=128 (UB overflow,
+        # verified BG=32/64 crash). Without these, topK>128 gather path falls
+        # back to BG=64 after "all autotune params pruned", corrupting sm_max/sum.
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 32, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+    ],
+    key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
+    prune_configs_by={"early_config_prune": _prune_configs},
+)
+@triton.jit
+def _sfa_kernel_gathered(
+    q_ptr, qr_ptr,
+    gk_ptr, gkr_ptr, v_ptr,
+    gvalid_ptr,
+    out_ptr, sm_max_ptr, sm_sum_ptr,
+    fp32_acc_ptr,
+    act_q_ptr, act_k_ptr,
+    S2, N1, topK,
+    B_S1: tl.constexpr, S1: tl.constexpr,
+    D: tl.constexpr, D_ROPE: tl.constexpr,
+    scale_value,
+    sparse_mode: tl.constexpr,
+    return_lse: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    SINGLE_BLOCK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    """Flash attention over a device-gathered contiguous KV window.
+
+    Same grid and output layout as _sfa_kernel, but K/KR/V are pre-packed to
+    [B*S1, topK, D] contiguous buffers by _sfa_gather_kernel.  This removes the
+    random index_select_simd inside the hot loop and allows much larger tiles.
+    """
+    q_ptr = tl.multiple_of(q_ptr, 128)
+    qr_ptr = tl.multiple_of(qr_ptr, 128)
+    gk_ptr = tl.multiple_of(gk_ptr, 128)
+    gkr_ptr = tl.multiple_of(gkr_ptr, 128)
+    v_ptr = tl.multiple_of(v_ptr, 128)
+    out_ptr = tl.multiple_of(out_ptr, 128)
+    fp32_acc_ptr = tl.multiple_of(fp32_acc_ptr, 128)
+    gvalid_ptr = tl.multiple_of(gvalid_ptr, 128)
+    sm_max_ptr = tl.multiple_of(sm_max_ptr, 128)
+    sm_sum_ptr = tl.multiple_of(sm_sum_ptr, 128)
+
+    pid_bs1 = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    bs1_in_range = pid_bs1 < B_S1
+    pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0)
+
+    b = pid_bs1 // S1
+    s1 = pid_bs1 % S1
+
+    g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+    g_valid = g_offs < N1
+
+    act_q = tl.load(act_q_ptr + b)
+    act_k = tl.load(act_k_ptr + b)
+
+    if sparse_mode == 0:
+        threshold = act_k
+    else:
+        threshold = act_k - act_q + s1 + 1
+
+    row_active = bs1_in_range & (s1 < act_q) & (threshold > 0)
+
+    q_base = (b * S1 + s1) * N1 * D
+    qr_base = (b * S1 + s1) * N1 * D_ROPE
+    gk_base = (b * S1 + s1) * topK * D
+    gkr_base = (b * S1 + s1) * topK * D_ROPE
+    gv_base = gk_base
+    sp_base = (b * S1 + s1) * topK
+    fp32_base = (b * S1 + s1) * N1 * D
+    out_base = fp32_base
+
+    if SINGLE_BLOCK:
+        blk_offs = tl.arange(0, BLOCK_TOPK)
+        blk_in_count = blk_offs < topK
+        valid_i8 = tl.load(gvalid_ptr + sp_base + blk_offs, mask=blk_in_count, other=0)
+        tok_valid = (valid_i8 > 0) & blk_in_count & row_active
+
+        scores = tl.zeros([BLOCK_G, BLOCK_TOPK], dtype=tl.float32)
+        for d_start in range(0, D, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D
+            q_tile = tl.load(
+                q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            k_tile = tl.load(
+                gk_ptr + gk_base + blk_offs[:, None] * D + d_offs[None, :],
+                mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(q_tile, tl.trans(k_tile))
+        for d_start in range(0, D_ROPE, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D_ROPE
+            qr_tile = tl.load(
+                qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            kr_tile = tl.load(
+                gkr_ptr + gkr_base + blk_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(qr_tile, tl.trans(kr_tile))
+        scores = scores * scale_value
+        scores = tl.where(tok_valid[None, :], scores, float('-inf'))
+
+        m_i = tl.max(scores, axis=1)
+        m_safe = tl.where(m_i == float('-inf'), 0.0, m_i)
+        p = tl.exp(scores - m_safe[:, None])
+        p = tl.where(tok_valid[None, :], p, 0.0)
+        l_i = tl.sum(p, axis=1)
+        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+
+        p_norm = p / l_safe[:, None]
+        for dv_start in range(0, D, BLOCK_DV):
+            dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+            dv_valid = dv_offs < D
+            v_tile = tl.load(
+                v_ptr + gv_base + blk_offs[:, None] * D + dv_offs[None, :],
+                mask=blk_in_count[:, None] & dv_valid[None, :], other=0.0)
+            out_tile = tl.dot(p_norm.to(v_tile.dtype), v_tile)
+            tl.store(
+                out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
+                out_tile.to(out_ptr.dtype.element_ty),
+                mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+        if return_lse:
+            sm_base = (b * S1 + s1) * N1
+            store_mask = g_valid & row_active & (l_i > 0.0)
+            tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
+            tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
+    else:
+        m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
+
+        for blk_start in range(0, topK - BLOCK_K, BLOCK_K):
+            blk_offs = blk_start + tl.arange(0, BLOCK_K)
+            blk_in_count = blk_offs < topK
+            valid_i8 = tl.load(gvalid_ptr + sp_base + blk_offs, mask=blk_in_count, other=0)
+            tok_valid = (valid_i8 > 0) & blk_in_count & row_active
+
+            scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
+            for d_start in range(0, D, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < D
+                q_tile = tl.load(
+                    q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                    mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+                k_tile = tl.load(
+                    gk_ptr + gk_base + blk_offs[:, None] * D + d_offs[None, :],
+                    mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+                scores += tl.dot(q_tile, tl.trans(k_tile))
+            for d_start in range(0, D_ROPE, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < D_ROPE
+                qr_tile = tl.load(
+                    qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                    mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+                kr_tile = tl.load(
+                    gkr_ptr + gkr_base + blk_offs[:, None] * D_ROPE + d_offs[None, :],
+                    mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+                scores += tl.dot(qr_tile, tl.trans(kr_tile))
+            scores = scores * scale_value
+            scores = tl.where(tok_valid[None, :], scores, float('-inf'))
+
+            m_blk = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_blk)
+            m_new_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+            alpha_old = tl.exp(m_i - m_new_safe)
+            alpha_new = tl.exp(m_blk - m_new_safe)
+
+            m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
+            p_raw = tl.exp(scores - m_blk_safe[:, None])
+            l_chunk = tl.sum(p_raw, axis=1)
+            l_i = l_i * alpha_old + l_chunk * alpha_new
+
+            for dv_start in range(0, D, BLOCK_DV):
+                dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+                dv_valid = dv_offs < D
+                acc_dv = tl.load(
+                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                    mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
+                v_tile = tl.load(
+                    v_ptr + gv_base + blk_offs[:, None] * D + dv_offs[None, :],
+                    mask=blk_in_count[:, None] & dv_valid[None, :], other=0.0)
+                pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
+                acc_dv = acc_dv * alpha_old[:, None] + pv_tile
+                tl.store(
+                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                    acc_dv,
+                    mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+            m_i = m_new
+
+        last_blk_start = topK - BLOCK_K
+        blk_offs = last_blk_start + tl.arange(0, BLOCK_K)
+        blk_in_count = blk_offs < topK
+        valid_i8 = tl.load(gvalid_ptr + sp_base + blk_offs, mask=blk_in_count, other=0)
+        tok_valid = (valid_i8 > 0) & blk_in_count & row_active
+
+        scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
+        for d_start in range(0, D, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D
+            q_tile = tl.load(
+                q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            k_tile = tl.load(
+                gk_ptr + gk_base + blk_offs[:, None] * D + d_offs[None, :],
+                mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(q_tile, tl.trans(k_tile))
+        for d_start in range(0, D_ROPE, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D_ROPE
+            qr_tile = tl.load(
+                qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            kr_tile = tl.load(
+                gkr_ptr + gkr_base + blk_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(qr_tile, tl.trans(kr_tile))
+        scores = scores * scale_value
+        scores = tl.where(tok_valid[None, :], scores, float('-inf'))
+
+        m_blk = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_blk)
+        m_new_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+        alpha_old = tl.exp(m_i - m_new_safe)
+        alpha_new = tl.exp(m_blk - m_new_safe)
+
+        m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
+        p_raw = tl.exp(scores - m_blk_safe[:, None])
+        p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
+        l_chunk = tl.sum(p_raw, axis=1)
+        l_i = l_i * alpha_old + l_chunk * alpha_new
+        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+
+        for dv_start in range(0, D, BLOCK_DV):
+            dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+            dv_valid = dv_offs < D
+            acc_dv = tl.load(
+                fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
+            v_tile = tl.load(
+                v_ptr + gv_base + blk_offs[:, None] * D + dv_offs[None, :],
+                mask=blk_in_count[:, None] & dv_valid[None, :], other=0.0)
+            pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
+            out_tile = (acc_dv * alpha_old[:, None] + pv_tile) / l_safe[:, None]
+            tl.store(
+                out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
+                out_tile.to(out_ptr.dtype.element_ty),
+                mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+        m_i = m_new
+
+        if return_lse:
+            sm_base = (b * S1 + s1) * N1
+            store_mask = g_valid & row_active & (l_i > 0.0)
+            tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
+            tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +979,7 @@ def _tnd_cumsum_to_per_batch(cumsum):
 
 def _tnd_to_bsnd(tensor, act_seq_per_batch):
     """[T, N, ...] -> [B, max_S, N, ...]; PyNative-only (data-dependent slicing)."""
-    assert ms.get_context('mode') == ms.PYNATIVE_MODE, "TND path is PyNative-only."
+    # assert ms.get_context('mode') == ms.PYNATIVE_MODE, "TND path is PyNative-only."
     B = act_seq_per_batch.shape[0]
     lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
     max_seq = max(lengths) if lengths else 0
@@ -365,7 +995,7 @@ def _tnd_to_bsnd(tensor, act_seq_per_batch):
 
 def _bsnd_to_tnd(tensor, act_seq_per_batch):
     """[B, S, N, ...] -> [T, N, ...]; inverse of _tnd_to_bsnd (PyNative-only)."""
-    assert ms.get_context('mode') == ms.PYNATIVE_MODE, "TND path is PyNative-only."
+# assert ms.get_context('mode') == ms.PYNATIVE_MODE, "TND path is PyNative-only."
     B = act_seq_per_batch.shape[0]
     lengths = [int(act_seq_per_batch[i].asnumpy().item()) for i in range(B)]
     total_t = sum(lengths)
@@ -385,7 +1015,7 @@ def _pa_to_bsnd(cache, block_table, act_k_per_batch, max_s2):
     Reverses paging using block_table[B, max_blocks] (PyNative-only). -1 block ids
     are skipped. Mirrors the golden's tensor_to_pa inverse.
     """
-    assert ms.get_context('mode') == ms.PYNATIVE_MODE, "PA_BSND path is PyNative-only."
+    # assert ms.get_context('mode') == ms.PYNATIVE_MODE, "PA_BSND path is PyNative-only."
     block_num, block_size, N, Dx = cache.shape
     B = block_table.shape[0]
     out = ms.ops.zeros((B, max_s2, N, Dx), dtype=cache.dtype)
@@ -430,6 +1060,7 @@ def _infer_sfa(
     k_flat: ms.Tensor, kr_flat: ms.Tensor, v_flat: ms.Tensor,
     sparse_flat: ms.Tensor,
     out_buf: ms.Tensor, sm_max_buf: ms.Tensor, sm_sum_buf: ms.Tensor,
+    fp32_acc_buf: ms.Tensor,
     act_q: ms.Tensor, act_k: ms.Tensor,
     B_S1: int, S1: int, S2: int, N1: int, topK: int,
     D: int, D_ROPE: int,
@@ -441,6 +1072,90 @@ def _infer_sfa(
             ms.mint.empty_like(sm_max_buf),
             ms.mint.empty_like(sm_sum_buf))
 
+import os
+import pickle
+from datetime import datetime
+
+def _save_sfa_inputs(
+    q_flat, qr_flat, k_flat, kr_flat, v_flat,
+    sparse_flat, out_buf, sm_max_buf, sm_sum_buf,
+    fp32_acc_buf, act_q, act_k,
+    B_S1, S1, S2, N1, topK,
+    D, D_ROPE, scale_value, sparse_mode, return_lse,
+    single_block, block_topk,
+    save_dir="/tmp/sfa_inputs"
+):
+    """保存 _sfa_kernel 的所有输入到本地文件"""
+    os.makedirs(save_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    save_path = os.path.join(save_dir, f"sfa_inputs_{timestamp}.pkl")
+    
+    import torch
+    import numpy as np
+    import mindspore as ms
+    
+    def ms_tensor_to_torch(ms_t):
+        """将 ms.Tensor 转为 torch.Tensor，兼容 bfloat16"""
+        if not hasattr(ms_t, "dtype"):
+            return ms_t  # 不是 ms.Tensor
+        
+        ms_dtype = ms_t.dtype
+        shape = ms_t.shape
+        
+        # bfloat16 特殊处理：通过 uint16 字节视图中转
+        if ms_dtype == ms.bfloat16:
+            # 方法：先 view 为 uint16，再 asnumpy，再 torch.from_numpy，最后 view 回 bfloat16
+            uint16_tensor = ms_t.view(ms.uint16)
+            np_uint16 = uint16_tensor.asnumpy()
+            torch_uint16 = torch.from_numpy(np_uint16)
+            return torch_uint16.view(torch.bfloat16).reshape(shape)
+        
+        # 其他类型正常转换
+        try:
+            np_arr = ms_t.asnumpy()
+            dtype_map = {
+                ms.float16: torch.float16,
+                ms.float32: torch.float32,
+                ms.float64: torch.float64,
+                ms.int8: torch.int8,
+                ms.int16: torch.int16,
+                ms.int32: torch.int32,
+                ms.int64: torch.int64,
+                ms.uint8: torch.uint8,
+                ms.bool_: torch.bool,
+            }
+            torch_dtype = dtype_map.get(ms_dtype, torch.float32)
+            return torch.from_numpy(np_arr).to(torch_dtype)
+        except Exception as e:
+            # 兜底：float32 中转
+            np_f32 = ms_t.astype(ms.float32).asnumpy()
+            target_dtype = dtype_map.get(ms_dtype, torch.float32)
+            return torch.from_numpy(np_f32).to(target_dtype)
+
+    inputs = {
+        "q_flat":       ms_tensor_to_torch(q_flat),
+        "qr_flat":      ms_tensor_to_torch(qr_flat),
+        "k_flat":       ms_tensor_to_torch(k_flat),
+        "kr_flat":      ms_tensor_to_torch(kr_flat),
+        "v_flat":       ms_tensor_to_torch(v_flat),
+        "sparse_flat":  ms_tensor_to_torch(sparse_flat),
+        "out_buf":      ms_tensor_to_torch(out_buf),
+        "sm_max_buf":   ms_tensor_to_torch(sm_max_buf),
+        "sm_sum_buf":   ms_tensor_to_torch(sm_sum_buf),
+        "fp32_acc_buf": ms_tensor_to_torch(fp32_acc_buf),
+        "act_q":        ms_tensor_to_torch(act_q),
+        "act_k":        ms_tensor_to_torch(act_k),
+        "B_S1": B_S1, "S1": S1, "S2": S2, "N1": N1, "topK": topK,
+        "D": D, "D_ROPE": D_ROPE, "scale_value": scale_value,
+        "sparse_mode": sparse_mode, "return_lse": return_lse,
+        "single_block": single_block, "block_topk": block_topk,
+    }
+    
+    with open(save_path, "wb") as f:
+        pickle.dump(inputs, f)
+    
+    print(f"[SFA] 输入已保存到: {save_path}")
+    return save_path
 
 @ms.ops._ms_pyfunc(infer_func=_infer_sfa)
 def _sfa_core(
@@ -448,6 +1163,7 @@ def _sfa_core(
     k_flat: ms.Tensor, kr_flat: ms.Tensor, v_flat: ms.Tensor,
     sparse_flat: ms.Tensor,
     out_buf: ms.Tensor, sm_max_buf: ms.Tensor, sm_sum_buf: ms.Tensor,
+    fp32_acc_buf: ms.Tensor,
     act_q: ms.Tensor, act_k: ms.Tensor,
     B_S1: int, S1: int, S2: int, N1: int, topK: int,
     D: int, D_ROPE: int,
@@ -462,17 +1178,113 @@ def _sfa_core(
         _next_pow2(triton.cdiv(N1, meta["BLOCK_G"])),
     )
 
-    _sfa_kernel[grid_fn](
-        q_flat, qr_flat,
-        k_flat, kr_flat, v_flat,
-        sparse_flat,
-        out_buf, sm_max_buf, sm_sum_buf,
+    # fast path when one block (BLOCK_TOPK = pow2(topK), capped at 128) covers the
+    # whole sparse window: scores/P computed once, dv-tiled P@V. Larger topK uses
+    # chunked online-softmax (fp32 global accumulator, no two-pass recompute).
+    block_topk = _next_pow2(topK)
+    single_block = block_topk <= 128
+
+    # _save_sfa_inputs(
+    #         q_flat, qr_flat, k_flat, kr_flat, v_flat,
+    #         sparse_flat, out_buf, sm_max_buf, sm_sum_buf,
+    #         fp32_acc_buf, act_q, act_k,
+    #         B_S1, S1, S2, N1, topK,
+    #         D, D_ROPE, scale_value, sparse_mode, return_lse,
+    #         single_block, block_topk,
+    #         save_dir="/home/z00841464/SFA/data/sfa_inputs"  # 可修改保存路径
+    #     )
+
+    if single_block:
+        _sfa_kernel[grid_fn](
+            q_flat, qr_flat,
+            k_flat, kr_flat, v_flat,
+            sparse_flat,
+            out_buf, sm_max_buf, sm_sum_buf,
+            fp32_acc_buf,
+            act_q, act_k,
+            S2, N1, topK,
+            B_S1=B_S1, S1=S1,
+            D=D, D_ROPE=D_ROPE,
+            scale_value=scale_value,
+            sparse_mode=sparse_mode,
+            return_lse=return_lse,
+            SINGLE_BLOCK=single_block,
+            BLOCK_TOPK=block_topk,
+        )
+        return out_buf, sm_max_buf, sm_sum_buf
+
+    # For large topK, pre-gather the sparse KV window into contiguous buffers on
+    # the device.  This turns random index_select_simd gathers inside the hot
+    # loop into sequential vector loads and unlocks larger attention tiles.
+    # Fall back to the inline-gather kernel when the workspace would be huge.
+    gather_workspace_bytes = B_S1 * topK * (D + D_ROPE + 1) * 2
+    use_device_gather = gather_workspace_bytes <= 2 * 1024 * 1024 * 1024
+
+    if not use_device_gather:
+        _sfa_kernel[grid_fn](
+            q_flat, qr_flat,
+            k_flat, kr_flat, v_flat,
+            sparse_flat,
+            out_buf, sm_max_buf, sm_sum_buf,
+            fp32_acc_buf,
+            act_q, act_k,
+            S2, N1, topK,
+            B_S1=B_S1, S1=S1,
+            D=D, D_ROPE=D_ROPE,
+            scale_value=scale_value,
+            sparse_mode=sparse_mode,
+            return_lse=return_lse,
+            SINGLE_BLOCK=single_block,
+            BLOCK_TOPK=block_topk,
+        )
+        return out_buf, sm_max_buf, sm_sum_buf
+
+    cache_key = (B_S1, topK, D, D_ROPE, k_flat.dtype, kr_flat.dtype)
+    cached = _GATHER_WS_CACHE.get(cache_key)
+    if cached is not None:
+        gk, gkr, gvalid = cached
+    else:
+        gk = ms.mint.empty((B_S1, topK, D), dtype=k_flat.dtype).to('Ascend')
+        gkr = ms.mint.empty((B_S1, topK, D_ROPE), dtype=kr_flat.dtype).to('Ascend')
+        gvalid = ms.mint.empty((B_S1, topK), dtype=ms.int8).to('Ascend')
+        _GATHER_WS_CACHE[cache_key] = (gk, gkr, gvalid)
+
+    def gather_grid(meta): return (
+        _next_pow2(B_S1),
+        _next_pow2(triton.cdiv(topK, meta["BLOCK_GK"])),
+    )
+
+    _sfa_gather_kernel[gather_grid](
+        k_flat, kr_flat, sparse_flat,
+        gk, gkr, gvalid,
         act_q, act_k,
-        B_S1, S1, S2, N1, topK,
-        D, D_ROPE,
-        scale_value,
+        S2, topK, S1,
+        B_S1=B_S1,
+        D=D, D_ROPE=D_ROPE,
+        sparse_mode=sparse_mode,
+        BLOCK_GK=64, BLOCK_D=128,
+    )
+
+    def gathered_grid_fn(meta): return (
+        _next_pow2(B_S1),
+        _next_pow2(triton.cdiv(N1, meta["BLOCK_G"])),
+    )
+
+    _sfa_kernel_gathered[gathered_grid_fn](
+        q_flat, qr_flat,
+        gk, gkr, gk,
+        gvalid,
+        out_buf, sm_max_buf, sm_sum_buf,
+        fp32_acc_buf,
+        act_q, act_k,
+        S2, N1, topK,
+        B_S1=B_S1, S1=S1,
+        D=D, D_ROPE=D_ROPE,
+        scale_value=scale_value,
         sparse_mode=sparse_mode,
         return_lse=return_lse,
+        SINGLE_BLOCK=False,
+        BLOCK_TOPK=block_topk,
     )
     return out_buf, sm_max_buf, sm_sum_buf
 
@@ -615,12 +1427,14 @@ def sparse_flash_attention_triton(
     out_buf = ms.mint.zeros((B, S1, N1, D), dtype=q_bsnd.dtype).to('Ascend')
     sm_max_buf = ms.mint.zeros((B, 1, S1, N1), dtype=ms.float32).to('Ascend')
     sm_sum_buf = ms.mint.zeros((B, 1, S1, N1), dtype=ms.float32).to('Ascend')
+    fp32_acc_buf = ms.mint.zeros((B, S1, N1, D), dtype=ms.float32).to('Ascend')
 
     out_buf, sm_max_buf, sm_sum_buf = _sfa_core(
         q_flat, qr_flat,
         k_flat, kr_flat, v_flat,
         sparse_flat,
         out_buf, sm_max_buf, sm_sum_buf,
+        fp32_acc_buf,
         act_q.to('Ascend'), act_k.to('Ascend'),
         B * S1, S1, S2, N1, topK,
         D, D_ROPE,
@@ -691,5 +1505,5 @@ class SparseFlashAttentionTriton(ms.nn.Cell):
             next_tokens=self.next_tokens,
             attention_mode=self.attention_mode,
             return_softmax_lse=self.return_softmax_lse,
-            block_size=self.block_size,
+            # block_size=self.block_size,   目前mindformers不用，先注释掉 by guod
         )

@@ -76,6 +76,9 @@ import triton.backends.ascend.runtime
 
 import mindspore as ms
 from mindspore import ops
+import os
+if os.environ.get("TRITON_ENABLE_TASKQUEUE", "true").lower() in ("true", "1"):
+    os.environ["TRITON_ENABLE_TASKQUEUE"] = "false"
 
 # host-side layout helpers shared with the forward (same normalization rules)
 from sparse_flash_attention_triton import (
@@ -140,63 +143,81 @@ def _patch_triton_ascend_mindspore_dtype_bytes():
 _patch_triton_ascend_mindspore_dtype_bytes()
 
 
-def _select_block_config(D):
-    """Host-side fixed block config (no autotune).
-
-    The backward writes dk/dkr/dv via tl.atomic_add into pre-zeroed buffers.
-    triton.autotune benchmarks each config by running the kernel HUNDREDS of times
-    against the same buffers, so the atomic accumulation explodes (~config_runs×).
-    We therefore pick a fixed, hardware-validated config and launch the kernel
-    exactly once. BLOCK_G=16/BLOCK_K=16/BLOCK_D=128 is the config that passed on
-    D=512 (where _prune_configs happened to leave a single config -> no bench).
-    UB scales with D via the resident acc_dq[BLOCK_G,D]; small blocks keep all of
-    D in {128,256,512} within the ~192KB UB budget.
-    """
-    return {"BLOCK_G": 16, "BLOCK_K": 16, "BLOCK_D": 128}
+def _select_block_config(D, N1):
+    block_g = min(16, max(8, N1))
+    # BLOCK_K_A (Pass A: gather + 3 dots + dS/P store) and BLOCK_K_B (Pass B:
+    # dk/dv acc) split so each pass can tune independently. BK_A capped at 32:
+    # at 64 k_cat must exist in BOTH dot orientations (scores contracts D_TOT,
+    # acc_dq contracts BK) = 144KB, + acc_dq + q/do → UB overflow. BK_B capped
+    # at 32: the [BK_B, D_TOT] fp32 accumulator overflows at 64.
+    return {"BLOCK_G": block_g, "BLOCK_K_A": 32, "BLOCK_K_B": 32, "BLOCK_D": 128}
 
 
 @triton.jit
 def _sfa_grad_kernel(
-    q_ptr, qr_ptr,                       # query[B,S1,N1,D], query_rope[B,S1,N1,Dr]
-    k_ptr, kr_ptr, v_ptr,                # key/key_rope/value, all [B,S2,1,*] (v aliases k)
+    qcat_ptr,                            # query cat [B*S1, N1, D+D_ROPE] (nope|rope)
+    kcat_ptr,                            # key cat [B*S2, D+D_ROPE] (nope|rope)
     sparse_ptr,                          # token indices [B,S1,1,topK] int32 (block pre-expanded)
-    do_ptr, o_ptr,                       # d_out[B,S1,N1,D], out[B,S1,N1,D]
+    do_ptr, delta_ptr,                   # d_out [B*S1,N1,D]; delta=rowsum(dO*O) [B*S1*N1] (host-precomputed)
     sm_max_ptr, sm_sum_ptr,              # forward softmax stats, flat (b*S1+s1)*N1 + g
-    dq_ptr, dqr_ptr,                     # outputs: d_query, d_query_rope
-    dk_ptr, dkr_ptr, dv_ptr,             # outputs (fp32 workspace): d_key, d_key_rope, d_value
+    dqcat_ptr,                           # output: d_query cat [B*S1, N1, D+D_ROPE] (nope|rope)
+    dkcat_ptr,                           # output (fp32): d_key cat [B*S2, D+D_ROPE] (nope|rope)
+    dv_ptr,                              # output (fp32): d_value [B*S2, D]
+    ds_ptr, p_ptr,                       # workspace (bf16): dS/P [B*S1, N1, topK] — Pass A writes, B reads
     act_q_ptr, act_k_ptr,
     B_S1, S1, S2, N1, topK,
-    D: tl.constexpr, D_ROPE: tl.constexpr,
+    D: tl.constexpr, D_ROPE: tl.constexpr, D_TOT: tl.constexpr,
     scale_value,
     sparse_mode: tl.constexpr,
     BLOCK_G: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    BLOCK_K_A: tl.constexpr,
+    BLOCK_K_B: tl.constexpr,
+    NUM_HC: tl.constexpr,
+    NEED_BLK_MASK_A: tl.constexpr,
+    NEED_BLK_MASK_B: tl.constexpr,
 ):
     """SFA backward over sparsely gathered KV (BSND, MQA / N2=1), single pass.
 
-    Grid: (_next_pow2(B*S1), _next_pow2(cdiv(N1, BLOCK_G))), both pow2-padded.
-    Each program owns one (b,s1) and BLOCK_G query heads.
+    Host concats nope|rope into q_cat/k_cat so each scores/dq/dk cube is one dot
+    over D_TOT=D+D_ROPE instead of two (nope + rope). dPv = dO·k_nope; since
+    triton-ascend rejects column slicing k_cat[:, :D], dO is loaded padded to
+    D_TOT (rope cols 0) and dotted against full k_cat — rope cols contribute 0,
+    so the result equals dO·k_nope. Outputs dqcat/dkcat are written whole
+    (nope|rope) and split back into dq/dqr, dk/dkr on host.
 
-    Per topK block: rebuild scores (q·k) -> P (from saved softmax stats) -> dPv
-    (dO·v, v=k_nope) -> dS = P·(dPv - delta)·scale. Accumulate dq/dqr resident
-    (no cross-program contention — each head row owned by one program); scatter-add
-    dk/dkr (dS·q) and dv (P·dO) into fp32 workspaces (many s1 rows hit one KV token).
+    Grid: (_next_pow2(B*S1),). Each program owns one (b,s1) and BLOCK_G query heads.
+
+    Per topK block: rebuild scores (q_cat·k_cat) -> P (from saved softmax stats) ->
+    dPv (dO_pad·k_cat) -> dS = P·(dPv - delta)·scale. Accumulate dqcat resident
+    (no cross-program contention — each head row owned by one program); materialize
+    dS/P to a GM workspace, then a second pass scatter-adds dkcat (dS·q_cat) and
+    dv (P·dO) into fp32 workspaces WITHOUT re-gathering k_cat or recomputing
+    scores/P/dS (gathers 3->1, dots 8->5). delta = rowsum(dO*O) is host-precomputed.
+
+    Mask elision: i32 LT/GT comparisons are scalar-lowered on Ascend, so the
+    hottest such masks are dropped entirely when provably all-true at host —
+    NEED_BLK_MASK_A/B=False (topK % BLOCK_K_A/B == 0 ⇒ blk_offs<topK always true)
+    removes the per-iteration blk_in_count. g_offs is never clamped (tl.where on
+    g_valid would let BiShengHIR specialize N1, shrinking the head tile to size-1
+    and failing N1=1 compilation); out-of-range heads are masked via g_valid
+    instead. (tok!=-1 is i32 NE, not lowered.) dt_lt_D (rope-col padding) is
+    hoisted to a one-time compute.
 
     No early-return (triton-ascend drops stores after early-return): inactive rows
     are folded into tok_valid so dS/P become 0 and all contributions vanish.
     """
     pid_bs1 = tl.program_id(0)
-    pid_g = tl.program_id(1)
-
     bs1_in_range = pid_bs1 < B_S1
     pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0)
 
     b = pid_bs1 // S1
     s1 = pid_bs1 % S1
 
-    g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
-    g_valid = g_offs < N1
+    d_offs = tl.arange(0, D)
+    dt_offs = tl.arange(0, D_TOT)
+    dt_lt_D = dt_offs < D
+    blk_k_offs_a = tl.arange(0, BLOCK_K_A)
+    blk_k_offs_b = tl.arange(0, BLOCK_K_B)
 
     act_q = tl.load(act_q_ptr + b)
     act_k = tl.load(act_k_ptr + b)
@@ -207,105 +228,189 @@ def _sfa_grad_kernel(
         threshold = act_k - act_q + s1 + 1
     row_active = bs1_in_range & (s1 < act_q) & (threshold > 0)
 
-    d_offs_full = tl.arange(0, D)
-    dr_offs_full = tl.arange(0, D_ROPE)
+    upper = tl.minimum(threshold, act_k)
+    upper_f = upper.to(tl.float32)
 
-    q_base = (b * S1 + s1) * N1 * D
-    qr_base = (b * S1 + s1) * N1 * D_ROPE
-    o_base = (b * S1 + s1) * N1 * D
-    k_base = b * S2 * D
-    kr_base = b * S2 * D_ROPE
-    v_base = b * S2 * D
-    sp_base = (b * S1 + s1) * topK
-    sm_base = (b * S1 + s1) * N1
+    # Base offsets (shared across all stages)
+    sp_base = pid_bs1 * topK
+    kcat_base = b * S2 * D_TOT            # [B*S2, D_TOT]
+    v_base = b * S2 * D                    # dv scatter over nope D
+    dq_row_base = pid_bs1 * N1 * D         # [B*S1, N1, D] (do/o are nope-only)
+    dqcat_row_base = pid_bs1 * N1 * D_TOT  # [B*S1, N1, D_TOT]
+    ws_base = pid_bs1 * N1 * topK          # workspace [B*S1, N1, topK] row for this program
 
-    # resident per-head tiles (loaded once)
-    q_nope = tl.load(q_ptr + q_base + g_offs[:, None] * D + d_offs_full[None, :],
-                     mask=g_valid[:, None], other=0.0)
-    q_rope = tl.load(qr_ptr + qr_base + g_offs[:, None] * D_ROPE + dr_offs_full[None, :],
-                     mask=g_valid[:, None], other=0.0)
-    do_tile = tl.load(do_ptr + o_base + g_offs[:, None] * D + d_offs_full[None, :],
-                      mask=g_valid[:, None], other=0.0)
-    o_tile = tl.load(o_ptr + o_base + g_offs[:, None] * D + d_offs_full[None, :],
-                     mask=g_valid[:, None], other=0.0)
+    # ──────────────────────────────────────────────────────────────
+    # Stage A: Compute dq/dqr for each head chunk.
+    # hc-outer, blk_start-inner loop.
+    # NO MTE3 writes in the hot loop → Cube not blocked by Vector.
+    # ──────────────────────────────────────────────────────────────
+    # Use HC_LOOP to avoid Triton compiler crash on `for hc in range(1)`
+    # (scf.For assertion failure in ttir_to_linalg). When NUM_HC == 1,
+    # the extra hc=1 iteration has g_valid all-False, contributing nothing.
+    if NUM_HC == 1:
+        HC_LOOP: tl.constexpr = 2
+    else:
+        HC_LOOP: tl.constexpr = NUM_HC
 
-    sm_max = tl.load(sm_max_ptr + sm_base + g_offs, mask=g_valid, other=0.0)
-    sm_sum = tl.load(sm_sum_ptr + sm_base + g_offs, mask=g_valid, other=1.0)
-    sm_sum = tl.where(sm_sum > 0.0, sm_sum, 1.0)
+    # Stage A merges GROUP_HC head chunks into one dot's M-dim. Two wins:
+    # (1) cube micro-tiles are 16x16 — M=BLOCK_G=8 alone half-fills them
+    #     (cube_ratio 0.14%); MG=16 fills them fully.
+    # (2) dot invocation count drops by GROUP_HC× (k_cat shared across the
+    #     merged heads — same tokens). Dots here are issue/sync-bound, not
+    #     compute-bound, so fewer-larger dots cut the dominant cube↔vector
+    #     sync cost. MG capped at 2*BLOCK_G by UB: acc_dqcat[MG,D_TOT] fp32 +
+    #     q_cat/do_pad[MG,D_TOT] bf16 + cube-internal fp32 upcast copies must
+    #     coexist with k_cat[blk,D_TOT] + trans under 192KB.
+    if NUM_HC >= 2:
+        GROUP_HC: tl.constexpr = 2
+        N_GROUPS: tl.constexpr = NUM_HC // 2
+    else:
+        GROUP_HC: tl.constexpr = 1
+        N_GROUPS: tl.constexpr = 2
+    MG: tl.constexpr = GROUP_HC * BLOCK_G
+    for hg in range(N_GROUPS):
+        g_offs = hg * MG + tl.arange(0, MG)
+        g_valid = g_offs < N1
+        # 不 clamp: tl.where(g_valid, g_offs, 0) 会让 BiShengHIR 对 N1 specialize,
+        # head tile 缩成 size-1 致 N1=1 编译失败; 越界头靠 mask=g_valid 屏蔽,
+        # Ascend masked 越界访问安全。
+        g_offs_s = g_offs
+        q_cat = tl.load(qcat_ptr + dqcat_row_base + g_offs_s[:, None] * D_TOT + dt_offs[None, :],
+                        mask=g_valid[:, None], other=0.0)
+        do_pad = tl.load(do_ptr + dq_row_base + g_offs_s[:, None] * D + dt_offs[None, :],
+                         mask=g_valid[:, None] & dt_lt_D[None, :], other=0.0)
+        sm_max = tl.load(sm_max_ptr + pid_bs1 * N1 + g_offs_s, mask=g_valid, other=0.0)
+        sm_sum = tl.load(sm_sum_ptr + pid_bs1 * N1 + g_offs_s, mask=g_valid, other=1.0)
+        sm_sum = tl.where(sm_sum > 0.0, sm_sum, 1.0)
+        inv_sm_sum = 1.0 / sm_sum
+        delta = tl.load(delta_ptr + pid_bs1 * N1 + g_offs_s, mask=g_valid, other=0.0)
+        acc_dqcat = tl.zeros([MG, D_TOT], dtype=tl.float32)
 
-    # delta[g] = rowsum(dO * O)  (== sum_p P·dPv)
-    delta = tl.sum(do_tile.to(tl.float32) * o_tile.to(tl.float32), axis=1)
+        for blk_start in range(0, topK, BLOCK_K_A):
+            blk_offs = blk_start + blk_k_offs_a
+            if NEED_BLK_MASK_A:
+                blk_in_count = blk_offs < topK
+                tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
+            else:
+                tok = tl.load(sparse_ptr + sp_base + blk_offs)
+            tok_f = tok.to(tl.float32)
+            tok_valid = ((tok != -1)
+                         & (tok_f < upper_f)
+                         & row_active)
+            tok_clamped = tl.where(tok_valid, tok, 0)
 
-    acc_dq = tl.zeros([BLOCK_G, D], dtype=tl.float32)
-    acc_dqr = tl.zeros([BLOCK_G, D_ROPE], dtype=tl.float32)
+            k_cat = tl.load(
+                kcat_ptr + kcat_base + tok_clamped[:, None] * D_TOT + dt_offs[None, :],
+                mask=tok_valid[:, None], other=0.0)
 
-    for blk_start in range(0, topK, BLOCK_K):
-        blk_offs = blk_start + tl.arange(0, BLOCK_K)
-        blk_in_count = blk_offs < topK
-        tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
-        tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
+            # Compute scores and dPv back-to-back on cube BEFORE any vector op so
+            # the cube->vector sync happens once for both (vs interleaving P between
+            # them, which forces cube->vector->cube->vector = 2 extra syncs).
+            scores = tl.dot(q_cat, tl.trans(k_cat)).to(tl.float32) * scale_value
+            dPv = tl.dot(do_pad, tl.trans(k_cat)).to(tl.float32)
+
+            P = tl.exp(scores - sm_max[:, None]) * inv_sm_sum[:, None]
+            dS = P * (dPv - delta[:, None]) * scale_value
+
+            acc_dqcat = tl.dot(dS.to(k_cat.dtype), k_cat, acc=acc_dqcat)
+
+            # Materialize dS/P to GM workspace (bf16 — same precision as the dots
+            # below which downcast to bf16 anyway). Pass B reads these back to
+            # compute dk=dS^T·q and dv=P^T·do WITHOUT re-gathering k_cat or
+            # recomputing scores/P/dS (3 gathers -> 1, 8 dots -> 5).
+            ws_offs = ws_base + g_offs_s[:, None] * topK + blk_offs[None, :]
+            if NEED_BLK_MASK_A:
+                ws_mask = g_valid[:, None] & blk_in_count[None, :]
+            else:
+                ws_mask = g_valid[:, None]
+            tl.store(ds_ptr + ws_offs, dS.to(ds_ptr.dtype.element_ty), mask=ws_mask)
+            tl.store(p_ptr + ws_offs, P.to(p_ptr.dtype.element_ty), mask=ws_mask)
+
+        # Store dqcat for this head chunk (no atomic — one program per row). Host
+        # splits nope|rope columns back into dq/dqr.
+        tl.store(dqcat_ptr + dqcat_row_base + g_offs_s[:, None] * D_TOT + dt_offs[None, :],
+                 acc_dqcat.to(dqcat_ptr.dtype.element_ty),
+                 mask=g_valid[:, None] & row_active)
+
+    # ──────────────────────────────────────────────────────────────
+    # Stage B1: Accumulate dk/dkr across head chunks.
+    # blk_start-outer, hc-inner loop. Reads dS from workspace (written in A) —
+    # NO k_cat gather, NO scores/P/dS recompute. dk = dS^T · q_cat. Kept in-kernel
+    # (not a separate kernel) so each program's 512KB dS/P workspace stays L2-hot
+    # between A's write and B's read — a 2-kernel split forced a cold GM re-read
+    # and regressed to ~77ms. dk_acc persists across hc via tl.dot(acc=).
+    # ──────────────────────────────────────────────────────────────
+    for blk_start in range(0, topK, BLOCK_K_B):
+        blk_offs = blk_start + blk_k_offs_b
+        if NEED_BLK_MASK_B:
+            blk_in_count = blk_offs < topK
+            tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
+        else:
+            tok = tl.load(sparse_ptr + sp_base + blk_offs)
+        tok_f = tok.to(tl.float32)
+        tok_valid = ((tok != -1) & (tok_f < upper_f) & row_active)
         tok_clamped = tl.where(tok_valid, tok, 0)
 
-        k_full = tl.load(
-            k_ptr + k_base + tok_clamped[:, None] * D + d_offs_full[None, :],
-            mask=tok_valid[:, None], other=0.0)
-        kr_full = tl.load(
-            kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + dr_offs_full[None, :],
-            mask=tok_valid[:, None], other=0.0)
+        dkcat_acc = tl.zeros([BLOCK_K_B, D_TOT], dtype=tl.float32)
 
-        # scores[g,k] = (q_nope·k_nope + q_rope·k_rope)·scale
-        scores = tl.dot(q_nope, tl.trans(k_full)).to(tl.float32)
-        scores += tl.dot(q_rope, tl.trans(kr_full)).to(tl.float32)
-        scores = scores * scale_value
+        for hc in range(HC_LOOP):
+            g_offs = hc * BLOCK_G + tl.arange(0, BLOCK_G)
+            g_valid = g_offs < N1
+            g_offs_s = g_offs
+            q_cat = tl.load(qcat_ptr + dqcat_row_base + g_offs_s[:, None] * D_TOT + dt_offs[None, :],
+                            mask=g_valid[:, None], other=0.0)
+            ws_offs = ws_base + g_offs_s[:, None] * topK + blk_offs[None, :]
+            if NEED_BLK_MASK_B:
+                ws_mask = g_valid[:, None] & blk_in_count[None, :]
+            else:
+                ws_mask = g_valid[:, None]
+            dS = tl.load(ds_ptr + ws_offs, mask=ws_mask, other=0.0)
 
-        # P from saved stats; masked tokens -> 0
-        P = tl.exp(scores - sm_max[:, None]) / sm_sum[:, None]
-        P = tl.where(tok_valid[None, :], P, 0.0)
+            dkcat_acc = tl.dot(tl.trans(dS).to(q_cat.dtype), q_cat, acc=dkcat_acc)
 
-        # dPv[g,k] = dO·v, v = k_nope (MLA-absorb)
-        dPv = tl.dot(do_tile, tl.trans(k_full)).to(tl.float32)
-        dS = P * (dPv - delta[:, None]) * scale_value
-        dS = tl.where(tok_valid[None, :], dS, 0.0)
+        # Single atomic_add for dkcat (accumulated across all head chunks). Host
+        # splits nope|rope columns back into dk/dkr.
+        dkcat_offs = kcat_base + tok_clamped[:, None] * D_TOT + dt_offs[None, :]
+        tl.atomic_add(dkcat_ptr + dkcat_offs, dkcat_acc, mask=tok_valid[:, None])
 
-        # dq/dqr accumulate (owned, no atomics)
-        acc_dq += tl.dot(dS.to(k_full.dtype), k_full).to(tl.float32)
-        acc_dqr += tl.dot(dS.to(kr_full.dtype), kr_full).to(tl.float32)
+    # ──────────────────────────────────────────────────────────────
+    # Stage B2: Accumulate dv across head chunks.
+    # Reads P from workspace (written in A) — NO k_cat gather, NO scores/P
+    # recompute. dv = P^T · do. Separate from B1: dk_acc and dv_acc coexist would
+    # overflow UB + L0C (two concurrent cube dots). dv_acc via tl.dot(acc=).
+    # ──────────────────────────────────────────────────────────────
+    for blk_start in range(0, topK, BLOCK_K_B):
+        blk_offs = blk_start + blk_k_offs_b
+        if NEED_BLK_MASK_B:
+            blk_in_count = blk_offs < topK
+            tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
+        else:
+            tok = tl.load(sparse_ptr + sp_base + blk_offs)
+        tok_f = tok.to(tl.float32)
+        tok_valid = ((tok != -1) & (tok_f < upper_f) & row_active)
+        tok_clamped = tl.where(tok_valid, tok, 0)
 
-        # scatter dk/dv over D-tiles (bound UB on [BLOCK_K, *] fp32 contribs)
-        dS_t = tl.trans(dS)          # [BLOCK_K, BLOCK_G]
-        P_t = tl.trans(P)            # [BLOCK_K, BLOCK_G]
-        for d_start in range(0, D, BLOCK_D):
-            d_offs = d_start + tl.arange(0, BLOCK_D)
-            d_valid = d_offs < D
-            q_sub = tl.load(
-                q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
-                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
-            do_sub = tl.load(
-                do_ptr + o_base + g_offs[:, None] * D + d_offs[None, :],
-                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
-            dk_contrib = tl.dot(dS_t.to(q_sub.dtype), q_sub).to(tl.float32)
-            dv_contrib = tl.dot(P_t.to(do_sub.dtype), do_sub).to(tl.float32)
-            dk_offs = v_base + tok_clamped[:, None] * D + d_offs[None, :]
-            tl.atomic_add(dk_ptr + dk_offs, dk_contrib,
-                          mask=tok_valid[:, None] & d_valid[None, :])
-            tl.atomic_add(dv_ptr + dk_offs, dv_contrib,
-                          mask=tok_valid[:, None] & d_valid[None, :])
+        dv_acc = tl.zeros([BLOCK_K_B, D], dtype=tl.float32)
 
-        # scatter dkr (Dr single tile)
-        qr_sub = tl.load(
-            qr_ptr + qr_base + g_offs[:, None] * D_ROPE + dr_offs_full[None, :],
-            mask=g_valid[:, None], other=0.0)
-        dkr_contrib = tl.dot(dS_t.to(qr_sub.dtype), qr_sub).to(tl.float32)
-        dkr_offs = kr_base + tok_clamped[:, None] * D_ROPE + dr_offs_full[None, :]
-        tl.atomic_add(dkr_ptr + dkr_offs, dkr_contrib, mask=tok_valid[:, None])
+        for hc in range(HC_LOOP):
+            g_offs = hc * BLOCK_G + tl.arange(0, BLOCK_G)
+            g_valid = g_offs < N1
+            g_offs_s = g_offs
+            do_tile = tl.load(do_ptr + dq_row_base + g_offs_s[:, None] * D + d_offs[None, :],
+                              mask=g_valid[:, None], other=0.0)
+            ws_offs = ws_base + g_offs_s[:, None] * topK + blk_offs[None, :]
+            if NEED_BLK_MASK_B:
+                ws_mask = g_valid[:, None] & blk_in_count[None, :]
+            else:
+                ws_mask = g_valid[:, None]
+            P = tl.load(p_ptr + ws_offs, mask=ws_mask, other=0.0)
 
-    # store dq/dqr (per (b,s1,head-group), no contention)
-    tl.store(dq_ptr + q_base + g_offs[:, None] * D + d_offs_full[None, :],
-             acc_dq.to(dq_ptr.dtype.element_ty),
-             mask=g_valid[:, None] & row_active)
-    tl.store(dqr_ptr + qr_base + g_offs[:, None] * D_ROPE + dr_offs_full[None, :],
-             acc_dqr.to(dqr_ptr.dtype.element_ty),
-             mask=g_valid[:, None] & row_active)
+            dv_acc = tl.dot(tl.trans(P).to(do_tile.dtype), do_tile, acc=dv_acc)
+
+        # Single atomic_add for dv
+        dv_offs = v_base + tok_clamped[:, None] * D + d_offs[None, :]
+        tl.atomic_add(dv_ptr + dv_offs, dv_acc, mask=tok_valid[:, None])
+
 
 
 # ---------------------------------------------------------------------------
@@ -313,67 +418,78 @@ def _sfa_grad_kernel(
 # inference and must match between infer_func and core.
 # ---------------------------------------------------------------------------
 def _infer_sfa_grad(
-    q_flat: ms.Tensor, qr_flat: ms.Tensor,
-    k_flat: ms.Tensor, kr_flat: ms.Tensor, v_flat: ms.Tensor,
+    q_cat: ms.Tensor,
+    k_cat: ms.Tensor,
     sparse_flat: ms.Tensor,
-    do_flat: ms.Tensor, o_flat: ms.Tensor,
+    do_flat: ms.Tensor, delta_flat: ms.Tensor,
     sm_max_flat: ms.Tensor, sm_sum_flat: ms.Tensor,
-    dq_buf: ms.Tensor, dqr_buf: ms.Tensor,
-    dk_buf: ms.Tensor, dkr_buf: ms.Tensor, dv_buf: ms.Tensor,
+    dqcat_buf: ms.Tensor,
+    dkcat_buf: ms.Tensor, dv_buf: ms.Tensor,
+    ds_buf: ms.Tensor, p_buf: ms.Tensor,
     act_q: ms.Tensor, act_k: ms.Tensor,
     B_S1: int, S1: int, S2: int, N1: int, topK: int,
-    D: int, D_ROPE: int,
+    D: int, D_ROPE: int, D_TOT: int,
     scale_value: float,
     sparse_mode: int,
 ) -> tuple[ms.Tensor, ms.Tensor, ms.Tensor, ms.Tensor, ms.Tensor]:
-    return (ms.mint.empty_like(dq_buf), ms.mint.empty_like(dqr_buf),
-            ms.mint.empty_like(dk_buf), ms.mint.empty_like(dkr_buf),
+    return (ms.mint.empty_like(dqcat_buf), ms.mint.empty_like(dqcat_buf),
+            ms.mint.empty_like(dkcat_buf), ms.mint.empty_like(dkcat_buf),
             ms.mint.empty_like(dv_buf))
 
 
 @ms.ops._ms_pyfunc(infer_func=_infer_sfa_grad)
 def _sfa_grad_core(
-    q_flat: ms.Tensor, qr_flat: ms.Tensor,
-    k_flat: ms.Tensor, kr_flat: ms.Tensor, v_flat: ms.Tensor,
+    q_cat: ms.Tensor,
+    k_cat: ms.Tensor,
     sparse_flat: ms.Tensor,
-    do_flat: ms.Tensor, o_flat: ms.Tensor,
+    do_flat: ms.Tensor, delta_flat: ms.Tensor,
     sm_max_flat: ms.Tensor, sm_sum_flat: ms.Tensor,
-    dq_buf: ms.Tensor, dqr_buf: ms.Tensor,
-    dk_buf: ms.Tensor, dkr_buf: ms.Tensor, dv_buf: ms.Tensor,
+    dqcat_buf: ms.Tensor,
+    dkcat_buf: ms.Tensor, dv_buf: ms.Tensor,
+    ds_buf: ms.Tensor, p_buf: ms.Tensor,
     act_q: ms.Tensor, act_k: ms.Tensor,
     B_S1: int, S1: int, S2: int, N1: int, topK: int,
-    D: int, D_ROPE: int,
+    D: int, D_ROPE: int, D_TOT: int,
     scale_value: float,
     sparse_mode: int,
 ) -> tuple[ms.Tensor, ms.Tensor, ms.Tensor, ms.Tensor, ms.Tensor]:
     # Fixed block config + single launch (NO autotune): autotune re-runs the
     # kernel many times to benchmark, which double-counts the atomic_add scatter
-    # into dk/dkr/dv. See _select_block_config.
-    cfg = _select_block_config(D)
+    # into dkcat/dv. See _select_block_config.
+    cfg = _select_block_config(D, N1)
     block_g = cfg["BLOCK_G"]
+    block_k_a = cfg["BLOCK_K_A"]
+    block_k_b = cfg["BLOCK_K_B"]
+    num_hc = triton.cdiv(N1, block_g)  # number of head chunks
+    need_blk_mask_a = (topK % block_k_a) != 0
+    need_blk_mask_b = (topK % block_k_b) != 0
 
-    # grid both dims pow2-padded (Ascend traps on non-pow2 grid); out-of-range
-    # programs idle via in_range masks.
-    grid = (_next_pow2(B_S1), _next_pow2(triton.cdiv(N1, block_g)))
+    # 1D grid, one program per query row
+    grid = (_next_pow2(B_S1),)
 
     _sfa_grad_kernel[grid](
-        q_flat, qr_flat,
-        k_flat, kr_flat, v_flat,
+        q_cat,
+        k_cat,
         sparse_flat,
-        do_flat, o_flat,
+        do_flat, delta_flat,
         sm_max_flat, sm_sum_flat,
-        dq_buf, dqr_buf,
-        dk_buf, dkr_buf, dv_buf,
+        dqcat_buf,
+        dkcat_buf, dv_buf,
+        ds_buf, p_buf,
         act_q, act_k,
         B_S1, S1, S2, N1, topK,
-        D, D_ROPE,
+        D, D_ROPE, D_TOT,
         scale_value,
         sparse_mode=sparse_mode,
         BLOCK_G=block_g,
-        BLOCK_K=cfg["BLOCK_K"],
-        BLOCK_D=cfg["BLOCK_D"],
+        BLOCK_K_A=block_k_a,
+        BLOCK_K_B=block_k_b,
+        NUM_HC=num_hc,
+        NEED_BLK_MASK_A=need_blk_mask_a,
+        NEED_BLK_MASK_B=need_blk_mask_b,
+        multibuffer=False,
     )
-    return dq_buf, dqr_buf, dk_buf, dkr_buf, dv_buf
+    return dqcat_buf, dqcat_buf, dkcat_buf, dkcat_buf, dv_buf
 
 
 # ---------------------------------------------------------------------------
@@ -497,37 +613,57 @@ def sparse_flash_attention_grad_triton(
     o_flat = o_bsnd.contiguous()
     k_flat = k_bsnd.reshape(B * S2, D).contiguous()
     kr_flat = kr_bsnd.reshape(B * S2, D_ROPE).contiguous()
-    v_flat = k_flat
+    # Concat nope|rope on host so each scores/dq/dk cube is one dot over D_TOT
+    # instead of two (nope + rope). Public API inputs/outputs are unchanged.
+    D_TOT = D + D_ROPE
+    q_cat = ops.cat((q_flat, qr_flat), axis=-1).reshape(B * S1, N1, D_TOT).contiguous()
+    k_cat = ops.cat((k_flat, kr_flat), axis=-1).contiguous()
     sparse_flat = si_tok.reshape(B * S1, topK).to(ms.int32).contiguous()
     sm_max_flat = sm_max_bsnd.reshape(B * S1 * N1).astype(ms.float32).contiguous()
     sm_sum_flat = sm_sum_bsnd.reshape(B * S1 * N1).astype(ms.float32).contiguous()
+    # delta = rowsum(dO * O) per (b,s1,head) — precomputed on host so the kernel
+    # avoids loading `out` (o_pad) and the per-hc reduction. [B*S1*N1] fp32.
+    delta_flat = (do_flat.to(ms.float32) * o_flat.to(ms.float32)).sum(axis=-1).reshape(
+        B * S1 * N1).contiguous()
 
     # Output buffers must live on-device (mint.zeros defaults to CPU -> triton
-    # rejects the pointer). dk/dkr/dv accumulate via atomic_add, so fp32 workspace.
-    dq_buf = ms.mint.zeros((B, S1, N1, D), dtype=q_bsnd.dtype).to('Ascend')
-    dqr_buf = ms.mint.zeros((B, S1, N1, D_ROPE), dtype=qr_bsnd.dtype).to('Ascend')
-    dk_buf = ms.mint.zeros((B * S2, D), dtype=ms.float32).to('Ascend')
-    dkr_buf = ms.mint.zeros((B * S2, D_ROPE), dtype=ms.float32).to('Ascend')
+    # rejects the pointer). dqcat/dkcat hold nope|rope concatenated grads (kernel
+    # writes them whole — triton-ascend rejects column slicing); dkcat/dv
+    # accumulate via atomic_add, so fp32 workspace.
+    dqcat_buf = ms.mint.zeros((B * S1, N1, D_TOT), dtype=q_bsnd.dtype).to('Ascend')
+    dkcat_buf = ms.mint.zeros((B * S2, D_TOT), dtype=ms.float32).to('Ascend')
     dv_buf = ms.mint.zeros((B * S2, D), dtype=ms.float32).to('Ascend')
+    # dS/P workspace: Pass A writes per-(b,s1) row, Pass B reads back to compute
+    # dk/dv without re-gathering k_cat or recomputing scores/P/dS. bf16 — same
+    # precision as the dots which downcast to bf16 anyway.
+    ds_buf = ms.mint.zeros((B * S1, N1, topK), dtype=q_bsnd.dtype).to('Ascend')
+    p_buf = ms.mint.zeros((B * S1, N1, topK), dtype=q_bsnd.dtype).to('Ascend')
 
-    dq_buf, dqr_buf, dk_buf, dkr_buf, dv_buf = _sfa_grad_core(
-        q_flat, qr_flat,
-        k_flat, kr_flat, v_flat,
+    dqcat_buf, _, dkcat_buf, _, dv_buf = _sfa_grad_core(
+        q_cat,
+        k_cat,
         sparse_flat,
-        do_flat, o_flat,
+        do_flat, delta_flat,
         sm_max_flat, sm_sum_flat,
-        dq_buf, dqr_buf,
-        dk_buf, dkr_buf, dv_buf,
+        dqcat_buf,
+        dkcat_buf, dv_buf,
+        ds_buf, p_buf,
         act_q.to('Ascend'), act_k.to('Ascend'),
         B * S1, S1, S2, N1, topK,
-        D, D_ROPE,
+        D, D_ROPE, D_TOT,
         float(scale_value),
         sparse_mode,
     )
 
+    # Split nope|rope columns back into the 5 separate outputs.
+    dq_buf = dqcat_buf[:, :, :D].reshape(B, S1, N1, D).contiguous()
+    dqr_buf = dqcat_buf[:, :, D:].reshape(B, S1, N1, D_ROPE).contiguous()
+    dk_buf = dkcat_buf[:, :D].reshape(B, S2, 1, D)
+    dkr_buf = dkcat_buf[:, D:].reshape(B, S2, 1, D_ROPE)
+
     # fp32 workspace -> key/value dtype, reshape to BSND [B,S2,1,*]
-    d_key = dk_buf.reshape(B, S2, 1, D).astype(key.dtype)
-    d_key_rope = dkr_buf.reshape(B, S2, 1, D_ROPE).astype(key_rope.dtype)
+    d_key = dk_buf.astype(key.dtype)
+    d_key_rope = dkr_buf.astype(key_rope.dtype)
     d_value = dv_buf.reshape(B, S2, 1, D).astype(value.dtype)
     d_query, d_query_rope = dq_buf, dqr_buf
 

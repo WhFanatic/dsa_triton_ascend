@@ -79,15 +79,21 @@ def _prune_configs(configs, named_args, **kwargs):
     """autotune config 过滤
 
     - UB 容量上限(910B 单核 ~192KB)
+
+    Phased UB estimation: the kernel has two non-overlapping phases per
+    G-iteration — (1) dot accumulation: q/k tiles + acc + trans_tmp,
+    (2) reduce: acc → tile_scores. Buffers from phase 1 are freed before
+    phase 2 starts, so peak UB is max(phase1, phase2), not the sum.
     """
     _UB_LIMIT_BYTES = 192 * 1024
-    _GRID_LIMIT = 65536  # Ascend coreDim 硬件上限（65536）
+    _GRID_LIMIT = 65535  # Ascend coreDim 硬件上限（65535）
 
     def _estimate_ub_bytes(block_s2, block_d, block_g):
-        """粗估单 tile 主要 buffer 的 UB 占用 (bytes)。
+        """分阶段估算 UB 峰值 (bytes)。
 
-        1.25 系数近似 double-buffering + tl.trans 临时空间, 由实测反推:
-        (BLOCK_S2=256,BLOCK_D=128,BLOCK_G=64) 实测要 ~262KB。
+        Phase 1 (dot): q_tile + k_tile + acc + trans_tmp
+        Phase 2 (reduce): acc + tile_scores (k_tile/trans_tmp 已释放)
+        Peak = max(phase1, phase2)
         """
         if block_s2 is None or block_d is None or block_g is None:
             return 0
@@ -96,8 +102,9 @@ def _prune_configs(configs, named_args, **kwargs):
         q_tile     = block_g  * block_d * 2   # q_tile[BLOCK_G, BLOCK_D] fp16
         trans_tmp  = block_s2 * block_d * 2   # tl.trans 中间空间
         tile_score = block_s2 * 4             # tile_scores[BLOCK_S2] fp32
-        total = acc + k_tile + q_tile + trans_tmp + tile_score
-        return int(total * 1.25)
+        phase1 = q_tile + k_tile + acc + trans_tmp
+        phase2 = acc + tile_score
+        return max(phase1, phase2)
 
     def _get(name):
         if name in named_args:
@@ -147,20 +154,22 @@ def _prune_configs(configs, named_args, **kwargs):
 @triton.autotune(
     configs=[
         # BLOCK_S1=8/4: 小~中 shape, 并行度高; 每档给 G=16 与 G=64 两种 reduce 宽度。
-        triton.Config({"BLOCK_S1": 8, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=128 选中
-        triton.Config({"BLOCK_S1": 8, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),  # S1=1024/2048 选中
+        triton.Config({"BLOCK_S1": 8, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=128 
+        triton.Config({"BLOCK_S1": 8, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),  # S1=1024/2048 
         triton.Config({"BLOCK_S1": 4, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
         triton.Config({"BLOCK_S1": 4, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),
 
         # BLOCK_S1=1/2: 并行度最高, 但只在 B*S1 很小时存活 (大 shape 下 grid0 超 coreDim 被剪)。
-        triton.Config({"BLOCK_S1": 1, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=4096 选中
+        triton.Config({"BLOCK_S1": 1, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=4096 
         triton.Config({"BLOCK_S1": 1, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),
         triton.Config({"BLOCK_S1": 2, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
 
         # 大 BLOCK_S1: 大 shape 用它把 grid0 压回限内, 同时调大 BLOCK_S2 摊薄 grid1、调小 BLOCK_D 守 UB。
-        triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=16384 选中
+        triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),  # S1=16384 
         triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 16, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),  # G=64 融合, 减少 K tile 重复加载
         triton.Config({"BLOCK_S1": 32, "BLOCK_S2": 256, "BLOCK_D": 128, "BLOCK_G": 16}),
+        triton.Config({"BLOCK_S1": 32, "BLOCK_S2": 128, "BLOCK_D": 128, "BLOCK_G": 64}),  # G=64 融合
         triton.Config({"BLOCK_S1": 128, "BLOCK_S2": 256,  "BLOCK_D": 64, "BLOCK_G": 16}),
         triton.Config({"BLOCK_S1": 256, "BLOCK_S2": 512,  "BLOCK_D": 32, "BLOCK_G": 16}),
         triton.Config({"BLOCK_S1": 512, "BLOCK_S2": 1024, "BLOCK_D": 16, "BLOCK_G": 16}),
@@ -234,8 +243,6 @@ def _lightning_indexer_score_kernel(
 
             tile_scores = tl.zeros([BLOCK_S2], dtype=tl.float32)
 
-            # G 外 / D 内分块。k_tile 与 g 无关却每个 g-block 重 load 一遍 (G=64/BLOCK_G=16 时 4 次),
-            # K 带宽吃紧时可提到 g 循环外复用。
             for g_start in range(0, G, BLOCK_G):
                 g_rel   = g_start + tl.arange(0, BLOCK_G)
                 g_valid = g_rel < G
@@ -263,10 +270,7 @@ def _lightning_indexer_score_kernel(
 
                     acc += tl.dot(q_tile, tl.trans(k_tile))
 
-                # indexer 打分 = 各 head ReLU(Q·K) 按 W 加权求和; padding 的 g 行先清零。
-                acc = tl.maximum(acc, 0.0)
-                acc = tl.where(g_valid[:, None], acc, 0.0)
-                tile_scores += tl.sum(acc * w_g[:, None], axis=0)
+                tile_scores += tl.sum(tl.maximum(acc, 0.0) * w_g[:, None], axis=0)
 
             # 超出 causal / act_k 的不可见位置置 -inf, topk 时会被映射成 index -1。
             if sparse_mode == 3:
