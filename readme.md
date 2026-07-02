@@ -1,12 +1,12 @@
 # Triton-Ascend implementation of DSA
 
-用 triton-ascend 重写的 DSA（DeepSeek Sparse Attention）算子，接口分别与 `ops.lightning_indexer`、`aclnnSparseLightningIndexerGradKLLoss`、`ops.sparse_flash_attention` 对齐，通过 `ops._ms_pyfunc()` 接入 mindspore 静态图。
+用 triton-ascend 重写的 DSA（DeepSeek Sparse Attention）算子，接口分别与 `ops.lightning_indexer`、`aclnnSparseLightningIndexerGradKLLoss`、`ops.sparse_flash_attention` 、'ops.sparse_flash_attention_grad'和dense_lightning_indexer_grad_kl_loss对齐，通过 `ops._ms_pyfunc()` 接入 mindspore 静态图。
 
 ## 环境依赖
 
 - CANN 9.0.0
 - mindspore 2.9.0
-- triton-ascend 3.2.1
+- triton-ascend 3.2.1及以上
 - pytest-forked (全量测试需要 pytest --forked ...)
 
 ## 文件
@@ -40,35 +40,6 @@
 | `perf_sfa_grad_triton.py` | sparse_flash_attention 反向性能测试 |
 | `perf_dense_loss_backward_triton.py` | dense_loss_backward 性能测试 |
 | `perf_sli_grad_kl_loss_triton.py` | sparse_lightning_indexer_grad_kl_loss 性能测试 |
-
-### 参考实现
-
-| 文件 | 说明 |
-|------|------|
-| `sparse_flash_attention_numpy.py` | sparse_flash_attention 纯 numpy golden reference |
-| `sparse_flash_attention_grad_numpy.py` | sparse_flash_attention_grad 纯 numpy golden reference |
-| `sli_grad_kl_loss_numpy.py` | sparse_lightning_indexer_grad_kl_loss 纯 numpy reference |
-| `sparse_flash_attention_grad_cann.py` | CANN sparse_flash_attention_grad 参考实现 |
-| `sfa_grad_cann.py` | CANN sfa_grad 参考实现 |
-| `sli_grad_kl_loss_cann.py` | CANN sli_grad_kl_loss 参考实现 |
-| `dense_loss_backward_cann.py` | CANN dense_loss_backward 参考实现 |
-
-### 辅助工具
-
-| 文件 | 说明 |
-|------|------|
-| `dsa_torch.py` | PyTorch 参考实现 |
-| `verify_grad_algo.py` | 梯度算法验证（host-only，无需 NPU） |
-| `run_test.sh` | 测试驱动脚本（含所有算子测试命令） |
-| `run_grad_test.sh` | SFA grad 结构化测试驱动脚本 |
-| `dump_profiler.sh` | Profiler 数据导出脚本 |
-
-### 目录
-
-| 目录 | 说明 |
-|------|------|
-| `script/` | 测试和 profiling 脚本集合 |
-| `docs/` | 优化总结文档 |
 
 ## 泛化性配置
 
@@ -356,8 +327,14 @@ dense_lightning_indexer_softmax_lse_triton(
 - pre_tokens / next_tokens 参数暂未使用
 
 ## 测试
+测试前执行环境信息：
+export ASCEND_RT_VISIBLE_DEVICES=0
+export TRITON_END=mindspore
+export TRITON_BACKEND=mindspore
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+export TRITON_CACHE_DIR=./my_triton_cache
 
-### 快速命令
+### 精度测试命令
 
 ```bash
 # LightningIndexer
@@ -376,51 +353,24 @@ pytest --forked test_sfa_grad_triton.py -v
 pytest test_dense_loss_backward_triton.py -v
 ```
 
-### run_test.sh
-
-`run_test.sh` 包含所有算子的详细测试命令，涵盖:
-- 功能测试 (test_golden): triton vs numpy golden
-- 精度测试 (test_accuracy): triton vs CANN ops
-- 功能自检 (test_basic): shape/dtype/finiteness
-- 性能测试 (perf_*.py): triton vs CANN timing + speedup
-- Smoke 测试: 精选典型 case 快速回归
-
-### run_grad_test.sh
-
-`run_grad_test.sh` 为 SFA grad 提供结构化测试流程:
+### 性能能命令：(计时 + speedup（triton vs CANN）)
 
 ```bash
-./run_grad_test.sh <子命令> [pytest 参数]
+# LightningIndexer
+TRITON_PRINT_AUTOTUNING=1 python perf_li_triton.py
+
+# SparseLightningIndexerGradKLLoss
+bash script/profile_sparse.sh timing
+
+# SparseFlashAttention 前向
+TRITON_PRINT_AUTOTUNING=1 python perf_sfa_triton.py
+
+# SparseFlashAttention 反向
+TRITON_PRINT_AUTOTUNING=1 python perf_sfa_grad_triton.py
+
+# DenseLossBackward
+TRITON_PRINT_AUTOTUNING=1 python perf_dense_loss_backward_triton.py
 ```
-
-| 子命令 | 说明 |
-|--------|------|
-| `host` | numpy 算法门禁 (无需 NPU) |
-| `fwd` | 前向依赖算子 |
-| `smoke` | 反向冒烟 (日常首选, 单 shape) |
-| `basic` | 反向大 shape 功能自检 |
-| `golden` | 反向精度全量 vs numpy golden |
-| `guards` | 接口守卫 (不支持入参须抛错, 无需 NPU) |
-| `cann` | 对齐 CANN ms.grad(ops.sparse_flash_attention) |
-| `all` | fwd→smoke→basic→golden→cann 顺序跑 |
-
-### 测试覆盖
-
-- `test_li_triton.py`: 参数化覆盖 BSND 布局、fp16/bf16、sparse_mode 0/3、return_value True/False，对比 `ops.lightning_indexer`
-- `test_sli_grad_kl_loss_triton.py`: 对比 CANN `SparseLightningIndexerGradKLLoss` 验证 dQueryIndex、dKeyIndex、dWeights、loss 一致性
-- `test_sfa_triton.py`: `test_golden` 对比 numpy golden（任意 shape，验算法）、`test_accuracy` 对比 `ops.sparse_flash_attention`（BSND, CANN 基准）、`test_basic` 形状/dtype/有限性自检；覆盖 fp16/bf16、sparse_mode 0/3、token/block-wise、D∈{128,256,512}、return_softmax_lse
-- `test_sfa_grad_triton.py`: `test_golden` 对比 numpy backward golden（D×dtype×mode×block 全矩阵）、`test_accuracy` 对比 `ms.grad(ops.sparse_flash_attention)` (CANN backward)、`test_basic` 形状/dtype/有限性自检、`test_guards` 接口守卫；覆盖 fp16/bf16、sparse_mode 0/3、token/block-wise、D∈{128,256,512}、topK=2048
-- `test_dense_loss_backward_triton.py`: `test_dense_softmax_lse_precision` LSE 精度（分流: CANN 范围 vs CANN, 其余 vs NumPy）、`test_dense_grad_kl_loss_triton_supported_shapes` grad 功能+精度（分流验证）、`test_dense_grad_kl_loss_precision` 严格 CANN golden 对比、`test_dense_softmax_lse_guards` 接口守卫；覆盖 bf16 全 29 配置 + fp16 smoke 4 配置
-
-## 接入路径
-
-在 mindformers 中替换原有 CANN 算子调用:
-
-- `ops.lightning_indexer` → `lightning_indexer_triton` @ `dsa_indexer.py`
-- `ops.Custom("aclnnSparseLightningIndexerGradKLLoss", ...)` → `sparse_lightning_indexer_grad_kl_loss_triton` @ `sparse_lightning_indexer_grad_kl_loss.py`
-- `ops.sparse_flash_attention` → `sparse_flash_attention_triton` @ `dsa_attention.py`
-- SFA backward: 在 `P.Morph` 中附加 `bprop = self._sfa_bprop`, 调用 `sparse_flash_attention_grad_triton`
-- Dense loss backward: `dense_lightning_indexer_grad_kl_loss_triton` @ `dense_lightning_indexer_grad_kl_loss.py`
 
 ## 参考
 
