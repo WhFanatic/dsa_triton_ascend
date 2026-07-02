@@ -1,6 +1,6 @@
 # Triton-Ascend implementation of DSA
 
-用 triton-ascend 重写的 DSA（DeepSeek Sparse Attention）算子，接口分别与 `ops.lightning_indexer` 和 `aclnnSparseLightningIndexerGradKLLoss` 对齐，通过 `ops._ms_pyfunc()` 接入 mindspore 静态图。
+用 triton-ascend 重写的 DSA（DeepSeek Sparse Attention）算子，接口分别与 `ops.lightning_indexer`、`aclnnSparseLightningIndexerGradKLLoss`、`ops.sparse_flash_attention` 对齐，通过 `ops._ms_pyfunc()` 接入 mindspore 静态图。
 
 ## 环境依赖
 
@@ -8,18 +8,67 @@
 - mindspore 2.9.0
 - triton-ascend 3.2.1
 - pytest-forked (全量测试需要 pytest --forked ...)
-- 
+
 ## 文件
+
+### Triton 算子实现
 
 | 文件 | 说明 |
 |------|------|
 | `lightning_indexer_triton.py` | triton-ascend lightning_indexer 算子实现 |
 | `sparse_lightning_indexer_grad_kl_loss_triton.py` | triton-ascend sparse_lightning_indexer_grad_kl_loss 算子实现 |
-| `sparse_flash_attention_triton.py` | triton-ascend sparse_flash_attention 算子实现 |
-| `sparse_flash_attention_numpy.py` | sparse_flash_attention 纯 numpy golden reference |
+| `sparse_flash_attention_triton.py` | triton-ascend sparse_flash_attention 前向算子实现 |
+| `sparse_flash_attention_grad_triton.py` | triton-ascend sparse_flash_attention 反向算子实现 |
+| `dense_loss_backward_triton.py` | triton-ascend dense LightningIndexer softmax LSE + KL loss backward 算子实现 |
+
+### 测试文件
+
+| 文件 | 说明 |
+|------|------|
 | `test_li_triton.py` | lightning_indexer 单算子测试 |
 | `test_sli_grad_kl_loss_triton.py` | sparse_lightning_indexer_grad_kl_loss 单算子测试 |
-| `test_sfa_triton.py` | sparse_flash_attention 单算子测试 |
+| `test_sfa_triton.py` | sparse_flash_attention 前向单算子测试 |
+| `test_sfa_grad_triton.py` | sparse_flash_attention 反向单算子测试 |
+| `test_dense_loss_backward_triton.py` | dense_loss_backward 单算子测试 |
+
+### 性能测试
+
+| 文件 | 说明 |
+|------|------|
+| `perf_li_triton.py` | lightning_indexer 性能测试 |
+| `perf_sfa_triton.py` | sparse_flash_attention 前向性能测试 |
+| `perf_sfa_grad_triton.py` | sparse_flash_attention 反向性能测试 |
+| `perf_dense_loss_backward_triton.py` | dense_loss_backward 性能测试 |
+| `perf_sli_grad_kl_loss_triton.py` | sparse_lightning_indexer_grad_kl_loss 性能测试 |
+
+### 参考实现
+
+| 文件 | 说明 |
+|------|------|
+| `sparse_flash_attention_numpy.py` | sparse_flash_attention 纯 numpy golden reference |
+| `sparse_flash_attention_grad_numpy.py` | sparse_flash_attention_grad 纯 numpy golden reference |
+| `sli_grad_kl_loss_numpy.py` | sparse_lightning_indexer_grad_kl_loss 纯 numpy reference |
+| `sparse_flash_attention_grad_cann.py` | CANN sparse_flash_attention_grad 参考实现 |
+| `sfa_grad_cann.py` | CANN sfa_grad 参考实现 |
+| `sli_grad_kl_loss_cann.py` | CANN sli_grad_kl_loss 参考实现 |
+| `dense_loss_backward_cann.py` | CANN dense_loss_backward 参考实现 |
+
+### 辅助工具
+
+| 文件 | 说明 |
+|------|------|
+| `dsa_torch.py` | PyTorch 参考实现 |
+| `verify_grad_algo.py` | 梯度算法验证（host-only，无需 NPU） |
+| `run_test.sh` | 测试驱动脚本（含所有算子测试命令） |
+| `run_grad_test.sh` | SFA grad 结构化测试驱动脚本 |
+| `dump_profiler.sh` | Profiler 数据导出脚本 |
+
+### 目录
+
+| 目录 | 说明 |
+|------|------|
+| `script/` | 测试和 profiling 脚本集合 |
+| `docs/` | 优化总结文档 |
 
 ## 泛化性配置
 
@@ -33,6 +82,12 @@
 | sparse_flash_attention | N1（num_query_heads） | 1/2/4/8/16/32/64/128 |
 | | D（head_dim） | 128, 256, 512（CANN 仅 512，余者对 numpy golden 验证） |
 | | Dr（rope dim，固定） | 64 |
+| sparse_flash_attention_grad | N1（num_query_heads） | 1/2/4/8/16/32/64/128 |
+| | D（head_dim） | 128, 256, 512 |
+| | Dr（rope dim，固定） | 64 |
+| dense_loss_backward | Nidx1（dsa_indexer_n_heads） | 32, 64, 128 |
+| | D_idx（dsa_indexer_head_dim） | 128, 256, 512 |
+| | D（query/key head_dim） | 128, 256, 512 |
 
 ## lightning_indexer_triton
 
@@ -177,26 +232,185 @@ TND / PA_BSND 在 host 侧归一到 dense BSND 再进 kernel（与 lightning_ind
 - `_pa_to_bsnd`: 按 block_table 把分页 cache 反分页成 dense BSND
 - `_expand_block_indices`: block id → token id（纯静态算子, GRAPH_MODE 亦可）
 
+## sparse_flash_attention_grad_triton
+
+### 接口
+
+```python
+sparse_flash_attention_grad_triton(
+    query,                          # [B,S1,N1,D] BSND 或 [T1,N1,D] TND, fp16/bf16
+    key,                            # [B,S2,1,D] BSND / [T2,1,D] TND
+    value,                          # 与 key 同布局同形; MLA-absorb 下忽略, 但 d_value 仍独立返回
+    sparse_indices,                 # [B,S1,1,sparse_count] int32, block id, -1 无效
+    d_out,                          # [B,S1,N1,D] 梯度输出
+    out,                            # [B,S1,N1,D] 前向输出
+    softmax_max,                    # [B,1,S1,N1] fp32, 前向 softmax_max
+    softmax_sum,                    # [B,1,S1,N1] fp32, 前向 softmax_sum
+    scale_value=1.0,                # softmax 缩放
+    query_rope=None,                # [.,N,Dr] (Dr=64), 必传
+    key_rope=None,                  # 必传
+    actual_seq_lengths_query=None,  # [B] int32/list/None
+    actual_seq_lengths_kv=None,
+    sparse_block_size=1,            # 1(token-wise) 或 [1,128] 2 的幂
+    layout="BSND",                  # BSND / TND
+    sparse_mode=3,                  # 0 / 3
+    pre_tokens=INT64_MAX,           # 仅默认值
+    next_tokens=INT64_MAX,          # 仅默认值
+    deterministic=False,            # 仅 False (scatter-add 路径天然非确定性)
+) -> (d_query, d_key, d_value, d_query_rope, d_key_rope)
+```
+
+### 算法
+
+对每个 (batch, s1) 位置（N2=1, MQA）:
+
+1. Host 侧 concat nope|rope: q_cat = [q, q_rope], k_cat = [k, k_rope], D_TOT = D + D_ROPE
+2. 复用前向 softmax_max/sum 重建 P = exp(score - max) / sum
+3. delta = rowsum(dO * O), host 预计算
+4. dS = P · (dO·k - delta) · scale
+5. dq = dS^T · k, dk = dS · q, dv = P^T · dO
+
+### triton kernel
+
+`_sfa_grad_kernel`:
+- Grid: `(_next_pow2(B*S1),)`, 每 program 处理一个 (b,s1) 的所有 query head
+- **Stage A**: 计算 dq/dqr, 同时将 dS/P 写入 GM workspace (bf16)
+  - 每 head chunk (BLOCK_G heads) 内循环 topK blocks
+  - scores = q_cat · k_cat^T · scale, P = exp(scores - max) / sum
+  - dPv = dO_pad · k_cat^T, dS = P · (dPv - delta) · scale
+  - dq_acc += dS · k_cat, 写 dS/P 到 workspace
+- **Stage B1**: 计算 dk/dkr (读 workspace dS, 无需重新 gather k_cat)
+  - dk_acc = dS^T · q_cat, atomic_add 到全局 dkcat
+- **Stage B2**: 计算 dv (读 workspace P, 无需重新 gather)
+  - dv_acc = P^T · dO, atomic_add 到全局 dv
+- `BLOCK_G = 8~16`, `BLOCK_K_A = 32`, `BLOCK_K_B = 32`, `BLOCK_D = 128`
+- Host 侧 split nope|rope 列回 dq/dqr, dk/dkr
+
+## dense_loss_backward_triton
+
+### 接口
+
+```python
+dense_loss_backward_triton(
+    query,                   # [B,S1,N1,D], fp16/bf16
+    key,                     # [B,S2,N2,D], fp16/bf16
+    query_index,             # [B,S1,Nidx1,D_idx], fp16/bf16
+    key_index,               # [B,S2,1,D_idx], fp16/bf16
+    weights,                 # [B,S1,Nidx1], fp16/bf16/fp32
+    softmax_max,             # [B,N2,S1,G] fp32, from forward FlashAttention
+    softmax_sum,             # [B,N2,S1,G] fp32, from forward FlashAttention
+    softmax_max_index=None,  # [B,1,S1] fp32, 可选 (不提供则内部计算)
+    softmax_sum_index=None,  # [B,1,S1] fp32, 可选
+    scale_value=1.0,         # softmax scale
+    query_rope=None,         # [B,S1,N1,DRope], fp16/bf16
+    key_rope=None,           # [B,S2,N2,DRope], fp16/bf16
+    actual_seq_qlen=None,    # [B] int32/list/None
+    actual_seq_klen=None,    # [B] int32/list/None
+    layout="BSND",           # 仅支持 "BSND"
+    sparse_mode=3,           # 仅支持 3 (rightDownCausal)
+    pre_tokens=INT64_MAX,    # 仅默认值
+    next_tokens=INT64_MAX,   # 仅默认值
+) -> (dQueryIndex, dKeyIndex, dWeights, loss)
+```
+
+### 辅助接口
+
+```python
+dense_lightning_indexer_softmax_lse_triton(
+    query_index,             # [B,S1,Nidx1,D_idx]
+    key_index,               # [B,S2,1,D_idx]
+    weights,                 # [B,S1,Nidx1]
+    actual_seq_qlen=None,
+    actual_seq_klen=None,
+    layout="BSND",
+    sparse_mode=3,
+) -> (softmax_max_index, softmax_sum_index)  # [B,1,S1] fp32
+```
+
+### 算法
+
+对每个 (batch, s1) 位置:
+
+1. **Index stats**: I[k] = Σ_g W_g · ReLU(qi_g @ ki[k]^T), stable softmax → max_index, sum_index
+2. **Teacher distribution**: p[k] = (1/N1) Σ_h softmax(score_h)[k], 复用 forward softmax_max/sum
+3. **KL loss**: student = softmax(I), loss = Σ p·log(p/student)
+4. **dI = student - p**, 链式法则求 dQueryIndex, dKeyIndex, dWeights
+
+### triton kernels
+
+- `_dense_indexer_stats_kernel`: 计算 index-level softmax stats (max/sum), Grid: `(B*S1,)`
+- `_dense_loss_kernel`: 融合 loss + dI 计算, Grid: `(B*S1,)`
+- `_dense_main_grad_kernel`: 计算 dQueryIndex + dWeights, Grid: `(B*S1,)` (分块避免 core dim 溢出)
+- `_dense_dkey_index_kernel`: 计算 dKeyIndex (scatter-add over s1), Grid: `(B, num_k_blocks, num_di_blocks)`
+- `BLOCK_K = 64`, `BLOCK_D = 64`, `BLOCK_G` 自适应 Nidx1×D_idx
+
 ## 限制
 
 - lightning_indexer: N1 % N2 == 0（测试覆盖 N2=1）
 - sparse_lightning_indexer_grad_kl_loss: N2=1, Nidx2=1（MQA 约束），仅 sparse_mode=3
 - sparse_flash_attention: attention_mode=2(MLA-absorb), N2=1(MQA), D∈{128,256,512}, Dr=64, rope 必传; sparse_mode 0/3; sparse_block_size 1 或 [1,128] 2 的幂; pre/next_tokens 仅默认值
+- sparse_flash_attention_grad: attention_mode=2(MLA-absorb), N2=1(MQA), D∈{128,256,512}, Dr=64, rope 必传; sparse_mode 0/3; deterministic 仅 False; pre/next_tokens 仅默认值
+- dense_loss_backward: 仅 BSND 布局, sparse_mode=3, Nidx2=1, D∈{128,256,512}, D_idx∈{128,256,512}, Nidx1∈{32,64,128}
 - 不支持 PA_BSND / block_table（lightning_indexer 与 grad_kl_loss）
 - TND 在 PyNative 下通过布局转换支持，静态图需调用方预转 BSND
 - pre_tokens / next_tokens 参数暂未使用
 
 ## 测试
 
+### 快速命令
+
 ```bash
-pytest test_li_triton.py -v
-pytest test_sli_grad_kl_loss_triton.py -v
+# LightningIndexer
+pytest --forked test_li_triton.py -v
+
+# SparseLightningIndexerGradKLLoss
+pytest --forked test_sli_grad_kl_loss_triton.py -v
+
+# SparseFlashAttention 前向
 pytest --forked test_sfa_triton.py -v
+
+# SparseFlashAttention 反向
+pytest --forked test_sfa_grad_triton.py -v
+
+# DenseLossBackward
+pytest test_dense_loss_backward_triton.py -v
 ```
 
-- `test_li_triton.py`: 参数化覆盖 BSND 布局、fp16、sparse_mode 0/3、return_value True/False，对比 `ops.lightning_indexer`
+### run_test.sh
+
+`run_test.sh` 包含所有算子的详细测试命令，涵盖:
+- 功能测试 (test_golden): triton vs numpy golden
+- 精度测试 (test_accuracy): triton vs CANN ops
+- 功能自检 (test_basic): shape/dtype/finiteness
+- 性能测试 (perf_*.py): triton vs CANN timing + speedup
+- Smoke 测试: 精选典型 case 快速回归
+
+### run_grad_test.sh
+
+`run_grad_test.sh` 为 SFA grad 提供结构化测试流程:
+
+```bash
+./run_grad_test.sh <子命令> [pytest 参数]
+```
+
+| 子命令 | 说明 |
+|--------|------|
+| `host` | numpy 算法门禁 (无需 NPU) |
+| `fwd` | 前向依赖算子 |
+| `smoke` | 反向冒烟 (日常首选, 单 shape) |
+| `basic` | 反向大 shape 功能自检 |
+| `golden` | 反向精度全量 vs numpy golden |
+| `guards` | 接口守卫 (不支持入参须抛错, 无需 NPU) |
+| `cann` | 对齐 CANN ms.grad(ops.sparse_flash_attention) |
+| `all` | fwd→smoke→basic→golden→cann 顺序跑 |
+
+### 测试覆盖
+
+- `test_li_triton.py`: 参数化覆盖 BSND 布局、fp16/bf16、sparse_mode 0/3、return_value True/False，对比 `ops.lightning_indexer`
 - `test_sli_grad_kl_loss_triton.py`: 对比 CANN `SparseLightningIndexerGradKLLoss` 验证 dQueryIndex、dKeyIndex、dWeights、loss 一致性
-- `test_sfa_triton.py`: `test_golden` 对比 numpy golden（任意 shape，验算法）、`test_accuracy` 对比 `ops.sparse_flash_attention`（BSND, CANN 基准）、`test_basic` 形状/dtype/有限性自检；覆盖 fp16/bf16（bf16=mindformers `compute_dtype`）、sparse_mode 0/3、token/block-wise、D∈{128,256,512}、return_softmax_lse。bf16 容差放宽到 4e-2（8-bit 尾数）。TND/PA_BSND 为 host 归一化的 PyNative-only 路径，GRAPH_MODE 接入只走 BSND，故测试只覆盖 BSND。
+- `test_sfa_triton.py`: `test_golden` 对比 numpy golden（任意 shape，验算法）、`test_accuracy` 对比 `ops.sparse_flash_attention`（BSND, CANN 基准）、`test_basic` 形状/dtype/有限性自检；覆盖 fp16/bf16、sparse_mode 0/3、token/block-wise、D∈{128,256,512}、return_softmax_lse
+- `test_sfa_grad_triton.py`: `test_golden` 对比 numpy backward golden（D×dtype×mode×block 全矩阵）、`test_accuracy` 对比 `ms.grad(ops.sparse_flash_attention)` (CANN backward)、`test_basic` 形状/dtype/有限性自检、`test_guards` 接口守卫；覆盖 fp16/bf16、sparse_mode 0/3、token/block-wise、D∈{128,256,512}、topK=2048
+- `test_dense_loss_backward_triton.py`: `test_dense_softmax_lse_precision` LSE 精度（分流: CANN 范围 vs CANN, 其余 vs NumPy）、`test_dense_grad_kl_loss_triton_supported_shapes` grad 功能+精度（分流验证）、`test_dense_grad_kl_loss_precision` 严格 CANN golden 对比、`test_dense_softmax_lse_guards` 接口守卫；覆盖 bf16 全 29 配置 + fp16 smoke 4 配置
 
 ## 接入路径
 
@@ -205,6 +419,8 @@ pytest --forked test_sfa_triton.py -v
 - `ops.lightning_indexer` → `lightning_indexer_triton` @ `dsa_indexer.py`
 - `ops.Custom("aclnnSparseLightningIndexerGradKLLoss", ...)` → `sparse_lightning_indexer_grad_kl_loss_triton` @ `sparse_lightning_indexer_grad_kl_loss.py`
 - `ops.sparse_flash_attention` → `sparse_flash_attention_triton` @ `dsa_attention.py`
+- SFA backward: 在 `P.Morph` 中附加 `bprop = self._sfa_bprop`, 调用 `sparse_flash_attention_grad_triton`
+- Dense loss backward: `dense_lightning_indexer_grad_kl_loss_triton` @ `dense_lightning_indexer_grad_kl_loss.py`
 
 ## 参考
 
