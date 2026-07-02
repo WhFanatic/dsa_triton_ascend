@@ -19,23 +19,21 @@ export TRITON_CACHE_DIR=./my_triton_cache
 # msprof op --kernel-name="_lightning_indexer_score_kernel" --output=./profilers python perf_li_triton.py --kernel-only
 
 # ####################
-# SparseLightningIndexerGradKLLoss 算子测试----脚本待调试
+# SparseLightningIndexerGradKLLoss 算子测试
 # ####################
 
 # 基础调试
-# python test_sli_grad_kl_loss_triton.py
+bash script/test_sparse.sh smoke
 # 全量测试
-# pytest --forked test_sli_grad_kl_loss_triton.py -v "$@"
+bash script/test_sparse.sh accuracy
 # 性能测试（triton vs CANN 计时 + speedup）
-# TRITON_PRINT_AUTOTUNING=1 python perf_sli_grad_kl_loss_triton.py
+bash script/profile_sparse.sh timing
 # triton profiling
-# python perf_sli_grad_kl_loss_triton.py
-# CANN profiling
-# python perf_sli_grad_kl_loss_triton.py
-# 内核性能测试（msprof op 指定 kernel，3个 kernel 耗时汇总为 triton 总耗时）
-# msprof op --kernel-name="_gather_kv_kernel" --output=./profilers python perf_sli_grad_kl_loss_triton.py --kernel-only
-# msprof op --kernel-name="_indexer_grad_kl_loss_kernel" --output=./profilers python perf_sli_grad_kl_loss_triton.py --kernel-only
-# msprof op --kernel-name="_scatter_dkey_index_kernel" --output=./profilers python perf_sli_grad_kl_loss_triton.py --kernel-only
+bash script/profile_sparse.sh triton
+# cann profiling
+bash script/profile_sparse.sh cann
+# 内核性能测试
+bash script/profile_sparse_detail.sh
 
 # ####################
 # SparseFlashAttention 算子测试
