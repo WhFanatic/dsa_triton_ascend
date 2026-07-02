@@ -11,35 +11,15 @@
 
 ## 文件
 
-### Triton 算子实现
+### Triton 算子
 
-| 文件 | 说明 |
-|------|------|
-| `lightning_indexer_triton.py` | triton-ascend lightning_indexer 算子实现 |
-| `sparse_lightning_indexer_grad_kl_loss_triton.py` | triton-ascend sparse_lightning_indexer_grad_kl_loss 算子实现 |
-| `sparse_flash_attention_triton.py` | triton-ascend sparse_flash_attention 前向算子实现 |
-| `sparse_flash_attention_grad_triton.py` | triton-ascend sparse_flash_attention 反向算子实现 |
-| `dense_loss_backward_triton.py` | triton-ascend dense LightningIndexer softmax LSE + KL loss backward 算子实现 |
-
-### 测试文件
-
-| 文件 | 说明 |
-|------|------|
-| `test_li_triton.py` | lightning_indexer 单算子测试 |
-| `test_sli_grad_kl_loss_triton.py` | sparse_lightning_indexer_grad_kl_loss 单算子测试 |
-| `test_sfa_triton.py` | sparse_flash_attention 前向单算子测试 |
-| `test_sfa_grad_triton.py` | sparse_flash_attention 反向单算子测试 |
-| `test_dense_loss_backward_triton.py` | dense_loss_backward 单算子测试 |
-
-### 性能测试
-
-| 文件 | 说明 |
-|------|------|
-| `perf_li_triton.py` | lightning_indexer 性能测试 |
-| `perf_sfa_triton.py` | sparse_flash_attention 前向性能测试 |
-| `perf_sfa_grad_triton.py` | sparse_flash_attention 反向性能测试 |
-| `perf_dense_loss_backward_triton.py` | dense_loss_backward 性能测试 |
-| `perf_sli_grad_kl_loss_triton.py` | sparse_lightning_indexer_grad_kl_loss 性能测试 |
+| 算子 | 实现 | 测试 | 性能测试 |
+|------|------|------|----------|
+| lightning_indexer | `lightning_indexer_triton.py` | `test_li_triton.py` | `perf_li_triton.py` |
+| sparse_lightning_indexer_grad_kl_loss | `sparse_lightning_indexer_grad_kl_loss_triton.py` | `test_sli_grad_kl_loss_triton.py` | `perf_sli_grad_kl_loss_triton.py` |
+| sparse_flash_attention (前向) | `sparse_flash_attention_triton.py` | `test_sfa_triton.py` | `perf_sfa_triton.py` |
+| sparse_flash_attention (反向) | `sparse_flash_attention_grad_triton.py` | `test_sfa_grad_triton.py` | `perf_sfa_grad_triton.py` |
+| dense_loss_backward | `dense_loss_backward_triton.py` | `test_dense_loss_backward_triton.py` | `perf_dense_loss_backward_triton.py` |
 
 ## 泛化性配置
 
