@@ -17,7 +17,7 @@ def _cann_supports_config(D, topK):
     return D == 512 and topK % 1024 == 0
 
 
-def _do_bench(fn, warmup=1, rep=1):
+def _do_bench(fn, warmup=5, rep=3):
     """Simple benchmarking with manual timing (Ascend-compatible)."""
     for _ in range(warmup):
         out = fn()
@@ -50,14 +50,14 @@ def _make_sparse_indices(B, S1, S2, topK):
     return ms.Tensor(si, dtype=ms.int32).to("Ascend")
 
 
-def _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=ms.float16):
-    q = ms.Tensor(np.random.randn(B, S1, N1, D).astype(np.float16), dtype=dtype).to("Ascend")
-    k = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float16), dtype=dtype).to("Ascend")
-    qr = ms.Tensor(np.random.randn(B, S1, N1, DROPE).astype(np.float16), dtype=dtype).to("Ascend")
-    kr = ms.Tensor(np.random.randn(B, S2, 1, DROPE).astype(np.float16), dtype=dtype).to("Ascend")
-    qi = ms.Tensor(np.random.randn(B, S1, Nidx1, D_idx).astype(np.float16), dtype=dtype).to("Ascend")
-    ki = ms.Tensor(np.random.randn(B, S2, 1, D_idx).astype(np.float16), dtype=dtype).to("Ascend")
-    w = ms.Tensor(np.abs(np.random.randn(B, S1, Nidx1)).astype(np.float16), dtype=dtype).to("Ascend")
+def _make_inputs(B, S1, S2, N1, D, Nidx1, D_idx, topK, dtype=ms.bfloat16):
+    q = ms.Tensor(np.random.randn(B, S1, N1, D).astype(np.float32), dtype=dtype).to("Ascend")
+    k = ms.Tensor(np.random.randn(B, S2, 1, D).astype(np.float32), dtype=dtype).to("Ascend")
+    qr = ms.Tensor(np.random.randn(B, S1, N1, DROPE).astype(np.float32), dtype=dtype).to("Ascend")
+    kr = ms.Tensor(np.random.randn(B, S2, 1, DROPE).astype(np.float32), dtype=dtype).to("Ascend")
+    qi = ms.Tensor(np.random.randn(B, S1, Nidx1, D_idx).astype(np.float32), dtype=dtype).to("Ascend")
+    ki = ms.Tensor(np.random.randn(B, S2, 1, D_idx).astype(np.float32), dtype=dtype).to("Ascend")
+    w = ms.Tensor(np.abs(np.random.randn(B, S1, Nidx1)).astype(np.float32), dtype=dtype).to("Ascend")
     si = _make_sparse_indices(B, S1, S2, topK)
     softmax_max = ms.Tensor(
         np.random.randn(B, 1, S1, N1).astype(np.float32), dtype=ms.float32
@@ -94,9 +94,7 @@ def _materialize_grad_outputs(outputs):
 
 def run_timing():
     configs = [
-        # (1, 128, 2048, 64, 512, 64, 128, 2048),
-        # (1, 1024, 2048, 64, 512, 64, 128, 2048),
-        (1, 4096, 4096, 64, 512, 64, 128, 2048),
+        (1, 512, 4096, 64, 512, 64, 128, 2048),
     ]
 
     for B, S1, S2, N1, D, Nidx1, D_idx, topK in configs:
@@ -152,10 +150,10 @@ def run_timing():
 
 
 def run_profiling():
-    total_steps = 2
+    total_steps = 8
     out_dir = "./profiler_data_sli_grad_kl_loss"
 
-    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 4096, 4096, 64, 512, 64, 128, 2048
+    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 512, 4096, 64, 512, 64, 128, 2048
 
     scale_value = 1.0 / np.sqrt(D)
     q, k, qr, kr, qi, ki, w, si, softmax_max, softmax_sum = _make_inputs(
@@ -176,7 +174,7 @@ def run_profiling():
     with ms.profiler.profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
         with_stack=True,
-        schedule=ms.profiler.schedule(wait=0, warmup=1, active=1, repeat=1, skip_first=0),
+        schedule=ms.profiler.schedule(wait=0, warmup=5, active=3, repeat=1, skip_first=0),
         on_trace_ready=ms.profiler.tensorboard_trace_handler(out_dir),
         profile_memory=False,
         experimental_config=experimental_config
@@ -199,7 +197,7 @@ def run_profiling_cann():
     total_steps = 10
     out_dir = "./profiler_data_sli_grad_kl_loss_cann"
 
-    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 4096, 4096, 64, 512, 64, 128, 2048
+    B, S1, S2, N1, D, Nidx1, D_idx, topK = 1, 512, 4096, 64, 512, 64, 128, 2048
     if not _cann_supports_config(D, topK):
         print(
             "CANN profiling skipped: CANN requires D=512 for "
