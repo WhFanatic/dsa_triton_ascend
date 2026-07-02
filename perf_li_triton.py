@@ -40,7 +40,7 @@ def run_timing():
     configs = [
         # (1, 128, 128, 16, 1, 128, 32),
         # (1, 1024, 1024, 64, 1, 128, 512),
-        (1, 4096, 4096, 64, 1, 128, 2048),
+        (1, 512, 4096, 64, 1, 128, 2048),
     ]
 
     for B, S1, S2, N1, N2, D, k in configs:
@@ -66,7 +66,7 @@ def run_profiling():
     total_steps = 10
     out_dir = './profiler_data'
 
-    B, S1, S2, N1, N2, D, k = 1, 4096, 4096, 64, 1, 128, 2048
+    B, S1, S2, N1, N2, D, k = 1, 512, 4096, 64, 1, 128, 2048
 
     q, k_t, w = _make_inputs(B, S1, S2, N1, N2, D)
     cell = LightningIndexerTriton(sparse_count=k)
@@ -103,7 +103,7 @@ def run_profiling_cann():
     total_steps = 10
     out_dir = './profiler_data_cann'
 
-    B, S1, S2, N1, N2, D, k = 1, 4096, 4096, 64, 1, 128, 2048
+    B, S1, S2, N1, N2, D, k = 1, 512, 4096, 64, 1, 128, 2048
 
     q, k_t, w = _make_inputs(B, S1, S2, N1, N2, D)
 
@@ -134,7 +134,7 @@ def run_profiling_cann():
 def run_kernel_only():
     from lightning_indexer_triton import LightningIndexerTriton
 
-    B, S1, S2, N1, N2, D, k = 1, 4096, 4096, 64, 1, 128, 2048
+    B, S1, S2, N1, N2, D, k = 1, 512, 4096, 64, 1, 128, 2048
 
     q, k_t, w = _make_inputs(B, S1, S2, N1, N2, D)
     cell = LightningIndexerTriton(sparse_count=k)
