@@ -31,6 +31,11 @@ from mindspore import ops
 
 INT64_MAX = 9223372036854775807
 
+# Persistent device-side workspace cache for the gather path.  Reusing the
+# buffers across calls avoids the large allocate/zero/free overhead that
+# dominates the end-to-end time in the benchmark.
+_GATHER_WS_CACHE = {}
+
 # CANN constraints. attention_mode=2 (MLA-absorb) fixes Dr=64; D (kv_lora_rank,
 # the nope latent dim) is generalized here to 128/256/512 — CANN itself only
 # does 512, so D!=512 has no CANN reference (verify against the numpy golden).
@@ -98,27 +103,8 @@ def _prune_configs(configs, named_args, **kwargs):
     phase 1 (q_tile, k_tile) are freed before phase 2 starts, so the peak
     UB is max(phase1, phase2), not the sum.
     """
-    import os
-    _diag = os.environ.get("SFA_DIAG_CFG")
-    if _diag:
-        try:
-            _dbg, _dbk, _dbd, _dbdv = map(int, _diag.split(","))
-            _target = {"BLOCK_G": _dbg, "BLOCK_K": _dbk, "BLOCK_D": _dbd, "BLOCK_DV": _dbdv}
-            for _c in configs:
-                if _c.kwargs == _target:
-                    return [_c]
-        except Exception:
-            pass
     _UB_LIMIT_BYTES = 180 * 1024
     _GRID_LIMIT = 131072
-    # Ascend Cube/MMA B-matrix 单 tile (BK*BD / BK*BDV) 元素上限, 超过则 MTE 地址越界 (实测归纳)
-    _CUBE_TILE_LIMIT = 8192
-    # 大 shape: autotune do_bench 多配置累积 VMM 物理页贴满, 只保留实测最优配置
-    _LARGE_SHAPE_LIMIT = 80 * 1024 * 1024
-    _LARGE_SHAPE_BEST = [
-        {"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64},
-        {"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64},
-    ]
 
     def _get(name):
         if name in named_args:
@@ -128,6 +114,7 @@ def _prune_configs(configs, named_args, **kwargs):
     N1 = _get("N1")
     BS1 = _get("B_S1")
     D = _get("D")
+    topK = _get("topK")
     # Conservative multiplier for D<=128: the compiler may keep all tiles
     # (nope + rope + scores) alive simultaneously across d-loops, and may
     # retain intermediate dot products. D>=256 uses 1.0 (verified safe).
@@ -173,9 +160,9 @@ def _prune_configs(configs, named_args, **kwargs):
             continue
         if bdv is not None and D is not None and bdv > D:
             continue
-        if bk is not None and bd is not None and bk * bd > _CUBE_TILE_LIMIT:
-            continue
-        if bk is not None and bdv is not None and bk * bdv > _CUBE_TILE_LIMIT:
+        # BLOCK_K larger than the actual topK window wastes UB and causes the
+        # last-block logic to read negative offsets; prune such configs.
+        if bk is not None and topK is not None and bk > topK:
             continue
         # Hard limit: BLOCK_G > 16 causes UB overflow for D=128 regardless of
         # multiplier (verified: BG=32/64 crash, BG=16/8 safe across all shapes).
@@ -189,9 +176,6 @@ def _prune_configs(configs, named_args, **kwargs):
             if grid0 * grid1 > _GRID_LIMIT:
                 continue
         kept.append(c)
-
-    if BS1 is not None and N1 is not None and D is not None and BS1 * N1 * D > _LARGE_SHAPE_LIMIT:
-        kept = [c for c in kept if c.kwargs in _LARGE_SHAPE_BEST]
 
     if not kept:
         print('Warning: all autotune params pruned')
@@ -252,76 +236,76 @@ def _sfa_scores_block(
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # BLOCK_G=8: lower UB pressure, finer grid for small N1
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # BLOCK_G=32: higher per-core work density for large N1
         triton.Config({"BLOCK_G": 32, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 32, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # BLOCK_G=64: one program covers all 64 heads, minimizing grid1
-        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
         # BLOCK_G=64 with larger BLOCK_K to halve chunked loop count (32 -> 16
         # chunks at topK=2048). Larger BLOCK_K also makes the K_nope gather
         # better-aligned with index_select_simd's preferred chunk size.
-        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
-        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # Wider BLOCK_K ranges
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 16, "BLOCK_D": 128, "BLOCK_DV": 64}),
-        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # Larger BLOCK_DV: fewer dv-tile iterations, fewer fp32_acc GM round-trips
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64, "BLOCK_DV": 128}),
-        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
-        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
         # Larger BLOCK_D=256: fewer nope d-tile iterations (2 vs 4 for D=512)
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 64}),
-        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
         # Large BLOCK_DV + BLOCK_D combos: minimize both dv and d iterations
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 128}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 256}),
         # BLOCK_DV=512 (full D=512 in one dv tile, no inner dv loop)
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 512}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 256, "BLOCK_DV": 512}),
-        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 256, "BLOCK_DV": 512}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
         # Previously pruned by sum-based UB estimator; now allowed by phased estimator.
         # BK=512+BD=128: 1 nope d-tile, 4 chunks (vs 16 for BK=128)
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 512, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 512, "BLOCK_D": 128, "BLOCK_DV": 64}),
         # BK=256+BD=256: 2 nope d-tiles, 8 chunks; high cube utilization
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 64}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 128}),
         # BG=64 + BK=256 + BD=128: covers all 64 heads, larger tiles
-        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
         # BG=64 + BK=128 + BD=128 + BDV=128: full-head with wider dv tiles
-        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
         # BK=256 + BDV=128: fewer dv-tile iterations
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
         # More configs unlocked by phased UB estimator
-        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
-        # triton.Config({"BLOCK_G": 32, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 32, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
         # More configs unlocked by ub_multiplier=1.1
-
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 256}),
-        # triton.Config({"BLOCK_G": 4,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 4,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 512}),
         # Extreme configs unlocked by ub_multiplier=1.0
-        # triton.Config({"BLOCK_G": 32, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
-        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 32, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 128}),
         # Large BLOCK_DV=256/512 configs: minimize dv-tile iterations
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 256}),
-        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 512}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 512}),
         # BLOCK_D=512: single nope d-tile iteration for D=512, eliminating loop overhead
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 64}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 128}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 64}),
-        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 256}),
     ],
     key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
     prune_configs_by={"early_config_prune": _prune_configs},
@@ -608,6 +592,365 @@ def _sfa_kernel(
             tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
             tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
 
+
+# ---------------------------------------------------------------------------
+# device-side gather path: pre-pack the sparse KV window into contiguous
+# memory so the attention kernel can use vectorized sequential loads.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _sfa_gather_kernel(
+    k_ptr, kr_ptr, sparse_ptr,
+    gk_ptr, gkr_ptr, gvalid_ptr,
+    act_q_ptr, act_k_ptr,
+    S2, topK, S1,
+    B_S1: tl.constexpr,
+    D: tl.constexpr, D_ROPE: tl.constexpr,
+    sparse_mode: tl.constexpr,
+    BLOCK_GK: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid_bs1 = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    bs1_in_range = pid_bs1 < B_S1
+    pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0)
+
+    b = pid_bs1 // S1
+    s1 = pid_bs1 % S1
+
+    act_q = tl.load(act_q_ptr + b)
+    act_k = tl.load(act_k_ptr + b)
+
+    if sparse_mode == 0:
+        threshold = act_k
+    else:
+        threshold = act_k - act_q + s1 + 1
+
+    row_active = bs1_in_range & (s1 < act_q) & (threshold > 0)
+
+    k_base = b * S2 * D
+    kr_base = b * S2 * D_ROPE
+    sp_base = pid_bs1 * topK
+    gk_base = pid_bs1 * topK * D
+    gkr_base = pid_bs1 * topK * D_ROPE
+
+    k_offs = pid_k * BLOCK_GK + tl.arange(0, BLOCK_GK)
+    k_in_range = k_offs < topK
+    tok = tl.load(sparse_ptr + sp_base + k_offs, mask=k_in_range, other=-1)
+    tok_valid = k_in_range & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
+    tok_clamped = tl.where(tok_valid, tok, 0)
+
+    for d_start in range(0, D, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_valid = d_offs < D
+        k_tile = tl.load(
+            k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
+            mask=tok_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
+        tl.store(
+            gk_ptr + gk_base + k_offs[:, None] * D + d_offs[None, :],
+            k_tile,
+            mask=bs1_in_range & k_in_range[:, None] & d_valid[None, :])
+
+    for d_start in range(0, D_ROPE, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_valid = d_offs < D_ROPE
+        kr_tile = tl.load(
+            kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + d_offs[None, :],
+            mask=tok_valid[:, None] & d_valid[None, :], other=0.0,
+            care_padding=False)
+        tl.store(
+            gkr_ptr + gkr_base + k_offs[:, None] * D_ROPE + d_offs[None, :],
+            kr_tile,
+            mask=bs1_in_range & k_in_range[:, None] & d_valid[None, :])
+
+    tl.store(
+        gvalid_ptr + sp_base + k_offs,
+        tl.where(tok_valid, 1, 0).to(gvalid_ptr.dtype.element_ty),
+        mask=bs1_in_range & k_in_range)
+
+
+@triton.autotune(
+    configs=[
+        # # Large tiles unlocked by contiguous gathered KV (no index_select_simd).
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        # # Conservative fallback configs.
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # D=128-safe: _prune_configs rejects BG>16 for D<=128 (UB overflow,
+        # verified BG=32/64 crash). Without these, topK>128 gather path falls
+        # back to BG=64 after "all autotune params pruned", corrupting sm_max/sum.
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 32, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+    ],
+    key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
+    prune_configs_by={"early_config_prune": _prune_configs},
+)
+@triton.jit
+def _sfa_kernel_gathered(
+    q_ptr, qr_ptr,
+    gk_ptr, gkr_ptr, v_ptr,
+    gvalid_ptr,
+    out_ptr, sm_max_ptr, sm_sum_ptr,
+    fp32_acc_ptr,
+    act_q_ptr, act_k_ptr,
+    S2, N1, topK,
+    B_S1: tl.constexpr, S1: tl.constexpr,
+    D: tl.constexpr, D_ROPE: tl.constexpr,
+    scale_value,
+    sparse_mode: tl.constexpr,
+    return_lse: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    SINGLE_BLOCK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    """Flash attention over a device-gathered contiguous KV window.
+
+    Same grid and output layout as _sfa_kernel, but K/KR/V are pre-packed to
+    [B*S1, topK, D] contiguous buffers by _sfa_gather_kernel.  This removes the
+    random index_select_simd inside the hot loop and allows much larger tiles.
+    """
+    q_ptr = tl.multiple_of(q_ptr, 128)
+    qr_ptr = tl.multiple_of(qr_ptr, 128)
+    gk_ptr = tl.multiple_of(gk_ptr, 128)
+    gkr_ptr = tl.multiple_of(gkr_ptr, 128)
+    v_ptr = tl.multiple_of(v_ptr, 128)
+    out_ptr = tl.multiple_of(out_ptr, 128)
+    fp32_acc_ptr = tl.multiple_of(fp32_acc_ptr, 128)
+    gvalid_ptr = tl.multiple_of(gvalid_ptr, 128)
+    sm_max_ptr = tl.multiple_of(sm_max_ptr, 128)
+    sm_sum_ptr = tl.multiple_of(sm_sum_ptr, 128)
+
+    pid_bs1 = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    bs1_in_range = pid_bs1 < B_S1
+    pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0)
+
+    b = pid_bs1 // S1
+    s1 = pid_bs1 % S1
+
+    g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+    g_valid = g_offs < N1
+
+    act_q = tl.load(act_q_ptr + b)
+    act_k = tl.load(act_k_ptr + b)
+
+    if sparse_mode == 0:
+        threshold = act_k
+    else:
+        threshold = act_k - act_q + s1 + 1
+
+    row_active = bs1_in_range & (s1 < act_q) & (threshold > 0)
+
+    q_base = (b * S1 + s1) * N1 * D
+    qr_base = (b * S1 + s1) * N1 * D_ROPE
+    gk_base = (b * S1 + s1) * topK * D
+    gkr_base = (b * S1 + s1) * topK * D_ROPE
+    gv_base = gk_base
+    sp_base = (b * S1 + s1) * topK
+    fp32_base = (b * S1 + s1) * N1 * D
+    out_base = fp32_base
+
+    if SINGLE_BLOCK:
+        blk_offs = tl.arange(0, BLOCK_TOPK)
+        blk_in_count = blk_offs < topK
+        valid_i8 = tl.load(gvalid_ptr + sp_base + blk_offs, mask=blk_in_count, other=0)
+        tok_valid = (valid_i8 > 0) & blk_in_count & row_active
+
+        scores = tl.zeros([BLOCK_G, BLOCK_TOPK], dtype=tl.float32)
+        for d_start in range(0, D, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D
+            q_tile = tl.load(
+                q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            k_tile = tl.load(
+                gk_ptr + gk_base + blk_offs[:, None] * D + d_offs[None, :],
+                mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(q_tile, tl.trans(k_tile))
+        for d_start in range(0, D_ROPE, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D_ROPE
+            qr_tile = tl.load(
+                qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            kr_tile = tl.load(
+                gkr_ptr + gkr_base + blk_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(qr_tile, tl.trans(kr_tile))
+        scores = scores * scale_value
+        scores = tl.where(tok_valid[None, :], scores, float('-inf'))
+
+        m_i = tl.max(scores, axis=1)
+        m_safe = tl.where(m_i == float('-inf'), 0.0, m_i)
+        p = tl.exp(scores - m_safe[:, None])
+        p = tl.where(tok_valid[None, :], p, 0.0)
+        l_i = tl.sum(p, axis=1)
+        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+
+        p_norm = p / l_safe[:, None]
+        for dv_start in range(0, D, BLOCK_DV):
+            dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+            dv_valid = dv_offs < D
+            v_tile = tl.load(
+                v_ptr + gv_base + blk_offs[:, None] * D + dv_offs[None, :],
+                mask=blk_in_count[:, None] & dv_valid[None, :], other=0.0)
+            out_tile = tl.dot(p_norm.to(v_tile.dtype), v_tile)
+            tl.store(
+                out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
+                out_tile.to(out_ptr.dtype.element_ty),
+                mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+        if return_lse:
+            sm_base = (b * S1 + s1) * N1
+            store_mask = g_valid & row_active & (l_i > 0.0)
+            tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
+            tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
+    else:
+        m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
+
+        for blk_start in range(0, topK - BLOCK_K, BLOCK_K):
+            blk_offs = blk_start + tl.arange(0, BLOCK_K)
+            blk_in_count = blk_offs < topK
+            valid_i8 = tl.load(gvalid_ptr + sp_base + blk_offs, mask=blk_in_count, other=0)
+            tok_valid = (valid_i8 > 0) & blk_in_count & row_active
+
+            scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
+            for d_start in range(0, D, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < D
+                q_tile = tl.load(
+                    q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                    mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+                k_tile = tl.load(
+                    gk_ptr + gk_base + blk_offs[:, None] * D + d_offs[None, :],
+                    mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+                scores += tl.dot(q_tile, tl.trans(k_tile))
+            for d_start in range(0, D_ROPE, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < D_ROPE
+                qr_tile = tl.load(
+                    qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                    mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+                kr_tile = tl.load(
+                    gkr_ptr + gkr_base + blk_offs[:, None] * D_ROPE + d_offs[None, :],
+                    mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+                scores += tl.dot(qr_tile, tl.trans(kr_tile))
+            scores = scores * scale_value
+            scores = tl.where(tok_valid[None, :], scores, float('-inf'))
+
+            m_blk = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_blk)
+            m_new_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+            alpha_old = tl.exp(m_i - m_new_safe)
+            alpha_new = tl.exp(m_blk - m_new_safe)
+
+            m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
+            p_raw = tl.exp(scores - m_blk_safe[:, None])
+            l_chunk = tl.sum(p_raw, axis=1)
+            l_i = l_i * alpha_old + l_chunk * alpha_new
+
+            for dv_start in range(0, D, BLOCK_DV):
+                dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+                dv_valid = dv_offs < D
+                acc_dv = tl.load(
+                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                    mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
+                v_tile = tl.load(
+                    v_ptr + gv_base + blk_offs[:, None] * D + dv_offs[None, :],
+                    mask=blk_in_count[:, None] & dv_valid[None, :], other=0.0)
+                pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
+                acc_dv = acc_dv * alpha_old[:, None] + pv_tile
+                tl.store(
+                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                    acc_dv,
+                    mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+            m_i = m_new
+
+        last_blk_start = topK - BLOCK_K
+        blk_offs = last_blk_start + tl.arange(0, BLOCK_K)
+        blk_in_count = blk_offs < topK
+        valid_i8 = tl.load(gvalid_ptr + sp_base + blk_offs, mask=blk_in_count, other=0)
+        tok_valid = (valid_i8 > 0) & blk_in_count & row_active
+
+        scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
+        for d_start in range(0, D, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D
+            q_tile = tl.load(
+                q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            k_tile = tl.load(
+                gk_ptr + gk_base + blk_offs[:, None] * D + d_offs[None, :],
+                mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(q_tile, tl.trans(k_tile))
+        for d_start in range(0, D_ROPE, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < D_ROPE
+            qr_tile = tl.load(
+                qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+            kr_tile = tl.load(
+                gkr_ptr + gkr_base + blk_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=blk_in_count[:, None] & d_valid[None, :], other=0.0)
+            scores += tl.dot(qr_tile, tl.trans(kr_tile))
+        scores = scores * scale_value
+        scores = tl.where(tok_valid[None, :], scores, float('-inf'))
+
+        m_blk = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_blk)
+        m_new_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+        alpha_old = tl.exp(m_i - m_new_safe)
+        alpha_new = tl.exp(m_blk - m_new_safe)
+
+        m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
+        p_raw = tl.exp(scores - m_blk_safe[:, None])
+        p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
+        l_chunk = tl.sum(p_raw, axis=1)
+        l_i = l_i * alpha_old + l_chunk * alpha_new
+        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+
+        for dv_start in range(0, D, BLOCK_DV):
+            dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+            dv_valid = dv_offs < D
+            acc_dv = tl.load(
+                fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
+            v_tile = tl.load(
+                v_ptr + gv_base + blk_offs[:, None] * D + dv_offs[None, :],
+                mask=blk_in_count[:, None] & dv_valid[None, :], other=0.0)
+            pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
+            out_tile = (acc_dv * alpha_old[:, None] + pv_tile) / l_safe[:, None]
+            tl.store(
+                out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
+                out_tile.to(out_ptr.dtype.element_ty),
+                mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+        m_i = m_new
+
+        if return_lse:
+            sm_base = (b * S1 + s1) * N1
+            store_mask = g_valid & row_active & (l_i > 0.0)
+            tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
+            tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
+
+
 # ---------------------------------------------------------------------------
 # host-side helpers
 # ---------------------------------------------------------------------------
@@ -840,10 +1183,86 @@ def _sfa_core(
     #         save_dir="/home/z00841464/SFA/data/sfa_inputs"  # 可修改保存路径
     #     )
 
-    _sfa_kernel[grid_fn](
+    if single_block:
+        _sfa_kernel[grid_fn](
+            q_flat, qr_flat,
+            k_flat, kr_flat, v_flat,
+            sparse_flat,
+            out_buf, sm_max_buf, sm_sum_buf,
+            fp32_acc_buf,
+            act_q, act_k,
+            S2, N1, topK,
+            B_S1=B_S1, S1=S1,
+            D=D, D_ROPE=D_ROPE,
+            scale_value=scale_value,
+            sparse_mode=sparse_mode,
+            return_lse=return_lse,
+            SINGLE_BLOCK=single_block,
+            BLOCK_TOPK=block_topk,
+        )
+        return out_buf, sm_max_buf, sm_sum_buf
+
+    # For large topK, pre-gather the sparse KV window into contiguous buffers on
+    # the device.  This turns random index_select_simd gathers inside the hot
+    # loop into sequential vector loads and unlocks larger attention tiles.
+    # Fall back to the inline-gather kernel when the workspace would be huge.
+    gather_workspace_bytes = B_S1 * topK * (D + D_ROPE + 1) * 2
+    use_device_gather = gather_workspace_bytes <= 2 * 1024 * 1024 * 1024
+
+    if not use_device_gather:
+        _sfa_kernel[grid_fn](
+            q_flat, qr_flat,
+            k_flat, kr_flat, v_flat,
+            sparse_flat,
+            out_buf, sm_max_buf, sm_sum_buf,
+            fp32_acc_buf,
+            act_q, act_k,
+            S2, N1, topK,
+            B_S1=B_S1, S1=S1,
+            D=D, D_ROPE=D_ROPE,
+            scale_value=scale_value,
+            sparse_mode=sparse_mode,
+            return_lse=return_lse,
+            SINGLE_BLOCK=single_block,
+            BLOCK_TOPK=block_topk,
+        )
+        return out_buf, sm_max_buf, sm_sum_buf
+
+    cache_key = (B_S1, topK, D, D_ROPE, k_flat.dtype, kr_flat.dtype)
+    cached = _GATHER_WS_CACHE.get(cache_key)
+    if cached is not None:
+        gk, gkr, gvalid = cached
+    else:
+        gk = ms.mint.empty((B_S1, topK, D), dtype=k_flat.dtype).to('Ascend')
+        gkr = ms.mint.empty((B_S1, topK, D_ROPE), dtype=kr_flat.dtype).to('Ascend')
+        gvalid = ms.mint.empty((B_S1, topK), dtype=ms.int8).to('Ascend')
+        _GATHER_WS_CACHE[cache_key] = (gk, gkr, gvalid)
+
+    def gather_grid(meta): return (
+        _next_pow2(B_S1),
+        _next_pow2(triton.cdiv(topK, meta["BLOCK_GK"])),
+    )
+
+    _sfa_gather_kernel[gather_grid](
+        k_flat, kr_flat, sparse_flat,
+        gk, gkr, gvalid,
+        act_q, act_k,
+        S2, topK, S1,
+        B_S1=B_S1,
+        D=D, D_ROPE=D_ROPE,
+        sparse_mode=sparse_mode,
+        BLOCK_GK=64, BLOCK_D=128,
+    )
+
+    def gathered_grid_fn(meta): return (
+        _next_pow2(B_S1),
+        _next_pow2(triton.cdiv(N1, meta["BLOCK_G"])),
+    )
+
+    _sfa_kernel_gathered[gathered_grid_fn](
         q_flat, qr_flat,
-        k_flat, kr_flat, v_flat,
-        sparse_flat,
+        gk, gkr, gk,
+        gvalid,
         out_buf, sm_max_buf, sm_sum_buf,
         fp32_acc_buf,
         act_q, act_k,
@@ -853,7 +1272,7 @@ def _sfa_core(
         scale_value=scale_value,
         sparse_mode=sparse_mode,
         return_lse=return_lse,
-        SINGLE_BLOCK=single_block,
+        SINGLE_BLOCK=False,
         BLOCK_TOPK=block_topk,
     )
     return out_buf, sm_max_buf, sm_sum_buf
