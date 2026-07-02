@@ -105,6 +105,14 @@ def _prune_configs(configs, named_args, **kwargs):
     """
     _UB_LIMIT_BYTES = 180 * 1024
     _GRID_LIMIT = 131072
+    # 大 shape (BS1*N1*D>80MB, 必走 inline-gather): BK*BD>8192 的 config 使 Cube
+    # B-matrix tile MTE 地址越界 (d84a17d 实测归纳), 仅保留 BK*BD<=8192 的实测最优.
+    # gathered path workspace<=2GB ⇒ BS1*N1*D<28MB, 永不触发, 不影响 gathered 分支.
+    _LARGE_SHAPE_LIMIT = 80 * 1024 * 1024
+    _LARGE_SHAPE_BEST = [
+        {"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64},
+        {"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64},
+    ]
 
     def _get(name):
         if name in named_args:
@@ -177,6 +185,9 @@ def _prune_configs(configs, named_args, **kwargs):
                 continue
         kept.append(c)
 
+    if BS1 is not None and N1 is not None and D is not None and BS1 * N1 * D > _LARGE_SHAPE_LIMIT:
+        kept = [c for c in kept if c.kwargs in _LARGE_SHAPE_BEST]
+
     if not kept:
         print('Warning: all autotune params pruned')
         kept = [min(configs, key=lambda c: _estimate_ub_bytes(
@@ -236,76 +247,76 @@ def _sfa_scores_block(
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # BLOCK_G=8: lower UB pressure, finer grid for small N1
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # BLOCK_G=32: higher per-core work density for large N1
         triton.Config({"BLOCK_G": 32, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 32, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # BLOCK_G=64: one program covers all 64 heads, minimizing grid1
-        triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 64}),
         # BLOCK_G=64 with larger BLOCK_K to halve chunked loop count (32 -> 16
         # chunks at topK=2048). Larger BLOCK_K also makes the K_nope gather
         # better-aligned with index_select_simd's preferred chunk size.
-        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # Wider BLOCK_K ranges
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 16, "BLOCK_D": 128, "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # Larger BLOCK_DV: fewer dv-tile iterations, fewer fp32_acc GM round-trips
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 256}),
         # Larger BLOCK_D=256: fewer nope d-tile iterations (2 vs 4 for D=512)
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 64}),
         # Large BLOCK_DV + BLOCK_D combos: minimize both dv and d iterations
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 256, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 256}),
         # BLOCK_DV=512 (full D=512 in one dv tile, no inner dv loop)
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 512}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 256, "BLOCK_DV": 512}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 32, "BLOCK_D": 256, "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 32, "BLOCK_D": 128, "BLOCK_DV": 512}),
         # Previously pruned by sum-based UB estimator; now allowed by phased estimator.
         # BK=512+BD=128: 1 nope d-tile, 4 chunks (vs 16 for BK=128)
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 512, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 512, "BLOCK_D": 128, "BLOCK_DV": 64}),
         # BK=256+BD=256: 2 nope d-tiles, 8 chunks; high cube utilization
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 256, "BLOCK_DV": 128}),
         # BG=64 + BK=256 + BD=128: covers all 64 heads, larger tiles
-        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
         # BG=64 + BK=128 + BD=128 + BDV=128: full-head with wider dv tiles
-        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
         # BK=256 + BDV=128: fewer dv-tile iterations
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
         # More configs unlocked by phased UB estimator
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 32, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 32, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
         # More configs unlocked by ub_multiplier=1.1
-        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 256}),
-        triton.Config({"BLOCK_G": 4,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 512}),
+
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 4,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 512}),
         # Extreme configs unlocked by ub_multiplier=1.0
-        triton.Config({"BLOCK_G": 32, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 32, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 128}),
         # Large BLOCK_DV=256/512 configs: minimize dv-tile iterations
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 256}),
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 512}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 16, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 512}),
         # BLOCK_D=512: single nope d-tile iteration for D=512, eliminating loop overhead
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 128}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 64}),
-        triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 256}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 512, "BLOCK_DV": 128}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 64}),
+        # triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64,  "BLOCK_D": 512, "BLOCK_DV": 256}),
     ],
     key=["B_S1", "N1", "S2", "topK", "D", "D_ROPE"],
     prune_configs_by={"early_config_prune": _prune_configs},
