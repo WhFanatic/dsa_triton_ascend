@@ -67,12 +67,12 @@ def numpy_reference(q, k, qr, kr, qi, ki, w, si, sm_max, sm_sum, scale):
     for b in range(B):
         for s1 in range(S1):
             n = s2_real[b, s1]
-            for g in range(Nidx1):
-                dot = qi[b, s1, g, :] @ ki_gathered[b, s1, :n].T  # (n,)
-                dot = dot.astype(np.float16).astype(np.float32)
-                relu = np.maximum(dot, 0.0)
-                relu_cache[b, s1, g, :n] = relu
-                I_scores[b, s1, :n] += w[b, s1, g] * relu
+            # (Nidx1, D_idx) @ (D_idx, n) -> (Nidx1, n)
+            dot = qi[b, s1] @ ki_gathered[b, s1, :n].T
+            relu = np.maximum(dot, 0.0)
+            relu_cache[b, s1, :, :n] = relu
+            # (Nidx1,) @ (Nidx1, n) -> (n,)
+            I_scores[b, s1, :n] = w[b, s1] @ relu
     results['I_scores'] = I_scores
     results['relu_cache'] = relu_cache
 
@@ -83,14 +83,12 @@ def numpy_reference(q, k, qr, kr, qi, ki, w, si, sm_max, sm_sum, scale):
             n = s2_real[b, s1]
             k_g = key_gathered[b, s1, :n]
             kr_g = kr_gathered[b, s1, :n]
-            for h in range(N1):
-                scores = (q[b, s1, h] @ k_g.T +
-                          qr[b, s1, h] @ kr_g.T) * scale
-                scores = scores.astype(np.float16).astype(np.float32)
-                sm_max_h = sm_max[b, 0, s1, h]
-                sm_sum_h = sm_sum[b, 0, s1, h]
-                probs = np.exp(scores - sm_max_h) / (sm_sum_h + EPS)
-                p[b, s1, :n] += probs
+            # (N1, D) @ (D, n) + (N1, D_rope) @ (D_rope, n) -> (N1, n)
+            scores = (q[b, s1] @ k_g.T + qr[b, s1] @ kr_g.T) * scale
+            sm_max_h = sm_max[b, 0, s1][:, None]  # (N1, 1)
+            sm_sum_h = sm_sum[b, 0, s1][:, None]  # (N1, 1)
+            probs = np.exp(scores - sm_max_h) / (sm_sum_h + EPS)
+            p[b, s1, :n] = probs.sum(axis=0)
     p *= (1.0 / N1)
     results['p'] = p
 
@@ -124,29 +122,35 @@ def numpy_reference(q, k, qr, kr, qi, ki, w, si, sm_max, sm_sum, scale):
     for b in range(B):
         for s1 in range(S1):
             n = s2_real[b, s1]
-            for g in range(Nidx1):
-                relu_g = relu_cache[b, s1, g, :n]
-                relu_mask_g = (relu_g > 0).astype(np.float32)
-                dW[b, s1, g] = np.sum(dI[b, s1, :n] * relu_g)
-                ds_idx_g = dI[b, s1, :n] * w[b, s1, g] * relu_mask_g
-                dQueryIndex[b, s1, g] = ds_idx_g @ ki_gathered[b, s1, :n]
+            relu_gn = relu_cache[b, s1, :, :n]              # (Nidx1, n)
+            relu_mask_gn = (relu_gn > 0).astype(np.float32)  # (Nidx1, n)
+            dI_n = dI[b, s1, :n]                             # (n,)
+            # dW[g] = Σ_k dI[k] * relu[g, k]
+            dW[b, s1] = relu_gn @ dI_n                       # (Nidx1,)
+            # ds_idx[g, k] = dI[k] * w[g] * relu_mask[g, k]
+            ds_idx = (dI_n[None, :] * w[b, s1, :, None]) * relu_mask_gn  # (Nidx1, n)
+            # dQI[g, :] = ds_idx[g, :] @ ki_gathered[:n, :]
+            dQueryIndex[b, s1] = ds_idx @ ki_gathered[b, s1, :n]  # (Nidx1, D_idx)
     results['dW'] = dW
     results['dQueryIndex'] = dQueryIndex
 
     # --- Stage 6: Scatter dKeyIndex ---
+    # dKI_contrib[g, k, d] = dI[k] * w[g] * relu_mask[g, k] * qi[g, d]
+    #                     = ds_idx[g, k] * qi[g, d]
+    # 按 target = si[k] 累加到 dKeyIndex[target, :]
     dKeyIndex = np.zeros_like(ki, dtype=np.float32)
     for b in range(B):
         for s1 in range(S1):
             n = s2_real[b, s1]
-            for k_idx in range(n):
-                target = si[b, s1, 0, k_idx]
-                if target < 0 or target >= S2:
-                    continue
-                for g in range(Nidx1):
-                    relu_g = relu_cache[b, s1, g]
-                    relu_mask_g = (relu_g[k_idx] > 0).astype(np.float32)
-                    dki_contrib = dI[b, s1, k_idx] * w[b, s1, g] * relu_mask_g
-                    dKeyIndex[b, target, 0] += dki_contrib * qi[b, s1, g]
+            relu_gn = relu_cache[b, s1, :, :n]
+            relu_mask_gn = (relu_gn > 0).astype(np.float32)
+            dI_n = dI[b, s1, :n]
+            ds_idx = (dI_n[None, :] * w[b, s1, :, None]) * relu_mask_gn  # (Nidx1, n)
+            # dKI_per_k[k, d] = Σ_g ds_idx[g, k] * qi[g, d]
+            dKI_per_k = ds_idx.T @ qi[b, s1]                  # (n, D_idx)
+            targets = np.clip(si[b, s1, 0, :n], 0, S2 - 1)    # (n,)
+            # 用 np.add.at 处理重复 target 的正确累加（等价于原来的顺序累加）
+            np.add.at(dKeyIndex[b, :, 0, :], targets, dKI_per_k)
     results['dKeyIndex'] = dKeyIndex
 
     return results

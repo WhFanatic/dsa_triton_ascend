@@ -4,3 +4,8 @@ trash/
 *__pycache__*
 prompts.md
 profiler*
+my_triton_cache*
+.omo*
+custom_kernel_meta*
+.pytest_cache*
+kernel_meta*
