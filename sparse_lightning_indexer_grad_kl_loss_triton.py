@@ -120,9 +120,9 @@ def _sli_grad_fused_kernel(
     g_local = tl.arange(0, BLOCK_G)
 
     # Stage T+I merged: per K-tile gather ki, compute teacher p[k] and indexer I[k].
-    # Merging halves K-loop iterations (64→32) and lets the indexer reuse ki_vals
-    # directly from registers instead of re-reading key_index_gathered from HBM.
-    d_valid_idx = d_idx_local < D_idx
+    # ki gather has a D_idx outer loop to support D_idx > BLOCK_D_IDX.
+    # idx_scores cumulated across D_idx blocks before relu; teacher
+    # (query_all/key_all) is D_idx-independent and stays as-is.
     for k_start in range(0, VALID_K, BLOCK_K):
         if k_start < s2_real:
             k_offs = k_start + local_k
@@ -132,16 +132,18 @@ def _sli_grad_fused_kernel(
                           mask=k_mask_real, other=0)
             idx = tl.maximum(tl.minimum(idx, S2 - 1), 0)
 
-            # ki gather — stored to HBM for Pass A/B, but also kept in registers
-            # for the indexer below (avoids HBM re-read).
-            mask_2d = k_mask_real[:, None] & d_valid_idx[None, :]
-            ki_vals = tl.load(
-                key_index_ptr + ki_src_base + idx[:, None] * D_idx + d_idx_local[None, :],
-                mask=mask_2d, other=0.0)
-            tl.store(
-                key_index_gathered_ptr + ki_g_base
-                + k_offs[:, None] * D_idx + d_idx_local[None, :],
-                ki_vals, mask=mask_2d)
+            # Ki gather across all D_idx blocks (stored to HBM for Pass A/B).
+            for d_idx_start in range(0, D_idx, BLOCK_D_IDX):
+                d_idx_loc = d_idx_start + d_idx_local
+                d_idx_mask = d_idx_loc < D_idx
+                mask_2d = k_mask_real[:, None] & d_idx_mask[None, :]
+                ki_vals = tl.load(
+                    key_index_ptr + ki_src_base + idx[:, None] * D_idx + d_idx_loc[None, :],
+                    mask=mask_2d, other=0.0)
+                tl.store(
+                    key_index_gathered_ptr + ki_g_base
+                    + k_offs[:, None] * D_idx + d_idx_loc[None, :],
+                    ki_vals, mask=mask_2d)
 
             # Teacher: compute p[k] (only when k < s2_bound; for production
             # shape s2_bound == s2_real so this branch is always taken).
@@ -180,20 +182,28 @@ def _sli_grad_fused_kernel(
                 p_tile = p_tile_acc * inv_n1
                 tl.store(buf_p_ptr + buf_p_base + k_offs, p_tile, mask=k_mask_bound)
 
-            # Indexer: compute I[k] using ki_vals directly (no HBM re-read).
+            # Indexer: compute I[k] = Σ_g W[g]·ReLU(Σ_d qi_d·ki_d^T).
+            # idx_scores cumulated across D_idx blocks, then relu applied.
             i_tile = tl.zeros([BLOCK_K], dtype=tl.float32)
             for g_start in range(0, Nidx1, BLOCK_G):
                 g_offs = g_start + g_local
                 g_mask = g_offs < Nidx1
 
-                qi_tile = tl.load(
-                    query_index_ptr + qi_base
-                    + g_offs[:, None] * D_idx + d_idx_local[None, :],
-                    mask=g_mask[:, None] & d_valid_idx[None, :],
-                    other=0.0)
-                idx_scores = tl.dot(qi_tile, tl.trans(ki_vals))
+                idx_scores_full = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
+                for d_idx_start in range(0, D_idx, BLOCK_D_IDX):
+                    d_idx_loc = d_idx_start + d_idx_local
+                    d_idx_mask = d_idx_loc < D_idx
+                    qi_tile = tl.load(
+                        query_index_ptr + qi_base
+                        + g_offs[:, None] * D_idx + d_idx_loc[None, :],
+                        mask=g_mask[:, None] & d_idx_mask[None, :], other=0.0)
+                    ki_vals = tl.load(
+                        key_index_gathered_ptr + ki_g_base
+                        + k_offs[:, None] * D_idx + d_idx_loc[None, :],
+                        mask=k_mask_real[:, None] & d_idx_mask[None, :], other=0.0)
+                    idx_scores_full += tl.dot(qi_tile, tl.trans(ki_vals))
 
-                relu = tl.maximum(idx_scores, 0.0)
+                relu = tl.maximum(idx_scores_full, 0.0)
                 relu = tl.where(g_mask[:, None] & k_mask_real[None, :], relu, 0.0)
                 w_g = tl.load(weights_ptr + w_base + g_offs,
                               mask=g_mask, other=0.0).to(tl.float32)
