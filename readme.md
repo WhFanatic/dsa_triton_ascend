@@ -312,7 +312,7 @@ pytest --forked test_sfa_triton.py -v
 pytest --forked test_sfa_grad_triton.py -v
 
 # DenseLossBackward
-pytest test_dense_loss_backward_triton.py -v
+pytest test_dense_loss_backward_triton.py -v -k test_dense_grad_kl_loss_triton_supported_shapes
 ```
 
 ### 性能能命令：(计时 + speedup（triton vs CANN）)
