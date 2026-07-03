@@ -8,6 +8,7 @@
 - mindspore 2.9.0
 - triton-ascend 3.2.1及以上
 - pytest-forked (全量测试需要 pytest --forked ...)
+- 昇腾A3服务器
 
 ## 文件
 
